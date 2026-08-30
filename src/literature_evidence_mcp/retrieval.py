@@ -183,6 +183,7 @@ def search_snapshot(
         results.append(
             {
                 "document_id": row["document_id"],
+                "asset_id": row["asset_id"],
                 "chunk_id": row["chunk_id"],
                 "title": row["title"],
                 "identifiers": json.loads(row["identifiers"]),
