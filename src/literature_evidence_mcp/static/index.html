@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>本地文献证据管理页</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header class="hero">
+        <p class="eyebrow">literature-evidence-mcp · 阶段二</p>
+        <h1>本地文献证据管理页</h1>
+        <p>
+          这里的“上传”只会把你明确选择的文件送到本机
+          <code>127.0.0.1</code> 服务，不会发送到云端。
+        </p>
+      </header>
+
+      <section aria-labelledby="status-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">只读</p>
+            <h2 id="status-heading">服务状态</h2>
+          </div>
+          <button id="refresh-button" class="secondary" type="button">刷新状态</button>
+        </div>
+        <p id="service-status" class="notice" role="status" aria-live="polite">
+          正在连接本机服务……
+        </p>
+      </section>
+
+      <section aria-labelledby="build-heading">
+        <p class="eyebrow">唯一写操作</p>
+        <h2 id="build-heading">构建全新快照</h2>
+        <p>
+          选择 1 个或多个 Markdown/PDF。每次成功构建都会新增快照，旧快照不会被覆盖。
+        </p>
+        <label for="source-files">选择本机文件</label>
+        <input
+          id="source-files"
+          type="file"
+          accept=".md,.markdown,.pdf,text/markdown,application/pdf"
+          multiple
+        >
+        <p id="upload-limits" class="hint"></p>
+        <ul id="selected-files" class="file-list" aria-live="polite"></ul>
+        <button id="build-button" type="button" disabled>明确构建一个全新快照</button>
+        <p id="build-status" class="notice quiet" role="status" aria-live="polite"></p>
+      </section>
+
+      <section aria-labelledby="snapshots-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">只读</p>
+            <h2 id="snapshots-heading">快照列表与核验</h2>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>快照</th>
+                <th>核验</th>
+                <th>文档 / 片段</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="snapshot-rows"></tbody>
+          </table>
+        </div>
+        <p id="snapshot-empty" class="hint" hidden>还没有可列出的快照。</p>
+      </section>
+
+      <section aria-labelledby="search-heading">
+        <p class="eyebrow">只读 · 本地 BM25</p>
+        <h2 id="search-heading">搜索冻结快照</h2>
+        <label for="snapshot-select">选择已核验快照</label>
+        <select id="snapshot-select"></select>
+        <label for="query">问题或关键词</label>
+        <input id="query" type="search" maxlength="400" autocomplete="off">
+        <p class="hint">连续中文召回有限；没有结果时，可尝试在关键词之间加入空格。</p>
+        <button id="search-button" type="button" disabled>本地搜索</button>
+        <p id="search-status" class="notice quiet" role="status" aria-live="polite"></p>
+        <div id="search-results" class="results"></div>
+      </section>
+    </main>
+  </body>
+</html>

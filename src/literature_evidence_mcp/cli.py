@@ -34,6 +34,17 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument(
         "--excerpt-chars", type=int, default=1000, help="每条摘录 1-1200 字符。"
     )
+
+    serve = subparsers.add_parser(
+        "serve", help="在 127.0.0.1 启动本机管理页，按 Ctrl+C 停止。"
+    )
+    serve.add_argument("--library", required=True, type=Path, help="固定本地资料库目录。")
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="本机端口（1024-65535，默认 8765）。",
+    )
     return parser
 
 
@@ -49,19 +60,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = build_snapshot(args.library, args.sources)
         elif args.command == "verify":
             result = verify_snapshot(args.snapshot)
-        else:
+        elif args.command == "search":
             result = search_snapshot(
                 args.snapshot,
                 args.query,
                 top_k=args.top_k,
                 excerpt_chars=args.excerpt_chars,
             )
+        else:
+            from .web import serve_local
+
+            serve_local(args.library, port=args.port)
+            return 0
     except LiteratureEvidenceError as exc:
         sys.stderr.write(f"错误：{exc}\n")
         return 2
     except OSError as exc:
         sys.stderr.write(f"错误：本地文件操作失败（{exc.strerror or exc}）。\n")
         return 2
+    except KeyboardInterrupt:
+        return 130
     _emit(result)
     return 0
 
