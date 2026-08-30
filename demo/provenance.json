@@ -1,0 +1,12 @@
+{
+  "assets": [
+    {
+      "path": "synthetic-evidence.md",
+      "kind": "synthetic",
+      "source": "Written specifically for this project; no private or third-party publication was copied.",
+      "sha256": "ad699b438849b13bdab7413cea3b3730c0d1f2df26e5bfccd8e9386a23c9a2ec"
+    }
+  ],
+  "license": "Apache-2.0",
+  "note": "This synthetic demo asset is distributed under the project's Apache-2.0 license."
+}

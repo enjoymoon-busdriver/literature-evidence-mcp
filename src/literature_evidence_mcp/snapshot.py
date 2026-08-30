@@ -1,0 +1,819 @@
+from __future__ import annotations
+
+import ctypes
+import errno
+import functools
+import hashlib
+import importlib.metadata
+import json
+import os
+import shutil
+import sqlite3
+import stat
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Any, Sequence
+
+from . import __version__
+from .errors import ImportPolicyError, SnapshotError
+from .ingest import PreparedDocument, prepare_documents
+
+
+SNAPSHOT_FORMAT = "literature-evidence-snapshot"
+SCHEMA_VERSION = 1
+DATABASE_NAME = "evidence.sqlite"
+MANIFEST_NAME = "manifest.json"
+SCHEMA_NAME = "schema.sql"
+
+SCHEMA_SQL = """PRAGMA foreign_keys=ON;
+PRAGMA page_size=4096;
+PRAGMA auto_vacuum=NONE;
+CREATE TABLE artifact_meta(
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE document(
+    document_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    identifiers TEXT NOT NULL,
+    source_name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    material_type TEXT NOT NULL,
+    language TEXT NOT NULL,
+    topics TEXT NOT NULL,
+    evidence_role TEXT NOT NULL,
+    fulltext_verified INTEGER NOT NULL CHECK(fulltext_verified IN (0, 1)),
+    formula_verified INTEGER NOT NULL CHECK(formula_verified IN (0, 1))
+);
+CREATE TABLE asset(
+    asset_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES document(document_id),
+    stored_path TEXT NOT NULL UNIQUE,
+    source_sha256 TEXT NOT NULL,
+    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+    extraction_method TEXT NOT NULL,
+    extraction_status TEXT NOT NULL,
+    page_count INTEGER,
+    extracted_char_count INTEGER NOT NULL CHECK(extracted_char_count >= 0)
+);
+CREATE TABLE chunk(
+    chunk_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES document(document_id),
+    asset_id TEXT NOT NULL REFERENCES asset(asset_id),
+    ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+    chunk_text TEXT NOT NULL,
+    heading_path TEXT NOT NULL,
+    pdf_page_start INTEGER,
+    pdf_page_end INTEGER,
+    source_line_start INTEGER,
+    source_line_end INTEGER,
+    anchor_label TEXT NOT NULL,
+    fulltext_verified INTEGER NOT NULL CHECK(fulltext_verified IN (0, 1)),
+    formula_verified INTEGER NOT NULL CHECK(formula_verified IN (0, 1)),
+    UNIQUE(asset_id, ordinal)
+);
+CREATE INDEX chunk_document_idx ON chunk(document_id, ordinal);
+CREATE INDEX chunk_asset_idx ON chunk(asset_id, ordinal);
+CREATE VIRTUAL TABLE chunk_fts USING fts5(
+    chunk_text,
+    content='chunk',
+    content_rowid='rowid',
+    tokenize='unicode61'
+);
+CREATE TRIGGER chunk_ai AFTER INSERT ON chunk BEGIN
+    INSERT INTO chunk_fts(rowid, chunk_text) VALUES (new.rowid, new.chunk_text);
+END;
+"""
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_json(payload: object) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _corpus_sha256(documents: Sequence[PreparedDocument]) -> str:
+    identity = sorted(
+        [
+            {
+                "document_id": document.document_id,
+                "source_name": document.source_name,
+                "source_sha256": document.source_sha256,
+            }
+            for document in documents
+        ],
+        key=lambda item: item["document_id"],
+    )
+    return _sha256_bytes(_canonical_json(identity))
+
+
+def _manifest_corpus_sha256(sources: Sequence[dict[str, Any]]) -> str:
+    identity = sorted(
+        [
+            {
+                "document_id": source.get("document_id"),
+                "source_name": source.get("source_name"),
+                "source_sha256": source.get("source_sha256"),
+            }
+            for source in sources
+        ],
+        key=lambda item: str(item["document_id"]),
+    )
+    return _sha256_bytes(_canonical_json(identity))
+
+
+def _chunk_id(document: PreparedDocument, ordinal: int, text: str, anchor: str) -> str:
+    payload = f"{document.document_id}\0{ordinal}\0{anchor}\0{text}".encode("utf-8")
+    return "chunk_" + _sha256_bytes(payload)[:24]
+
+
+def _write_new_file(path: Path, payload: bytes) -> None:
+    with path.open("xb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _prepare_library(library: Path) -> tuple[Path, Path]:
+    requested = Path(library).expanduser()
+    if requested.is_symlink():
+        raise ImportPolicyError("资料库目录不能是符号链接。")
+    requested.mkdir(parents=True, exist_ok=True)
+    root = requested.resolve(strict=True)
+    if not root.is_dir():
+        raise ImportPolicyError("资料库路径不是目录。")
+    snapshots = root / "snapshots"
+    if snapshots.is_symlink():
+        raise ImportPolicyError("snapshots 目录不能是符号链接。")
+    snapshots.mkdir(exist_ok=True)
+    return root, snapshots.resolve(strict=True)
+
+
+def _populate_database(
+    path: Path,
+    documents: Sequence[PreparedDocument],
+    corpus_sha256: str,
+) -> dict[str, int]:
+    database = sqlite3.connect(path)
+    try:
+        database.execute("PRAGMA journal_mode=DELETE")
+        database.executescript(SCHEMA_SQL)
+        metadata = {
+            "artifact_format": SNAPSHOT_FORMAT,
+            "schema_version": str(SCHEMA_VERSION),
+            "corpus_sha256": corpus_sha256,
+            "software_version": __version__,
+        }
+        database.executemany(
+            "INSERT INTO artifact_meta(key, value) VALUES (?, ?)",
+            sorted(metadata.items()),
+        )
+        for document in documents:
+            material_type = "pdf" if document.media_type == "application/pdf" else "markdown"
+            database.execute(
+                """INSERT INTO document(
+                    document_id,title,identifiers,source_name,source_type,media_type,
+                    material_type,language,topics,evidence_role,fulltext_verified,
+                    formula_verified
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,0,0)""",
+                (
+                    document.document_id,
+                    document.title,
+                    "{}",
+                    document.source_name,
+                    "local_file",
+                    document.media_type,
+                    material_type,
+                    "und",
+                    "[]",
+                    "imported_source",
+                ),
+            )
+            stored_path = f"sources/{document.document_id}{document.suffix}"
+            database.execute(
+                """INSERT INTO asset(
+                    asset_id,document_id,stored_path,source_sha256,byte_size,
+                    extraction_method,extraction_status,page_count,extracted_char_count
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    document.asset_id,
+                    document.document_id,
+                    stored_path,
+                    document.source_sha256,
+                    document.byte_size,
+                    document.extraction_method,
+                    document.extraction_status,
+                    document.page_count,
+                    document.extracted_char_count,
+                ),
+            )
+            for chunk in document.chunks:
+                database.execute(
+                    """INSERT INTO chunk(
+                        chunk_id,document_id,asset_id,ordinal,chunk_text,heading_path,
+                        pdf_page_start,pdf_page_end,source_line_start,source_line_end,
+                        anchor_label,fulltext_verified,formula_verified
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,0,0)""",
+                    (
+                        _chunk_id(document, chunk.ordinal, chunk.text, chunk.anchor_label),
+                        document.document_id,
+                        document.asset_id,
+                        chunk.ordinal,
+                        chunk.text,
+                        json.dumps(chunk.heading_path, ensure_ascii=False),
+                        chunk.pdf_page_start,
+                        chunk.pdf_page_end,
+                        chunk.source_line_start,
+                        chunk.source_line_end,
+                        chunk.anchor_label,
+                    ),
+                )
+        database.commit()
+        integrity = database.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise SnapshotError("临时数据库完整性检查失败。")
+        if database.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise SnapshotError("临时数据库外键检查失败。")
+        counts = {
+            "documents": database.execute("SELECT count(*) FROM document").fetchone()[0],
+            "assets": database.execute("SELECT count(*) FROM asset").fetchone()[0],
+            "chunks": database.execute("SELECT count(*) FROM chunk").fetchone()[0],
+            "fts_rows": database.execute("SELECT count(*) FROM chunk_fts").fetchone()[0],
+        }
+        if counts["chunks"] != counts["fts_rows"]:
+            raise SnapshotError("临时数据库正文片段与 FTS 行数不一致。")
+        return counts
+    finally:
+        database.close()
+
+
+def _readonly_uri(path: Path) -> str:
+    return path.resolve(strict=True).as_uri() + "?mode=ro&immutable=1"
+
+
+def _open_readonly(path: Path) -> sqlite3.Connection:
+    database = sqlite3.connect(_readonly_uri(path), uri=True)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA temp_store=MEMORY")
+    if database.execute("PRAGMA temp_store").fetchone()[0] != 2:
+        database.close()
+        raise SnapshotError("SQLite 未将临时排序数据限制在内存。")
+    database.execute("PRAGMA query_only=ON")
+    if database.execute("PRAGMA query_only").fetchone()[0] != 1:
+        database.close()
+        raise SnapshotError("SQLite 未进入 query_only 只读状态。")
+    return database
+
+
+def _sqlite_schema_sha256_from_connection(database: sqlite3.Connection) -> str:
+    rows = database.execute(
+        """SELECT type,name,tbl_name,sql FROM sqlite_schema
+        WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+        ORDER BY type,name,tbl_name"""
+    ).fetchall()
+    normalized = [list(row) for row in rows]
+    return _sha256_bytes(_canonical_json(normalized))
+
+
+def _sqlite_schema_sha256(path: Path) -> str:
+    database = _open_readonly(path)
+    try:
+        return _sqlite_schema_sha256_from_connection(database)
+    finally:
+        database.close()
+
+
+@functools.lru_cache(maxsize=1)
+def _expected_sqlite_schema_sha256() -> str:
+    database = sqlite3.connect(":memory:")
+    database.row_factory = sqlite3.Row
+    try:
+        database.executescript(SCHEMA_SQL)
+        return _sqlite_schema_sha256_from_connection(database)
+    finally:
+        database.close()
+
+
+def _serialized_database(path: Path) -> bytes:
+    database = _open_readonly(path)
+    try:
+        if not hasattr(database, "serialize"):
+            raise SnapshotError(
+                "当前 Python 的 SQLite 缺少 serialize 支持，无法绑定核验与检索镜像。"
+            )
+        return database.serialize()
+    except sqlite3.Error as exc:
+        raise SnapshotError("无法读取冻结 SQLite 数据库镜像。") from exc
+    finally:
+        database.close()
+
+
+def _open_serialized_readonly(payload: bytes) -> sqlite3.Connection:
+    database = sqlite3.connect(":memory:")
+    try:
+        if not hasattr(database, "deserialize"):
+            raise SnapshotError(
+                "当前 Python 的 SQLite 缺少 deserialize 支持，无法打开已核验镜像。"
+            )
+        database.deserialize(payload)
+        database.row_factory = sqlite3.Row
+        database.execute("PRAGMA temp_store=MEMORY")
+        if database.execute("PRAGMA temp_store").fetchone()[0] != 2:
+            raise SnapshotError("内存 SQLite 镜像未使用内存临时区。")
+        database.execute("PRAGMA query_only=ON")
+        if database.execute("PRAGMA query_only").fetchone()[0] != 1:
+            raise SnapshotError("内存 SQLite 镜像未进入 query_only 只读状态。")
+        return database
+    except BaseException:
+        database.close()
+        raise
+
+
+def _sha256_regular_file(path: Path, *, label: str) -> tuple[str, int]:
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise SnapshotError(f"快照缺少{label}。") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise SnapshotError(f"{label}必须是普通文件且不能是符号链接。")
+    if before.st_nlink != 1:
+        raise SnapshotError(f"{label}不能是多链接文件。")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            digest = hashlib.sha256()
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise SnapshotError(f"无法读取{label}。") from exc
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise SnapshotError(f"核验期间{label}发生变化。")
+    return digest.hexdigest(), after.st_size
+
+
+def _schema_sql_sha256() -> str:
+    return _sha256_bytes(SCHEMA_SQL.encode("utf-8"))
+
+
+def _dependency_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not-installed"
+
+
+def _source_manifest(document: PreparedDocument) -> dict[str, Any]:
+    return {
+        "document_id": document.document_id,
+        "asset_id": document.asset_id,
+        "source_name": document.source_name,
+        "stored_path": f"sources/{document.document_id}{document.suffix}",
+        "media_type": document.media_type,
+        "title": document.title,
+        "source_sha256": document.source_sha256,
+        "byte_size": document.byte_size,
+        "extraction_method": document.extraction_method,
+        "extraction_status": document.extraction_status,
+        "page_count": document.page_count,
+        "extracted_char_count": document.extracted_char_count,
+        "chunk_count": len(document.chunks),
+        "fulltext_verification": "unverified",
+        "formula_verification": "unverified",
+    }
+
+
+def _cleanup_build_directory(path: Path, snapshots_root: Path) -> None:
+    try:
+        inside = path.parent.resolve(strict=True) == snapshots_root.resolve(strict=True)
+    except OSError:
+        inside = False
+    if inside and path.name.startswith(".building-") and path.exists() and not path.is_symlink():
+        shutil.rmtree(path)
+
+
+def _publish_directory_no_replace(source: Path, target: Path) -> None:
+    """Atomically publish on macOS without replacing an existing snapshot."""
+    if sys.platform == "darwin":
+        renamex_np = ctypes.CDLL(None, use_errno=True).renamex_np
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(os.fsencode(source), os.fsencode(target), 0x00000004)
+        if result == 0:
+            return
+        error_number = ctypes.get_errno()
+        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise SnapshotError("目标快照已存在；未覆盖任何已有快照。")
+        raise OSError(error_number, os.strerror(error_number), str(target))
+    if target.exists():
+        raise SnapshotError("目标快照已存在；未覆盖任何已有快照。")
+    os.rename(source, target)
+
+
+def build_snapshot(library: Path, sources: Sequence[Path]) -> dict[str, Any]:
+    """Create a new, never-overwritten snapshot from explicitly selected local files."""
+    documents = prepare_documents(sources)
+    corpus_sha256 = _corpus_sha256(documents)
+    _library_root, snapshots_root = _prepare_library(library)
+    created_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    snapshot_id = f"{timestamp}-{corpus_sha256[:12]}-{uuid.uuid4().hex[:8]}"
+    final_directory = snapshots_root / snapshot_id
+    if final_directory.exists():
+        raise SnapshotError("新快照 ID 意外冲突；未覆盖任何已有快照。")
+    temporary_directory = Path(
+        tempfile.mkdtemp(prefix=".building-", dir=snapshots_root)
+    )
+
+    try:
+        sources_directory = temporary_directory / "sources"
+        sources_directory.mkdir()
+        for document in documents:
+            stored = sources_directory / f"{document.document_id}{document.suffix}"
+            _write_new_file(stored, document.payload)
+        _fsync_directory(sources_directory)
+
+        schema_path = temporary_directory / SCHEMA_NAME
+        _write_new_file(schema_path, SCHEMA_SQL.encode("utf-8"))
+        database_path = temporary_directory / DATABASE_NAME
+        counts = _populate_database(database_path, documents, corpus_sha256)
+        database_hash, database_size = _sha256_regular_file(
+            database_path, label="SQLite 数据库"
+        )
+        sqlite_schema_hash = _sqlite_schema_sha256(database_path)
+
+        manifest = {
+            "format": SNAPSHOT_FORMAT,
+            "schema_version": SCHEMA_VERSION,
+            "snapshot_id": snapshot_id,
+            "created_at": created_at,
+            "corpus_sha256": corpus_sha256,
+            "software": {
+                "literature_evidence_mcp": __version__,
+                "python": ".".join(map(str, sys.version_info[:3])),
+                "sqlite": sqlite3.sqlite_version,
+                "pypdf": _dependency_version("pypdf"),
+            },
+            "schema": {
+                "path": SCHEMA_NAME,
+                "sha256": _schema_sql_sha256(),
+                "sqlite_schema_sha256": sqlite_schema_hash,
+            },
+            "database": {
+                "path": DATABASE_NAME,
+                "sha256": database_hash,
+                "byte_size": database_size,
+            },
+            "counts": counts,
+            "sources": [_source_manifest(document) for document in documents],
+            "limitations": [
+                "BM25 uses SQLite FTS5 unicode61 without language-specific tokenization.",
+                "Text extraction does not promote fulltext or formula verification.",
+                "No result means only that this search returned no evidence.",
+            ],
+        }
+        manifest_path = temporary_directory / MANIFEST_NAME
+        manifest_payload = json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, indent=2
+        ).encode("utf-8") + b"\n"
+        _write_new_file(manifest_path, manifest_payload)
+        _fsync_directory(temporary_directory)
+        verified, _database_image = _verify_snapshot(
+            temporary_directory, require_directory_name=False
+        )
+        _publish_directory_no_replace(temporary_directory, final_directory)
+        _fsync_directory(snapshots_root)
+    except BaseException:
+        _cleanup_build_directory(temporary_directory, snapshots_root)
+        raise
+
+    return {
+        "snapshot_id": snapshot_id,
+        "snapshot_path": str(final_directory),
+        "manifest_sha256": verified["manifest_sha256"],
+        "corpus_sha256": corpus_sha256,
+        "database_sha256": database_hash,
+        "schema_version": SCHEMA_VERSION,
+        "counts": counts,
+    }
+
+
+def _load_manifest(snapshot_directory: Path) -> tuple[dict[str, Any], str]:
+    manifest_path = snapshot_directory / MANIFEST_NAME
+    try:
+        before = manifest_path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise SnapshotError("manifest.json 必须是普通文件且不能是符号链接。")
+        if before.st_nlink != 1:
+            raise SnapshotError("manifest.json 不能是多链接文件。")
+        if before.st_size > 8 * 1024 * 1024:
+            raise SnapshotError("manifest.json 超过 8 MiB 上限。")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(manifest_path, flags)
+        try:
+            raw = bytearray()
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                raw.extend(block)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise SnapshotError("读取期间 manifest.json 发生变化。")
+        digest = _sha256_bytes(bytes(raw))
+        payload = json.loads(bytes(raw).decode("utf-8"))
+    except SnapshotError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SnapshotError("manifest.json 不是有效 UTF-8 JSON。") from exc
+    if not isinstance(payload, dict):
+        raise SnapshotError("manifest.json 顶层必须是对象。")
+    return payload, digest
+
+
+def _snapshot_member(snapshot_directory: Path, raw: object) -> Path:
+    if not isinstance(raw, str):
+        raise SnapshotError("manifest 中的快照相对路径无效。")
+    relative = PurePosixPath(raw)
+    if not raw or relative.is_absolute() or ".." in relative.parts or "\\" in raw:
+        raise SnapshotError("manifest 中的快照相对路径不安全。")
+    target = snapshot_directory.joinpath(*relative.parts)
+    try:
+        resolved_parent = target.parent.resolve(strict=True)
+        resolved_root = snapshot_directory.resolve(strict=True)
+        resolved_parent.relative_to(resolved_root)
+    except (OSError, ValueError) as exc:
+        raise SnapshotError("manifest 中的快照路径越界或不存在。") from exc
+    return target
+
+
+def _database_counts(database: sqlite3.Connection) -> dict[str, int]:
+    try:
+        return {
+            "documents": database.execute("SELECT count(*) FROM document").fetchone()[0],
+            "assets": database.execute("SELECT count(*) FROM asset").fetchone()[0],
+            "chunks": database.execute("SELECT count(*) FROM chunk").fetchone()[0],
+            "fts_rows": database.execute("SELECT count(*) FROM chunk_fts").fetchone()[0],
+        }
+    except sqlite3.Error as exc:
+        raise SnapshotError("SQLite schema 或计数不可读。") from exc
+
+
+def _verify_snapshot(
+    snapshot: Path, *, require_directory_name: bool
+) -> tuple[dict[str, Any], bytes]:
+    """Verify one exact database image plus its manifest and frozen sources."""
+    directory = Path(snapshot).expanduser()
+    if directory.is_symlink():
+        raise SnapshotError("快照目录不能是符号链接。")
+    try:
+        directory = directory.resolve(strict=True)
+    except OSError as exc:
+        raise SnapshotError("找不到快照目录。") from exc
+    if not directory.is_dir():
+        raise SnapshotError("快照路径不是目录。")
+    manifest, manifest_hash = _load_manifest(directory)
+    if manifest.get("format") != SNAPSHOT_FORMAT:
+        raise SnapshotError("快照 format 不匹配。")
+    if type(manifest.get("schema_version")) is not int or manifest.get(
+        "schema_version"
+    ) != SCHEMA_VERSION:
+        raise SnapshotError("快照 schema_version 不受支持。")
+    if require_directory_name and manifest.get("snapshot_id") != directory.name:
+        raise SnapshotError("快照目录名与 snapshot_id 不一致。")
+
+    for suffix in ("-journal", "-wal", "-shm"):
+        if (directory / (DATABASE_NAME + suffix)).exists():
+            raise SnapshotError("冻结 SQLite 快照旁存在 sidecar 文件。")
+    expected_root_entries = {MANIFEST_NAME, SCHEMA_NAME, DATABASE_NAME, "sources"}
+    actual_root_entries = {entry.name for entry in directory.iterdir()}
+    if actual_root_entries != expected_root_entries:
+        raise SnapshotError("快照根目录含未登记文件或缺少固定文件。")
+
+    schema_info = manifest.get("schema")
+    database_info = manifest.get("database")
+    sources = manifest.get("sources")
+    counts = manifest.get("counts")
+    if not isinstance(schema_info, dict) or not isinstance(database_info, dict):
+        raise SnapshotError("manifest 缺少 schema 或 database 记录。")
+    if schema_info.get("path") != SCHEMA_NAME:
+        raise SnapshotError("manifest schema.path 必须固定为 schema.sql。")
+    if database_info.get("path") != DATABASE_NAME:
+        raise SnapshotError("manifest database.path 必须固定为 evidence.sqlite。")
+    if not isinstance(sources, list) or not isinstance(counts, dict):
+        raise SnapshotError("manifest 缺少 sources 或 counts 记录。")
+    if set(counts) != {"documents", "assets", "chunks", "fts_rows"} or any(
+        type(value) is not int or value < 0 for value in counts.values()
+    ):
+        raise SnapshotError("manifest counts 记录无效。")
+    software = manifest.get("software")
+    if not isinstance(software, dict) or not isinstance(
+        software.get("literature_evidence_mcp"), str
+    ):
+        raise SnapshotError("manifest 缺少构建软件版本。")
+
+    schema_path = _snapshot_member(directory, schema_info.get("path"))
+    schema_hash, _ = _sha256_regular_file(schema_path, label="schema.sql")
+    if schema_hash != schema_info.get("sha256") or schema_hash != _schema_sql_sha256():
+        raise SnapshotError("schema.sql 哈希不匹配。")
+
+    database_path = _snapshot_member(directory, database_info.get("path"))
+    database_hash, database_size = _sha256_regular_file(
+        database_path, label="SQLite 数据库"
+    )
+    if database_hash != database_info.get("sha256"):
+        raise SnapshotError("SQLite 数据库 SHA-256 不匹配。")
+    if database_size != database_info.get("byte_size"):
+        raise SnapshotError("SQLite 数据库字节数不匹配。")
+    database_image = _serialized_database(database_path)
+    if _sha256_bytes(database_image) != database_hash or len(database_image) != database_size:
+        raise SnapshotError("SQLite 数据库在哈希核验与读取之间发生变化。")
+
+    expected_source_paths: set[str] = set()
+    expected_document_ids: set[str] = set()
+    expected_asset_ids: set[str] = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            raise SnapshotError("manifest source 记录无效。")
+        document_id = source.get("document_id")
+        asset_id = source.get("asset_id")
+        if not isinstance(document_id, str) or not isinstance(asset_id, str):
+            raise SnapshotError("manifest source 缺少 document_id 或 asset_id。")
+        expected_document_ids.add(document_id)
+        expected_asset_ids.add(asset_id)
+        stored_path = source.get("stored_path")
+        source_path = _snapshot_member(directory, stored_path)
+        source_hash, source_size = _sha256_regular_file(
+            source_path, label="冻结源文件"
+        )
+        if source_hash != source.get("source_sha256"):
+            raise SnapshotError("冻结源文件 SHA-256 不匹配。")
+        if source_size != source.get("byte_size"):
+            raise SnapshotError("冻结源文件字节数不匹配。")
+        if source.get("fulltext_verification") != "unverified" or source.get(
+            "formula_verification"
+        ) != "unverified":
+            raise SnapshotError("v0.1 快照不得自动提升全文或公式核验状态。")
+        expected_source_paths.add(str(stored_path))
+    if len(expected_source_paths) != len(sources):
+        raise SnapshotError("manifest 中的冻结源路径重复。")
+    if len(expected_document_ids) != len(sources) or len(expected_asset_ids) != len(
+        sources
+    ):
+        raise SnapshotError("manifest 中的 document_id 或 asset_id 重复。")
+    if _manifest_corpus_sha256(sources) != manifest.get("corpus_sha256"):
+        raise SnapshotError("manifest corpus_sha256 与源记录不一致。")
+
+    sources_directory = directory / "sources"
+    if sources_directory.is_symlink() or not sources_directory.is_dir():
+        raise SnapshotError("快照 sources 目录无效。")
+    actual_source_paths: set[str] = set()
+    for path in sources_directory.iterdir():
+        if path.is_symlink() or not path.is_file():
+            raise SnapshotError("快照 sources 中含未登记或非普通文件。")
+        actual_source_paths.add(path.relative_to(directory).as_posix())
+    if actual_source_paths != expected_source_paths:
+        raise SnapshotError("冻结源文件集合与 manifest 不一致。")
+
+    database = _open_serialized_readonly(database_image)
+    try:
+        actual_sqlite_schema_hash = _sqlite_schema_sha256_from_connection(database)
+        if actual_sqlite_schema_hash != schema_info.get("sqlite_schema_sha256"):
+            raise SnapshotError("SQLite 实际 schema 哈希与 manifest 不匹配。")
+        if actual_sqlite_schema_hash != _expected_sqlite_schema_sha256():
+            raise SnapshotError("SQLite 实际 schema 不符合 schema_version 1。")
+        integrity = database.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise SnapshotError("SQLite integrity_check 未通过。")
+        if database.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise SnapshotError("SQLite foreign_key_check 未通过。")
+        actual_counts = _database_counts(database)
+        metadata = dict(database.execute("SELECT key,value FROM artifact_meta"))
+        database_sources = database.execute(
+            """SELECT
+                d.document_id,d.title,d.source_name,d.media_type,
+                d.fulltext_verified,d.formula_verified,
+                a.asset_id,a.stored_path,a.source_sha256,a.byte_size,
+                a.extraction_method,a.extraction_status,a.page_count,
+                a.extracted_char_count,
+                (SELECT count(*) FROM chunk c WHERE c.asset_id=a.asset_id) AS chunk_count
+            FROM document d JOIN asset a ON a.document_id=d.document_id
+            ORDER BY d.document_id"""
+        ).fetchall()
+        promoted_chunk = database.execute(
+            """SELECT 1 FROM chunk
+            WHERE fulltext_verified != 0 OR formula_verified != 0 LIMIT 1"""
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise SnapshotError("SQLite 完整性或元数据检查失败。") from exc
+    finally:
+        database.close()
+    if actual_counts != counts:
+        raise SnapshotError("SQLite 实际数量与 manifest 不一致。")
+    if actual_counts["documents"] != len(sources) or actual_counts["assets"] != len(
+        sources
+    ):
+        raise SnapshotError("v0.1 的 document/asset/source 一对一数量不一致。")
+    if actual_counts["chunks"] != actual_counts["fts_rows"]:
+        raise SnapshotError("SQLite chunk 与 FTS 行数不一致。")
+    if metadata != {
+        "artifact_format": SNAPSHOT_FORMAT,
+        "schema_version": str(SCHEMA_VERSION),
+        "corpus_sha256": manifest.get("corpus_sha256"),
+        "software_version": software["literature_evidence_mcp"],
+    }:
+        raise SnapshotError("SQLite artifact_meta 与 manifest/软件版本不一致。")
+    if promoted_chunk is not None:
+        raise SnapshotError("v0.1 chunk 不得自动提升全文或公式核验状态。")
+    source_by_document = {source["document_id"]: source for source in sources}
+    for row in database_sources:
+        source = source_by_document.get(row["document_id"])
+        if source is None:
+            raise SnapshotError("SQLite document 未登记在 manifest sources。")
+        comparable = {
+            "asset_id": row["asset_id"],
+            "title": row["title"],
+            "source_name": row["source_name"],
+            "media_type": row["media_type"],
+            "stored_path": row["stored_path"],
+            "source_sha256": row["source_sha256"],
+            "byte_size": row["byte_size"],
+            "extraction_method": row["extraction_method"],
+            "extraction_status": row["extraction_status"],
+            "page_count": row["page_count"],
+            "extracted_char_count": row["extracted_char_count"],
+            "chunk_count": row["chunk_count"],
+        }
+        if any(source.get(key) != value for key, value in comparable.items()):
+            raise SnapshotError("SQLite source 元数据与 manifest 不一致。")
+        if row["fulltext_verified"] != 0 or row["formula_verified"] != 0:
+            raise SnapshotError("v0.1 SQLite 不得自动提升全文或公式核验状态。")
+
+    status = {
+        "verified": True,
+        "snapshot_id": manifest["snapshot_id"],
+        "snapshot_path": str(directory),
+        "manifest_sha256": manifest_hash,
+        "corpus_sha256": manifest["corpus_sha256"],
+        "database_sha256": database_hash,
+        "schema_version": SCHEMA_VERSION,
+        "counts": actual_counts,
+        "readonly": True,
+    }
+    return status, database_image
+
+
+def verify_snapshot(snapshot: Path) -> dict[str, Any]:
+    """Recompute the frozen snapshot's hashes, schema identity, counts, and integrity."""
+    status, _database_image = _verify_snapshot(
+        snapshot, require_directory_name=True
+    )
+    return status
+
+
+def _open_verified_snapshot(
+    snapshot: Path,
+) -> tuple[dict[str, Any], sqlite3.Connection]:
+    status, database_image = _verify_snapshot(
+        snapshot, require_directory_name=True
+    )
+    return status, _open_serialized_readonly(database_image)

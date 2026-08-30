@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "literature-evidence-mcp"
+version = "0.1.0.dev0"
+description = "Auditable local literature evidence snapshots and read-only retrieval."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+  "pypdf>=6.0,<7",
+]
+
+[project.scripts]
+literature-evidence = "literature_evidence_mcp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
