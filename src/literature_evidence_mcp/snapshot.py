@@ -19,7 +19,7 @@ from typing import Any, Sequence
 
 from . import __version__
 from .errors import ImportPolicyError, SnapshotError
-from .ingest import PreparedDocument, prepare_documents
+from .ingest import MAX_CHUNK_CHARS, PreparedDocument, prepare_documents
 
 
 SNAPSHOT_FORMAT = "literature-evidence-snapshot"
@@ -133,8 +133,8 @@ def _manifest_corpus_sha256(sources: Sequence[dict[str, Any]]) -> str:
     return _sha256_bytes(_canonical_json(identity))
 
 
-def _chunk_id(document: PreparedDocument, ordinal: int, text: str, anchor: str) -> str:
-    payload = f"{document.document_id}\0{ordinal}\0{anchor}\0{text}".encode("utf-8")
+def _chunk_id(document_id: str, ordinal: int, text: str, anchor: str) -> str:
+    payload = f"{document_id}\0{ordinal}\0{anchor}\0{text}".encode("utf-8")
     return "chunk_" + _sha256_bytes(payload)[:24]
 
 
@@ -234,7 +234,12 @@ def _populate_database(
                         anchor_label,fulltext_verified,formula_verified
                     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,0,0)""",
                     (
-                        _chunk_id(document, chunk.ordinal, chunk.text, chunk.anchor_label),
+                        _chunk_id(
+                            document.document_id,
+                            chunk.ordinal,
+                            chunk.text,
+                            chunk.anchor_label,
+                        ),
                         document.document_id,
                         document.asset_id,
                         chunk.ordinal,
@@ -641,6 +646,19 @@ def _json_string_list(raw: object, *, label: str) -> list[str]:
     return value
 
 
+def _validate_document_semantics(row: sqlite3.Row) -> None:
+    if row["source_type"] != "local_file":
+        raise SnapshotError("v0.1 SQLite document.source_type 必须是 local_file。")
+    expected_material_type = {
+        "text/markdown": "markdown",
+        "application/pdf": "pdf",
+    }.get(row["media_type"])
+    if expected_material_type is None or row["material_type"] != expected_material_type:
+        raise SnapshotError(
+            "v0.1 SQLite document.material_type 与 media_type 不一致。"
+        )
+
+
 def _validate_chunk_semantics(chunks: Sequence[sqlite3.Row]) -> None:
     next_ordinal_by_asset: dict[str, int] = {}
     for row in chunks:
@@ -654,6 +672,13 @@ def _validate_chunk_semantics(chunks: Sequence[sqlite3.Row]) -> None:
             raise SnapshotError("v0.1 SQLite chunk 序号必须从 1 连续排列。")
         next_ordinal_by_asset[asset_id] = expected_ordinal + 1
 
+        chunk_text = row["chunk_text"]
+        if not isinstance(chunk_text, str) or not chunk_text.strip():
+            raise SnapshotError("v0.1 SQLite chunk.chunk_text 不得为空。")
+        if len(chunk_text) > MAX_CHUNK_CHARS:
+            raise SnapshotError(
+                f"v0.1 SQLite chunk.chunk_text 不得超过 {MAX_CHUNK_CHARS} 字符。"
+            )
         heading_path = _json_string_list(row["heading_path"], label="heading_path")
         page_start = row["pdf_page_start"]
         page_end = row["pdf_page_end"]
@@ -696,6 +721,11 @@ def _validate_chunk_semantics(chunks: Sequence[sqlite3.Row]) -> None:
             raise SnapshotError(
                 "v0.1 SQLite chunk 的 anchor_label 与定位字段不一致。"
             )
+        expected_chunk_id = _chunk_id(
+            row["document_id"], row["ordinal"], chunk_text, row["anchor_label"]
+        )
+        if row["chunk_id"] != expected_chunk_id:
+            raise SnapshotError("v0.1 SQLite chunk.chunk_id 与派生身份不一致。")
 
 
 def _verify_snapshot(
@@ -830,7 +860,8 @@ def _verify_snapshot(
         metadata = dict(database.execute("SELECT key,value FROM artifact_meta"))
         database_sources = database.execute(
             """SELECT
-                d.document_id,d.title,d.identifiers,d.source_name,d.media_type,d.topics,
+                d.document_id,d.title,d.identifiers,d.source_name,d.source_type,
+                d.media_type,d.material_type,d.topics,
                 d.fulltext_verified,d.formula_verified,
                 a.asset_id,a.stored_path,a.source_sha256,a.byte_size,
                 a.extraction_method,a.extraction_status,a.page_count,
@@ -841,7 +872,7 @@ def _verify_snapshot(
         ).fetchall()
         database_chunks = database.execute(
             """SELECT
-                c.document_id,c.asset_id,c.ordinal,c.heading_path,
+                c.chunk_id,c.document_id,c.asset_id,c.ordinal,c.chunk_text,c.heading_path,
                 c.pdf_page_start,c.pdf_page_end,c.source_line_start,c.source_line_end,
                 c.anchor_label,a.document_id AS asset_document_id,a.page_count,
                 d.media_type
@@ -899,6 +930,7 @@ def _verify_snapshot(
             raise SnapshotError("SQLite source 元数据与 manifest 不一致。")
         if row["chunk_count"] < 1:
             raise SnapshotError("v0.1 每个 asset 必须至少包含一个 chunk。")
+        _validate_document_semantics(row)
         _json_object_of_strings(row["identifiers"], label="identifiers")
         _json_string_list(row["topics"], label="topics")
         if row["fulltext_verified"] != 0 or row["formula_verified"] != 0:

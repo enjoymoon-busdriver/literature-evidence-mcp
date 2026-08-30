@@ -81,13 +81,42 @@ def _refresh_database_manifest(snapshot: Path) -> None:
     )
 
 
-def _mutate_database(snapshot: Path, statement: str, parameters: tuple[object, ...]) -> None:
+def _mutate_database(
+    snapshot: Path,
+    statement: str,
+    parameters: tuple[object, ...],
+    *,
+    rebuild_fts: bool = False,
+) -> None:
     database = sqlite3.connect(snapshot / "evidence.sqlite")
+    extracted_char_counts: dict[str, int] | None = None
     try:
         database.execute(statement, parameters)
+        if rebuild_fts:
+            database.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('rebuild')")
+            database.execute(
+                """UPDATE asset SET extracted_char_count=(
+                    SELECT coalesce(sum(length(chunk_text)),0) FROM chunk
+                    WHERE chunk.asset_id=asset.asset_id
+                )"""
+            )
+            extracted_char_counts = dict(
+                database.execute(
+                    "SELECT asset_id,extracted_char_count FROM asset"
+                ).fetchall()
+            )
         database.commit()
     finally:
         database.close()
+    if extracted_char_counts is not None:
+        manifest_path = snapshot / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for source in manifest["sources"]:
+            source["extracted_char_count"] = extracted_char_counts[source["asset_id"]]
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
     _refresh_database_manifest(snapshot)
 
 
@@ -269,6 +298,17 @@ class StageOneSnapshotTests(unittest.TestCase):
             deeply_nested_json = "[" * 20000 + "]" * 20000
             with self.assertRaises(RecursionError):
                 json.loads(deeply_nested_json)
+            database = sqlite3.connect(baseline / "evidence.sqlite")
+            try:
+                document_id, ordinal, original_chunk_text, anchor_label = database.execute(
+                    """SELECT document_id,ordinal,chunk_text,anchor_label FROM chunk
+                    WHERE source_line_start IS NOT NULL"""
+                ).fetchone()
+            finally:
+                database.close()
+            wrong_anchor = "wrong anchor"
+            empty_chunk_text = ""
+            oversized_chunk_text = "x" * (snapshot_module.MAX_CHUNK_CHARS + 1)
 
             cases = [
                 (
@@ -294,6 +334,18 @@ class StageOneSnapshotTests(unittest.TestCase):
                     "UPDATE document SET topics=?",
                     ('["valid", 1]',),
                     "topics",
+                ),
+                (
+                    "source-type",
+                    "UPDATE document SET source_type=?",
+                    ("remote",),
+                    "source_type",
+                ),
+                (
+                    "material-type",
+                    "UPDATE document SET material_type=?",
+                    ("other",),
+                    "material_type",
                 ),
                 (
                     "heading-path-wrong-shape",
@@ -323,9 +375,45 @@ class StageOneSnapshotTests(unittest.TestCase):
                 ),
                 (
                     "anchor-label-mismatch",
-                    "UPDATE chunk SET anchor_label=? WHERE source_line_start IS NOT NULL",
-                    ("wrong anchor",),
+                    "UPDATE chunk SET anchor_label=?,chunk_id=? "
+                    "WHERE source_line_start IS NOT NULL",
+                    (
+                        wrong_anchor,
+                        snapshot_module._chunk_id(
+                            document_id, ordinal, original_chunk_text, wrong_anchor
+                        ),
+                    ),
                     "anchor_label",
+                ),
+                (
+                    "empty-chunk-text",
+                    "UPDATE chunk SET chunk_text=?,chunk_id=? "
+                    "WHERE source_line_start IS NOT NULL",
+                    (
+                        empty_chunk_text,
+                        snapshot_module._chunk_id(
+                            document_id, ordinal, empty_chunk_text, anchor_label
+                        ),
+                    ),
+                    "chunk_text 不得为空",
+                ),
+                (
+                    "oversized-chunk-text",
+                    "UPDATE chunk SET chunk_text=?,chunk_id=? "
+                    "WHERE source_line_start IS NOT NULL",
+                    (
+                        oversized_chunk_text,
+                        snapshot_module._chunk_id(
+                            document_id, ordinal, oversized_chunk_text, anchor_label
+                        ),
+                    ),
+                    "chunk_text 不得超过",
+                ),
+                (
+                    "derived-chunk-id",
+                    "UPDATE chunk SET chunk_id=? WHERE source_line_start IS NOT NULL",
+                    ("chunk_000000000000000000000000",),
+                    "chunk_id",
                 ),
             ]
 
@@ -334,7 +422,16 @@ class StageOneSnapshotTests(unittest.TestCase):
                     snapshot = root / name / baseline.name
                     snapshot.parent.mkdir()
                     shutil.copytree(baseline, snapshot)
-                    _mutate_database(snapshot, statement, parameters)
+                    rebuild_fts = name in {
+                        "empty-chunk-text",
+                        "oversized-chunk-text",
+                    }
+                    _mutate_database(
+                        snapshot,
+                        statement,
+                        parameters,
+                        rebuild_fts=rebuild_fts,
+                    )
 
                     with self.assertRaisesRegex(SnapshotError, message):
                         verify_snapshot(snapshot)
