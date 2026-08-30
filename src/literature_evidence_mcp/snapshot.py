@@ -271,17 +271,25 @@ def _readonly_uri(path: Path) -> str:
 
 
 def _open_readonly(path: Path) -> sqlite3.Connection:
-    database = sqlite3.connect(_readonly_uri(path), uri=True)
-    database.row_factory = sqlite3.Row
-    database.execute("PRAGMA temp_store=MEMORY")
-    if database.execute("PRAGMA temp_store").fetchone()[0] != 2:
-        database.close()
-        raise SnapshotError("SQLite 未将临时排序数据限制在内存。")
-    database.execute("PRAGMA query_only=ON")
-    if database.execute("PRAGMA query_only").fetchone()[0] != 1:
-        database.close()
-        raise SnapshotError("SQLite 未进入 query_only 只读状态。")
-    return database
+    database: sqlite3.Connection | None = None
+    try:
+        database = sqlite3.connect(_readonly_uri(path), uri=True)
+        database.row_factory = sqlite3.Row
+        database.execute("PRAGMA temp_store=MEMORY")
+        if database.execute("PRAGMA temp_store").fetchone()[0] != 2:
+            raise SnapshotError("SQLite 未将临时排序数据限制在内存。")
+        database.execute("PRAGMA query_only=ON")
+        if database.execute("PRAGMA query_only").fetchone()[0] != 1:
+            raise SnapshotError("SQLite 未进入 query_only 只读状态。")
+        return database
+    except SnapshotError:
+        if database is not None:
+            database.close()
+        raise
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        if database is not None:
+            database.close()
+        raise SnapshotError("无法以只读方式打开冻结 SQLite 数据库。") from exc
 
 
 def _sqlite_schema_sha256_from_connection(database: sqlite3.Connection) -> str:
@@ -343,6 +351,12 @@ def _open_serialized_readonly(payload: bytes) -> sqlite3.Connection:
         if database.execute("PRAGMA query_only").fetchone()[0] != 1:
             raise SnapshotError("内存 SQLite 镜像未进入 query_only 只读状态。")
         return database
+    except SnapshotError:
+        database.close()
+        raise
+    except sqlite3.Error as exc:
+        database.close()
+        raise SnapshotError("无法打开已核验的 SQLite 镜像。") from exc
     except BaseException:
         database.close()
         raise
@@ -563,7 +577,7 @@ def _load_manifest(snapshot_directory: Path) -> tuple[dict[str, Any], str]:
         payload = json.loads(bytes(raw).decode("utf-8"))
     except SnapshotError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
         raise SnapshotError("manifest.json 不是有效 UTF-8 JSON。") from exc
     if not isinstance(payload, dict):
         raise SnapshotError("manifest.json 顶层必须是对象。")
@@ -596,6 +610,92 @@ def _database_counts(database: sqlite3.Connection) -> dict[str, int]:
         }
     except sqlite3.Error as exc:
         raise SnapshotError("SQLite schema 或计数不可读。") from exc
+
+
+def _json_object_of_strings(raw: object, *, label: str) -> dict[str, str]:
+    if not isinstance(raw, str):
+        raise SnapshotError(f"SQLite 中的 {label} 不是有效 JSON 文本。")
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise SnapshotError(f"SQLite 中的 {label} 不是有效 JSON。") from exc
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) and isinstance(item, str)
+        for key, item in value.items()
+    ):
+        raise SnapshotError(
+            f"SQLite 中的 {label} 必须是字符串到字符串的 JSON 对象。"
+        )
+    return value
+
+
+def _json_string_list(raw: object, *, label: str) -> list[str]:
+    if not isinstance(raw, str):
+        raise SnapshotError(f"SQLite 中的 {label} 不是有效 JSON 文本。")
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise SnapshotError(f"SQLite 中的 {label} 不是有效 JSON。") from exc
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise SnapshotError(f"SQLite 中的 {label} 必须是字符串 JSON 列表。")
+    return value
+
+
+def _validate_chunk_semantics(chunks: Sequence[sqlite3.Row]) -> None:
+    next_ordinal_by_asset: dict[str, int] = {}
+    for row in chunks:
+        asset_id = row["asset_id"]
+        if row["document_id"] != row["asset_document_id"]:
+            raise SnapshotError(
+                "SQLite chunk 的 document_id 与 asset 的 document_id 不一致。"
+            )
+        expected_ordinal = next_ordinal_by_asset.get(asset_id, 1)
+        if type(row["ordinal"]) is not int or row["ordinal"] != expected_ordinal:
+            raise SnapshotError("v0.1 SQLite chunk 序号必须从 1 连续排列。")
+        next_ordinal_by_asset[asset_id] = expected_ordinal + 1
+
+        heading_path = _json_string_list(row["heading_path"], label="heading_path")
+        page_start = row["pdf_page_start"]
+        page_end = row["pdf_page_end"]
+        line_start = row["source_line_start"]
+        line_end = row["source_line_end"]
+
+        if row["media_type"] == "text/markdown":
+            if page_start is not None or page_end is not None:
+                raise SnapshotError("v0.1 Markdown chunk 不得包含 PDF 页码。")
+            if (
+                type(line_start) is not int
+                or type(line_end) is not int
+                or line_start < 1
+                or line_start > line_end
+            ):
+                raise SnapshotError("v0.1 Markdown chunk 行号范围无效。")
+            expected_anchor = f"Markdown lines {line_start}-{line_end}"
+            if heading_path:
+                expected_anchor += " · " + " / ".join(heading_path)
+        elif row["media_type"] == "application/pdf":
+            page_count = row["page_count"]
+            if heading_path or line_start is not None or line_end is not None:
+                raise SnapshotError(
+                    "v0.1 PDF chunk 不得包含标题路径或 Markdown 行号。"
+                )
+            if (
+                type(page_start) is not int
+                or type(page_end) is not int
+                or type(page_count) is not int
+                or page_start < 1
+                or page_start != page_end
+                or page_end > page_count
+            ):
+                raise SnapshotError("v0.1 PDF chunk 页码范围无效。")
+            expected_anchor = f"PDF page {page_start}"
+        else:
+            raise SnapshotError("v0.1 SQLite chunk 引用了不支持的媒体类型。")
+
+        if row["anchor_label"] != expected_anchor:
+            raise SnapshotError(
+                "v0.1 SQLite chunk 的 anchor_label 与定位字段不一致。"
+            )
 
 
 def _verify_snapshot(
@@ -730,7 +830,7 @@ def _verify_snapshot(
         metadata = dict(database.execute("SELECT key,value FROM artifact_meta"))
         database_sources = database.execute(
             """SELECT
-                d.document_id,d.title,d.source_name,d.media_type,
+                d.document_id,d.title,d.identifiers,d.source_name,d.media_type,d.topics,
                 d.fulltext_verified,d.formula_verified,
                 a.asset_id,a.stored_path,a.source_sha256,a.byte_size,
                 a.extraction_method,a.extraction_status,a.page_count,
@@ -738,6 +838,17 @@ def _verify_snapshot(
                 (SELECT count(*) FROM chunk c WHERE c.asset_id=a.asset_id) AS chunk_count
             FROM document d JOIN asset a ON a.document_id=d.document_id
             ORDER BY d.document_id"""
+        ).fetchall()
+        database_chunks = database.execute(
+            """SELECT
+                c.document_id,c.asset_id,c.ordinal,c.heading_path,
+                c.pdf_page_start,c.pdf_page_end,c.source_line_start,c.source_line_end,
+                c.anchor_label,a.document_id AS asset_document_id,a.page_count,
+                d.media_type
+            FROM chunk c
+            JOIN asset a ON a.asset_id=c.asset_id
+            JOIN document d ON d.document_id=c.document_id
+            ORDER BY c.asset_id,c.ordinal"""
         ).fetchall()
         promoted_chunk = database.execute(
             """SELECT 1 FROM chunk
@@ -764,6 +875,7 @@ def _verify_snapshot(
         raise SnapshotError("SQLite artifact_meta 与 manifest/软件版本不一致。")
     if promoted_chunk is not None:
         raise SnapshotError("v0.1 chunk 不得自动提升全文或公式核验状态。")
+    _validate_chunk_semantics(database_chunks)
     source_by_document = {source["document_id"]: source for source in sources}
     for row in database_sources:
         source = source_by_document.get(row["document_id"])
@@ -785,6 +897,10 @@ def _verify_snapshot(
         }
         if any(source.get(key) != value for key, value in comparable.items()):
             raise SnapshotError("SQLite source 元数据与 manifest 不一致。")
+        if row["chunk_count"] < 1:
+            raise SnapshotError("v0.1 每个 asset 必须至少包含一个 chunk。")
+        _json_object_of_strings(row["identifiers"], label="identifiers")
+        _json_string_list(row["topics"], label="topics")
         if row["fulltext_verified"] != 0 or row["formula_verified"] != 0:
             raise SnapshotError("v0.1 SQLite 不得自动提升全文或公式核验状态。")
 

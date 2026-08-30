@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import shutil
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
 from literature_evidence_mcp import build_snapshot, search_snapshot, verify_snapshot
 from literature_evidence_mcp import snapshot as snapshot_module
+from literature_evidence_mcp.cli import main as cli_main
 from literature_evidence_mcp.errors import ImportPolicyError, SnapshotError
 
 
@@ -62,6 +66,64 @@ def _tree_hashes(root: Path) -> dict[str, str]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def _refresh_database_manifest(snapshot: Path) -> None:
+    database_path = snapshot / "evidence.sqlite"
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload = database_path.read_bytes()
+    manifest["database"]["sha256"] = hashlib.sha256(payload).hexdigest()
+    manifest["database"]["byte_size"] = len(payload)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _mutate_database(snapshot: Path, statement: str, parameters: tuple[object, ...]) -> None:
+    database = sqlite3.connect(snapshot / "evidence.sqlite")
+    try:
+        database.execute(statement, parameters)
+        database.commit()
+    finally:
+        database.close()
+    _refresh_database_manifest(snapshot)
+
+
+def _remove_all_chunks_from_one_asset(snapshot: Path) -> None:
+    database = sqlite3.connect(snapshot / "evidence.sqlite")
+    try:
+        asset_id = database.execute(
+            "SELECT asset_id FROM chunk WHERE source_line_start IS NOT NULL LIMIT 1"
+        ).fetchone()[0]
+        database.execute("DELETE FROM chunk WHERE asset_id=?", (asset_id,))
+        database.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('rebuild')")
+        database.commit()
+        counts = {
+            "documents": database.execute("SELECT count(*) FROM document").fetchone()[0],
+            "assets": database.execute("SELECT count(*) FROM asset").fetchone()[0],
+            "chunks": database.execute("SELECT count(*) FROM chunk").fetchone()[0],
+            "fts_rows": database.execute("SELECT count(*) FROM chunk_fts").fetchone()[0],
+        }
+        chunk_counts = dict(
+            database.execute(
+                "SELECT asset_id,count(*) FROM chunk GROUP BY asset_id"
+            ).fetchall()
+        )
+    finally:
+        database.close()
+
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["counts"] = counts
+    for source in manifest["sources"]:
+        source["chunk_count"] = chunk_counts.get(source["asset_id"], 0)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _refresh_database_manifest(snapshot)
 
 
 class StageOneSnapshotTests(unittest.TestCase):
@@ -192,6 +254,153 @@ class StageOneSnapshotTests(unittest.TestCase):
 
             with self.assertRaisesRegex(SnapshotError, "SHA-256"):
                 verify_snapshot(snapshot)
+
+    def test_semantically_malformed_database_is_rejected_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            markdown = root / "anchors.md"
+            markdown.write_text(
+                "# Anchors\n\nsemantic validation evidence\n", encoding="utf-8"
+            )
+            pdf = root / "pages.pdf"
+            pdf.write_bytes(_pdf_bytes(["PDF page anchor validation evidence."]))
+            built = build_snapshot(root / "library", [markdown, pdf])
+            baseline = Path(built["snapshot_path"])
+            deeply_nested_json = "[" * 20000 + "]" * 20000
+            with self.assertRaises(RecursionError):
+                json.loads(deeply_nested_json)
+
+            cases = [
+                (
+                    "identifiers-invalid-json",
+                    "UPDATE document SET identifiers=?",
+                    ("{",),
+                    "identifiers",
+                ),
+                (
+                    "identifiers-wrong-shape",
+                    "UPDATE document SET identifiers=?",
+                    ("[]",),
+                    "identifiers",
+                ),
+                (
+                    "identifiers-too-deep",
+                    "UPDATE document SET identifiers=?",
+                    (deeply_nested_json,),
+                    "identifiers",
+                ),
+                (
+                    "topics-wrong-shape",
+                    "UPDATE document SET topics=?",
+                    ('["valid", 1]',),
+                    "topics",
+                ),
+                (
+                    "heading-path-wrong-shape",
+                    "UPDATE chunk SET heading_path=? WHERE source_line_start IS NOT NULL",
+                    ('["Anchors", 1]',),
+                    "heading_path",
+                ),
+                (
+                    "markdown-line-range",
+                    "UPDATE chunk SET source_line_start=? WHERE source_line_start IS NOT NULL",
+                    (0,),
+                    "行号范围",
+                ),
+                (
+                    "markdown-pdf-anchor",
+                    "UPDATE chunk SET pdf_page_start=?,pdf_page_end=? "
+                    "WHERE source_line_start IS NOT NULL",
+                    (1, 1),
+                    "Markdown",
+                ),
+                (
+                    "pdf-page-range",
+                    "UPDATE chunk SET pdf_page_start=?,pdf_page_end=? "
+                    "WHERE pdf_page_start IS NOT NULL",
+                    (2, 2),
+                    "页码范围",
+                ),
+                (
+                    "anchor-label-mismatch",
+                    "UPDATE chunk SET anchor_label=? WHERE source_line_start IS NOT NULL",
+                    ("wrong anchor",),
+                    "anchor_label",
+                ),
+            ]
+
+            for name, statement, parameters, message in cases:
+                with self.subTest(name=name):
+                    snapshot = root / name / baseline.name
+                    snapshot.parent.mkdir()
+                    shutil.copytree(baseline, snapshot)
+                    _mutate_database(snapshot, statement, parameters)
+
+                    with self.assertRaisesRegex(SnapshotError, message):
+                        verify_snapshot(snapshot)
+                    if name == "identifiers-invalid-json":
+                        with self.assertRaises(SnapshotError):
+                            search_snapshot(snapshot, "validation evidence")
+
+                    stderr = io.StringIO()
+                    with redirect_stderr(stderr):
+                        exit_code = cli_main(["verify", str(snapshot)])
+                    self.assertEqual(exit_code, 2)
+                    self.assertIn("错误：", stderr.getvalue())
+                    for leaked in (
+                        "Traceback",
+                        "JSONDecodeError",
+                        "TypeError",
+                        "RecursionError",
+                        "sqlite3.",
+                    ):
+                        self.assertNotIn(leaked, stderr.getvalue())
+
+            deep_manifest = root / "deep-manifest" / baseline.name
+            deep_manifest.parent.mkdir()
+            shutil.copytree(baseline, deep_manifest)
+            manifest_path = deep_manifest / "manifest.json"
+            manifest_text = manifest_path.read_text(encoding="utf-8")
+            manifest_path.write_text(
+                '{"deep":' + deeply_nested_json + "," + manifest_text[1:],
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(SnapshotError, "manifest.json"):
+                verify_snapshot(deep_manifest)
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                exit_code = cli_main(["verify", str(deep_manifest)])
+            self.assertEqual(exit_code, 2)
+            self.assertNotIn("RecursionError", stderr.getvalue())
+
+            zero_chunks = root / "zero-chunk-asset" / baseline.name
+            zero_chunks.parent.mkdir()
+            shutil.copytree(baseline, zero_chunks)
+            _remove_all_chunks_from_one_asset(zero_chunks)
+
+            with self.assertRaisesRegex(SnapshotError, "至少包含一个 chunk"):
+                verify_snapshot(zero_chunks)
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                exit_code = cli_main(["verify", str(zero_chunks)])
+            self.assertEqual(exit_code, 2)
+            self.assertNotIn("Traceback", stderr.getvalue())
+
+            corrupted = root / "corrupted-sqlite" / baseline.name
+            corrupted.parent.mkdir()
+            shutil.copytree(baseline, corrupted)
+            (corrupted / "evidence.sqlite").write_bytes(b"not a sqlite database")
+            _refresh_database_manifest(corrupted)
+
+            with self.assertRaises(SnapshotError):
+                verify_snapshot(corrupted)
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                exit_code = cli_main(["verify", str(corrupted)])
+            self.assertEqual(exit_code, 2)
+            self.assertNotIn("Traceback", stderr.getvalue())
+            self.assertNotIn("sqlite3.", stderr.getvalue())
 
     def test_manifest_cannot_redirect_verified_database_or_promote_status(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

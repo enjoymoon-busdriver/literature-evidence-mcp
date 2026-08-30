@@ -34,6 +34,12 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
+贡献者可在仓库根目录运行全部测试：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 用合成 Markdown 建立新快照（这一步会在 `local-library/` 新增文件）：
 
 ```bash
@@ -64,7 +70,7 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 
 ## 最小实施顺序
 
-1. **阶段一（本次）**：导入、冻结快照、哈希/schema/数量核验、SQLite BM25 与 CLI 预览。
+1. **阶段一（已完成）**：导入、冻结快照、哈希/schema/数量核验、SQLite BM25 与 CLI 预览。
 2. **阶段二**：本机 `127.0.0.1` Starlette 静态管理页；写操作只能由页面中的明确按钮触发。
 3. **阶段三**：八个 closed-world 只读 MCP 工具；`search_documents` 只走本地 BM25，不含 combo、API Key 或 Tunnel。
 4. **阶段四**：macOS Apple Silicon 小白入口、干净安装验收；自包含 App/DMG 再单独评估。
