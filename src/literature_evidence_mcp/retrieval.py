@@ -43,6 +43,7 @@ _ENGLISH_STOPWORDS = {
     "why",
     "with",
 }
+_HYPHENATED_IDENTIFIER = re.compile(r"[\w]+(?:-[\w]+)+", flags=re.UNICODE)
 
 _DENIED_SQLITE_ACTIONS = {
     sqlite3.SQLITE_INSERT,
@@ -110,6 +111,12 @@ def _fts_expression(query: str) -> str | None:
     tokens = re.findall(r"[\w]+", query, flags=re.UNICODE)
     if not tokens:
         return None
+    # unicode61 splits ASCII hyphens; keep identifier tokens in one phrase.
+    if (
+        _HYPHENATED_IDENTIFIER.fullmatch(query) is not None
+        and any(character.isdigit() for character in query)
+    ):
+        return '"' + " ".join(tokens) + '"'
     content_tokens = [token for token in tokens if token.casefold() not in _ENGLISH_STOPWORDS]
     selected = content_tokens or tokens
     return " OR ".join('"' + token.replace('"', "") + '"' for token in selected)

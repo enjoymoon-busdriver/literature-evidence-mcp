@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from literature_evidence_mcp import build_snapshot, search_snapshot
+from literature_evidence_mcp.retrieval import _fts_expression
 
 
 _SYNTHETIC_MARKDOWN = {
@@ -17,6 +18,16 @@ _SYNTHETIC_MARKDOWN = {
         "# 配电网证据\n\n"
         "## 谐波监测\n\n"
         "配电网 谐波 监测 使用 电压 频谱 识别 非线性 负载。\n"
+    ),
+    "identifier.md": (
+        "# Calibration Record\n\n"
+        "## Reference\n\n"
+        "The observation was found during review under identifier GRID-CAL-2048.\n"
+    ),
+    "distant-terms.md": (
+        "# Distant Terms\n\n"
+        "NEBULA appears in an astronomy note. The code was NOT assigned. "
+        "A sample was FOUND much later under row 999.\n"
     ),
     "tie-a.md": (
         "# Equal Rank\n\n"
@@ -100,6 +111,37 @@ class StageTwoSyntheticRetrievalTests(unittest.TestCase):
         )
         self.assert_real_empty(absent_term)
 
+    def test_hyphenated_identifiers_require_the_complete_identifier(self) -> None:
+        fragment_only = search_snapshot(
+            self.snapshot, "PHANTOM-ALPHA-FOUND-777"
+        )
+        self.assert_real_empty(fragment_only)
+
+        distant_terms = search_snapshot(
+            self.snapshot, "NEBULA-NOT-FOUND-999"
+        )
+        self.assert_real_empty(distant_terms)
+
+        existing_identifier = search_snapshot(self.snapshot, "GRID-CAL-2048")
+        self.assertTrue(existing_identifier["found"])
+        self.assertEqual(len(existing_identifier["results"]), 1)
+        self.assertEqual(
+            existing_identifier["results"][0]["source_name"], "identifier.md"
+        )
+        self.assertIn(
+            "GRID-CAL-2048", existing_identifier["results"][0]["excerpt"]
+        )
+
+        natural_question = search_snapshot(
+            self.snapshot,
+            "How does Shannon entropy relate to energy systems?",
+        )
+        self.assertTrue(natural_question["found"])
+        self.assertEqual(len(natural_question["results"]), 1)
+        self.assertEqual(
+            natural_question["results"][0]["source_name"], "entropy.md"
+        )
+
     def test_equal_score_ties_are_ordered_by_chunk_id_and_repeatable(self) -> None:
         first = search_snapshot(
             self.snapshot, "calibrationmarker", top_k=10
@@ -120,6 +162,26 @@ class StageTwoSyntheticRetrievalTests(unittest.TestCase):
         )
         chunk_ids = [result["chunk_id"] for result in first["results"]]
         self.assertEqual(chunk_ids, sorted(chunk_ids))
+
+
+class StageTwoQueryExpressionTests(unittest.TestCase):
+    def test_hyphenated_identifier_is_one_exact_phrase(self) -> None:
+        self.assertEqual(
+            _fts_expression("NEBULA-NOT-FOUND-999"),
+            '"NEBULA NOT FOUND 999"',
+        )
+        self.assertEqual(
+            _fts_expression("GRID-CAL-2048"),
+            '"GRID CAL 2048"',
+        )
+
+    def test_natural_language_keeps_existing_soft_or_expression(self) -> None:
+        self.assertEqual(
+            _fts_expression(
+                "How does Shannon entropy relate to energy systems?"
+            ),
+            '"does" OR "Shannon" OR "entropy" OR "relate" OR "energy" OR "systems"',
+        )
 
 
 if __name__ == "__main__":
