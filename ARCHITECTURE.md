@@ -178,7 +178,7 @@ macOS `.command` 保留无终端命令输入的用户体验，但受控持久目
 
 成功链固定且串行为 `query_rewrite → vector_recall → candidate_rerank`。改写只接收有界原问题；查询向量只接收有界改写问题，并严格校验类型、维度、有限数和非零范数；本地用 cosine 与 `chunk_id` tie-break 在完整 artifact 上召回。默认重排边界为最多 10 个候选、每候选正文最多 600 字符、候选正文合计最多 4000 字符，构造时可在更小的测试/部署边界内显式收紧；返回只能是候选集合内唯一 `chunk_id + finite score`。每个角色恰好调用一次、零自动重试，任一 transport 或输出错误立即停止，已发生几次就只审计几次，绝不静默回退 BM25。
 
-增强成功或失败审计只含调用数、顺序、角色/provider/model、发送类别、查询字符数、候选 ID/数量和候选总字符数；不含原问题、改写文本、候选正文、绝对路径、完整 profile 或秘密。最终证据继续使用现有 path-free 投影，保留明确两级 ID、document/asset/chunk、anchor、核验状态与有界摘录，且只可能来自请求选择的快照；重排返回空列表时允许真实 `found=false, results=[]`。
+增强成功或失败审计只含离线模拟真值、调用数、顺序、角色/provider/model、发送类别、查询字符数、候选 ID/数量和候选总字符数；不含原问题、改写文本、候选正文、绝对路径、完整 profile 或秘密。最终证据继续使用现有 path-free 投影，保留明确两级 ID、document/asset/chunk、anchor、核验状态与有界摘录，且只可能来自请求选择的快照；重排返回空列表时允许真实 `found=false, results=[]`。
 
 HTTP 搜索只接受严格 `mode=bm25|enhanced`，省略仍为 BM25。状态接口公开 `enhanced_available` 与非秘密角色/model 摘要；静态页面用原生模式选择并在决策点说明三次潜在外发，没有 CDN 或不安全 DOM。MCP 仍恰好八工具，只给 `search_documents` 增加可选 mode 并设 `openWorldHint=true`；其余七工具 schema 不变、`openWorldHint=false`，`find_in_document` 仍只走 BM25。阶段 6 没有真实模型调用、真实密钥/Keychain、真实 Tunnel、provider 配置 UI、质量评测、打包、签名、发布或阶段 7 内容；离线 fake 通过不能解释为真实链路已验证。
 
