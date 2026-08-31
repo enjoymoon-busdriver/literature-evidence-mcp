@@ -142,7 +142,7 @@ python -m unittest discover -s tests -v
 PYTHONPATH=src python -m literature_evidence_mcp.quality_eval
 ```
 
-该命令只在系统临时目录建立可分享的合成 Markdown/PDF、资料库、快照和离线向量，结束时自动清理；不会读取或写入用户真实应用根、仓库业务数据、密钥或网络。报告中的 simulated enhanced 命中由逐题脚本 fake 驱动，只能说明三调用、隔离、真实空和引用边界按合同工作。逐题 `case_pass` 表示合同完成或已知 BM25 局限被如实记录，不表示预期文档一定命中；质量观测要看分模式的 positive hit@k 与 MRR。报告内的“小白说明”解释这些区别。
+该命令只在系统临时目录建立可分享的合成 Markdown/PDF、资料库、快照和离线向量，结束时自动清理；不会读取或写入用户真实应用根、仓库业务数据、密钥或网络。报告中的 simulated enhanced 命中由逐题脚本 fake 驱动，只能说明三调用、隔离、真实空和引用边界按合同工作。每题同时记录请求选择与实际返回的库/快照身份，以及目标 chunk 在冻结数据库中的精确 anchor、页码或行号；身份缺失/错配、定位字段变化或检索异常都会使验收失败，异常不会冒充真实空。逐题 `case_pass` 表示合同完成或已知 BM25 局限被如实记录，不表示预期文档一定命中；质量观测要看分模式的 positive hit@k 与 MRR。报告内的“小白说明”解释这些区别。
 
 自动验收可显式指定测试用 Python，但该变量不会写入 shell 配置，也不会修改 `PATH`：
 

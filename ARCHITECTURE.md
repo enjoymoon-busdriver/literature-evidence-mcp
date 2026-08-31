@@ -188,7 +188,7 @@ HTTP 搜索只接受严格 `mode=bm25|enhanced`，省略仍为 BM25。状态接�
 
 题集含 12 个逻辑问题，分别用 BM25 和 simulated enhanced 运行，共 24 个 mode-case。每题保存完整 Q0、语言/双向跨语言路线、明确 `library_id + snapshot_id`、预期文档或真实空、模式和 path-free 观测。BM25 调用现有真实词法搜索；enhanced 必须通过阶段 6 完整预检及 `query_rewrite → vector_recall → candidate_rerank` 三调用链。逐题 scripted recording fake 只返回预先绑定的改写、查询向量和候选内 ID，不以 BM25 补候选，不越库/快照，也不冒充真实模型。
 
-JSON 报告按模式分列 positive hit@k/recall@k、MRR、首次命中 rank、真实空准确率、库隔离违规、快照隔离违规和 Markdown anchor/行号及 PDF 页码可追溯覆盖，并保留逐题通过/失败。逐题 `case_pass` 只表示合同完成或已知 BM25 局限被如实观测，不等于预期文档命中；检索质量必须读取分模式的 raw positive hit@k 与 MRR。连续中文、跨语言或同义表达导致的 BM25 未命中作为已知词法边界如实计入总指标，不改写成成功。不存在证据与选择旧快照看不到新来源两类负例都必须返回 `found=false, results=[]`。
+JSON 报告按模式分列 positive hit@k/recall@k、MRR、首次命中 rank、真实空准确率、库隔离违规、快照隔离违规和 Markdown anchor/行号及 PDF 页码可追溯覆盖，并保留逐题通过/失败。每题的 `selection` 是请求身份，`observed` 另存实际 `library_id + snapshot_id` 与 ok/error 状态；缺失或错配即计隔离违规。预期证据同时保存目标 chunk ID 和冻结 SQLite 中的精确 anchor、页码、行号，只有同一 chunk 的返回字段逐项相等才算可追溯。检索异常记录 `found=null`，不能计入真实空准确率。逐题 `case_pass` 只表示合同完成或已知 BM25 局限被如实观测，不等于预期文档命中；检索质量必须读取分模式的 raw positive hit@k 与 MRR。连续中文、跨语言或同义表达导致的 BM25 未命中作为已知词法边界如实计入总指标，不改写成成功。不存在证据与选择旧快照看不到新来源两类负例都必须返回 `found=false, results=[]`。
 
 报告固定写明 `evidence_level=offline_simulated`、`real_model_calls=0`、`network_calls=0` 和“不能推出真实模型质量提升”。它证明的是合成夹具上的管线合同、隔离和可追溯性，不是公开语料评测、真实 provider 适配、真实模型效果或生产链路验证。阶段 7 不改变八个 MCP 工具及其 schema，不新增依赖、缓存、日志或持久报告。
 

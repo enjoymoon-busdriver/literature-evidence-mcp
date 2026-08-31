@@ -40,7 +40,7 @@ class _SnapshotData:
     library_root: Path
     snapshot_id: str
     documents: Mapping[str, str]
-    chunks: Mapping[str, Mapping[str, str]]
+    chunks: Mapping[str, Mapping[str, Any]]
     vectors: Mapping[str, tuple[float, ...]]
 
 
@@ -126,7 +126,10 @@ def _load_snapshot(
     )
     try:
         rows = database.execute(
-            "SELECT chunk_id,document_id,chunk_text FROM chunk ORDER BY chunk_id"
+            """SELECT
+                chunk_id,document_id,chunk_text,anchor_label,
+                pdf_page_start,pdf_page_end,source_line_start,source_line_end
+            FROM chunk ORDER BY chunk_id"""
         ).fetchall()
     finally:
         database.close()
@@ -140,6 +143,11 @@ def _load_snapshot(
             row["chunk_id"]: {
                 "document_id": row["document_id"],
                 "chunk_text": row["chunk_text"],
+                "anchor_label": row["anchor_label"],
+                "pdf_page_start": row["pdf_page_start"],
+                "pdf_page_end": row["pdf_page_end"],
+                "source_line_start": row["source_line_start"],
+                "source_line_end": row["source_line_end"],
             }
             for row in rows
         },
@@ -467,6 +475,19 @@ def _public_result(result: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _bm25_search(
+    snapshot: _SnapshotData, query: str
+) -> tuple[dict[str, Any], str]:
+    library = FixedLibrary(snapshot.library_root)
+    result = library.search(
+        snapshot.snapshot_id,
+        query,
+        top_k=TOP_K,
+        excerpt_chars=240,
+    )
+    return result, library._root.name
+
+
 def _evaluate_case(
     question: _Question,
     mode: str,
@@ -482,18 +503,33 @@ def _evaluate_case(
             question.forbidden_source
         ]
 
+    expected_trace = (
+        {
+            key: snapshot.chunks[target_chunk_id][key]
+            for key in (
+                "anchor_label",
+                "pdf_page_start",
+                "pdf_page_end",
+                "source_line_start",
+                "source_line_end",
+            )
+        }
+        if target_chunk_id is not None
+        else None
+    )
     transport: _ScriptedTransport | None = None
     simulated = mode == "enhanced"
     call_count = 0
     error: str | None = None
+    actual_library_id: str | None = None
+    actual_snapshot_id: str | None = None
+    result: dict[str, Any] = {"found": None, "results": []}
     try:
         if mode == "bm25":
-            result = FixedLibrary(snapshot.library_root).search(
-                snapshot.snapshot_id,
-                question.q0,
-                top_k=TOP_K,
-                excerpt_chars=240,
-            )
+            result, actual_library_id = _bm25_search(snapshot, question.q0)
+            returned_snapshot_id = result.get("snapshot_id")
+            if isinstance(returned_snapshot_id, str):
+                actual_snapshot_id = returned_snapshot_id
         else:
             vector_chunk_id = target_chunk_id or sorted(snapshot.vectors)[0]
             transport = _ScriptedTransport(
@@ -526,16 +562,20 @@ def _evaluate_case(
                 excerpt_chars=240,
                 mode="enhanced",
             )
+            returned_library_id = result.get("library_id")
+            returned_snapshot_id = result.get("snapshot_id")
+            if isinstance(returned_library_id, str):
+                actual_library_id = returned_library_id
+            if isinstance(returned_snapshot_id, str):
+                actual_snapshot_id = returned_snapshot_id
             call_count = result["audit"]["call_count"]
             simulated = result["audit"]["simulated"] is True
     except EnhancedSearchError as exc:
-        result = {"found": False, "results": []}
         call_count = int(exc.audit["call_count"])
         simulated = exc.audit["simulated"] is True
         error = "simulated enhanced case failed closed"
     except LiteratureEvidenceError:
-        result = {"found": False, "results": []}
-        error = "local BM25 case failed closed"
+        error = "offline evaluation search failed closed"
 
     results = list(result["results"])
     rank = next(
@@ -548,19 +588,21 @@ def _evaluate_case(
     )
     selected_documents = set(snapshot.documents.values())
     selected_chunks = set(snapshot.chunks)
-    library_violations = sum(
+    library_violations = int(actual_library_id != snapshot.library_id) + sum(
         1
         for item in results
         if snapshot.library_id
         not in document_owners.get(item["document_id"], set())
     )
-    snapshot_violations = sum(
+    snapshot_violations = int(actual_snapshot_id != snapshot.snapshot_id) + sum(
         1
         for item in results
         if item["document_id"] not in selected_documents
         or item["chunk_id"] not in selected_chunks
     )
-    consistent_empty = result["found"] is False and results == []
+    consistent_empty = (
+        error is None and result["found"] is False and results == []
+    )
     transport_ok = (
         mode == "bm25"
         or (
@@ -582,17 +624,12 @@ def _evaluate_case(
 
     traceability_pass: bool | None = None
     if question.traceability is not None:
-        matching = [
-            item for item in results if item["document_id"] == expected_document_id
-        ]
-        if question.traceability == "markdown_anchor_line":
-            traceability_pass = any(
-                bool(item["anchor_label"])
-                and type(item["source_line_start"]) is int
-                for item in matching
-            )
-        else:
-            traceability_pass = any(item["pdf_page_start"] == 2 for item in matching)
+        assert target_chunk_id is not None and expected_trace is not None
+        traceability_pass = any(
+            item["chunk_id"] == target_chunk_id
+            and all(item[key] == expected_trace[key] for key in expected_trace)
+            for item in results
+        )
 
     case_pass = (
         error is None
@@ -614,11 +651,16 @@ def _evaluate_case(
         },
         "expected": {
             "document_id": expected_document_id,
+            "chunk_id": target_chunk_id,
             "empty": expected_document_id is None,
             "forbidden_document_id": forbidden_document_id,
             "traceability": question.traceability,
+            "trace": expected_trace,
         },
         "observed": {
+            "status": "ok" if error is None else "error",
+            "library_id": actual_library_id,
+            "snapshot_id": actual_snapshot_id,
             "found": result["found"],
             "results": [_public_result(item) for item in results],
             "first_expected_rank": rank,
@@ -635,7 +677,12 @@ def _evaluate_case(
         "library_isolation_violations": library_violations,
         "snapshot_isolation_violations": snapshot_violations,
         "traceability_pass": traceability_pass,
-        "metric_hit": rank is not None,
+        "metric_hit": (
+            error is None
+            and rank is not None
+            and library_violations == 0
+            and snapshot_violations == 0
+        ),
         "case_pass": case_pass,
         "error": error,
     }
@@ -678,7 +725,8 @@ def _metrics(cases: Sequence[Mapping[str, Any]], mode: str) -> dict[str, Any]:
             sum(
                 1
                 for case in negatives
-                if case["observed"]["found"] is False
+                if case["error"] is None
+                and case["observed"]["found"] is False
                 and case["observed"]["results"] == []
             ),
             len(negatives),
@@ -759,17 +807,29 @@ def run_evaluation() -> dict[str, Any]:
     }
 
 
+class _ArgumentParseError(Exception):
+    pass
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _ArgumentParseError from None
+
+
 def _parser() -> argparse.ArgumentParser:
-    return argparse.ArgumentParser(
+    return _SafeArgumentParser(
         prog="python -m literature_evidence_mcp.quality_eval",
         description="运行 Stage 7 合成离线搜索质量验收并把 JSON 报告写到 stdout。",
     )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    _parser().parse_args(argv)
     try:
+        _parser().parse_args(argv)
         report = run_evaluation()
+    except _ArgumentParseError:
+        sys.stderr.write("错误：Stage 7 离线评测参数无效。\n")
+        return 2
     except Exception:
         sys.stderr.write("错误：Stage 7 离线评测未完成；未生成质量结论。\n")
         return 2
