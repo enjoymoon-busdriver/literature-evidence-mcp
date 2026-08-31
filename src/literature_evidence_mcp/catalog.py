@@ -11,7 +11,8 @@ from typing import Any, Iterator
 
 import fcntl
 
-from .errors import SnapshotError
+from .errors import LibraryRegistryError, SnapshotError
+from .registry import LibraryRegistry, _identity
 
 
 CATALOG_FORMAT = "literature-evidence-snapshot-catalog"
@@ -35,15 +36,31 @@ def empty_snapshot_catalog() -> dict[str, Any]:
     }
 
 
-def _validated_root(library: Path) -> Path:
-    root = Path(library)
+def _root_guard(library: Path | LibraryRegistry) -> LibraryRegistry:
+    if isinstance(library, LibraryRegistry):
+        return library
     try:
-        status = root.lstat()
-    except OSError as exc:
-        raise SnapshotError("资料库尚未安全建立。") from exc
-    if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
-        raise SnapshotError("资料库根目录必须是普通目录且不能是符号链接。")
-    return root
+        return LibraryRegistry(Path(library).expanduser())
+    except (LibraryRegistryError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise SnapshotError("无法固定资料库根目录。") from exc
+
+
+def _validated_root(
+    library: Path | LibraryRegistry,
+    *,
+    allow_missing: bool = False,
+    create: bool = False,
+) -> Path | None:
+    guard = _root_guard(library)
+    try:
+        with guard._application_root(create=create) as descriptor:
+            if descriptor is None:
+                if allow_missing:
+                    return None
+                raise SnapshotError("资料库尚未安全建立。")
+    except LibraryRegistryError as exc:
+        raise SnapshotError("资料库根目录身份无效或已经改变。") from exc
+    return guard.application_root
 
 
 def _validate_catalog(payload: object) -> dict[str, Any]:
@@ -134,8 +151,9 @@ def _unregistered_snapshot_exists(root: Path) -> bool:
         raise SnapshotError("无法检查未登记快照。") from exc
 
 
-def snapshot_catalog_exists(library: Path) -> bool:
+def snapshot_catalog_exists(library: Path | LibraryRegistry) -> bool:
     root = _validated_root(library)
+    assert root is not None
     try:
         status = (root / CATALOG_NAME).lstat()
     except FileNotFoundError:
@@ -147,8 +165,9 @@ def snapshot_catalog_exists(library: Path) -> bool:
     return True
 
 
-def load_snapshot_catalog(library: Path) -> dict[str, Any]:
+def load_snapshot_catalog(library: Path | LibraryRegistry) -> dict[str, Any]:
     root = _validated_root(library)
+    assert root is not None
     path = root / CATALOG_NAME
     try:
         before = path.lstat()
@@ -204,34 +223,81 @@ def snapshot_record(catalog: dict[str, Any], snapshot_id: str) -> dict[str, Any]
 
 
 @contextmanager
-def snapshot_catalog_lock(library: Path) -> Iterator[None]:
-    root = _validated_root(library)
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+def snapshot_catalog_lock(library: Path | LibraryRegistry) -> Iterator[None]:
+    guard = _root_guard(library)
     try:
-        descriptor = os.open(root / CATALOG_LOCK_NAME, flags, 0o600)
-        status = os.fstat(descriptor)
-        if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
-            raise SnapshotError("快照目录册锁文件无效。")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        with guard._application_root(create=False) as root_descriptor:
+            if root_descriptor is None:
+                raise SnapshotError("资料库尚未安全建立。")
+            with guard._root_lock(root_descriptor, exclusive=True):
+                try:
+                    before = os.stat(
+                        CATALOG_LOCK_NAME,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    before = None
+                if before is not None and (
+                    stat.S_ISLNK(before.st_mode)
+                    or not stat.S_ISREG(before.st_mode)
+                ):
+                    raise SnapshotError("快照目录册锁文件无效。")
+
+                flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                descriptor = -1
+                locked = False
+                try:
+                    descriptor = os.open(
+                        CATALOG_LOCK_NAME,
+                        flags,
+                        0o600,
+                        dir_fd=root_descriptor,
+                    )
+                    opened = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or opened.st_nlink != 1
+                        or (before is not None and _identity(opened) != _identity(before))
+                    ):
+                        raise SnapshotError("快照目录册锁文件无效。")
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        raise SnapshotError(
+                            "该资料库已有快照写操作正在进行。"
+                        ) from None
+                    locked = True
+                    current = os.stat(
+                        CATALOG_LOCK_NAME,
+                        dir_fd=root_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if _identity(current) != _identity(opened):
+                        raise SnapshotError("快照目录册锁文件身份已改变。")
+                    yield
+                finally:
+                    if descriptor >= 0:
+                        if locked:
+                            try:
+                                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                            except OSError:
+                                pass
+                        os.close(descriptor)
+    except LibraryRegistryError as exc:
+        if isinstance(exc.__cause__, BlockingIOError):
             raise SnapshotError("该资料库已有快照写操作正在进行。") from None
-        yield
-    except SnapshotError:
-        raise
+        raise SnapshotError("无法锁定快照目录册。") from exc
     except OSError as exc:
         raise SnapshotError("无法锁定快照目录册。") from exc
-    finally:
-        if "descriptor" in locals():
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(descriptor)
 
 
-def write_snapshot_catalog(library: Path, catalog: dict[str, Any]) -> None:
+def write_snapshot_catalog(
+    library: Path | LibraryRegistry, catalog: dict[str, Any]
+) -> None:
     root = _validated_root(library)
+    assert root is not None
     _validate_catalog(catalog)
     path = root / CATALOG_NAME
     try:
@@ -285,6 +351,7 @@ def write_snapshot_catalog(library: Path, catalog: dict[str, Any]) -> None:
 
 
 __all__ = [
+    "CATALOG_LOCK_NAME",
     "CATALOG_NAME",
     "SNAPSHOT_ID_PATTERN",
     "empty_snapshot_catalog",

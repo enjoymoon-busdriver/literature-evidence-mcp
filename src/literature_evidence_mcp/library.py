@@ -8,6 +8,8 @@ from typing import Any, Mapping, Sequence
 
 from .catalog import (
     SNAPSHOT_ID_PATTERN,
+    _root_guard,
+    _validated_root,
     load_snapshot_catalog,
     snapshot_catalog_lock,
     snapshot_record,
@@ -47,25 +49,22 @@ class FixedLibrary:
             requested = Path(library).expanduser()
             if requested.is_symlink():
                 raise ImportPolicyError("固定资料库根目录不能是符号链接。")
-            self._root = requested.resolve(strict=False)
+            self._root_guard = _root_guard(requested)
+            self._root = self._root_guard.application_root
         except ImportPolicyError:
             raise
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        except (SnapshotError, OSError, RuntimeError, TypeError, ValueError) as exc:
             raise ImportPolicyError("无法固定资料库根目录。") from exc
 
     def _snapshots_directory(self, *, allow_missing: bool) -> Path | None:
-        try:
-            root_status = self._root.lstat()
-        except FileNotFoundError:
-            if allow_missing:
-                return None
-            raise SnapshotError("资料库尚未建立。") from None
-        except OSError as exc:
-            raise SnapshotError("无法读取固定资料库状态。") from exc
-        if stat.S_ISLNK(root_status.st_mode) or not stat.S_ISDIR(root_status.st_mode):
-            raise SnapshotError("固定资料库根目录无效。")
+        root = _validated_root(
+            self._root_guard,
+            allow_missing=allow_missing,
+        )
+        if root is None:
+            return None
 
-        snapshots = self._root / "snapshots"
+        snapshots = root / "snapshots"
         try:
             snapshots_status = snapshots.lstat()
         except FileNotFoundError:
@@ -106,7 +105,7 @@ class FixedLibrary:
     def _published_snapshot(
         self, snapshot_id: str
     ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
-        catalog = load_snapshot_catalog(self._root)
+        catalog = load_snapshot_catalog(self._root_guard)
         record = snapshot_record(catalog, snapshot_id)
         return self._snapshot_directory(snapshot_id), record, catalog
 
@@ -119,7 +118,7 @@ class FixedLibrary:
         return status
 
     def catalog_status(self) -> dict[str, Any]:
-        catalog = load_snapshot_catalog(self._root)
+        catalog = load_snapshot_catalog(self._root_guard)
         return {
             "snapshot_count": len(catalog["snapshots"]),
             "current_snapshot_id": catalog["current_snapshot_id"],
@@ -160,13 +159,9 @@ class FixedLibrary:
 
     def list_snapshots(self) -> list[dict[str, Any]]:
         """Return only cataloged successful snapshots, newest first."""
-        try:
-            self._root.lstat()
-        except FileNotFoundError:
+        if _validated_root(self._root_guard, allow_missing=True) is None:
             return []
-        except OSError as exc:
-            raise SnapshotError("无法读取固定资料库状态。") from exc
-        catalog = load_snapshot_catalog(self._root)
+        catalog = load_snapshot_catalog(self._root_guard)
         results: list[dict[str, Any]] = []
         for record in reversed(catalog["snapshots"]):
             snapshot_id = record["snapshot_id"]
@@ -247,10 +242,11 @@ class FixedLibrary:
         remove_document_ids: Sequence[str] = (),
     ) -> dict[str, Any]:
         """Build from paths already confined and validated by the upload layer."""
+        _validated_root(self._root_guard, allow_missing=True)
         if not all(isinstance(source, Path) for source in controlled_sources):
             raise ImportPolicyError("构建输入必须来自受控临时文件。")
         result = build_snapshot(
-            self._root,
+            self._root_guard,
             tuple(controlled_sources),
             base_snapshot_id=base_snapshot_id,
             replacements=replacements,
@@ -260,7 +256,7 @@ class FixedLibrary:
 
     def activate(self, snapshot_id: str) -> dict[str, Any]:
         """Explicitly move current to one verified successful snapshot."""
-        with snapshot_catalog_lock(self._root):
+        with snapshot_catalog_lock(self._root_guard):
             snapshot, record, catalog = self._published_snapshot(snapshot_id)
             self._catalog_bound_status(verify_snapshot(snapshot), record)
             if catalog["current_snapshot_id"] != snapshot_id:
@@ -269,7 +265,7 @@ class FixedLibrary:
                     "current_snapshot_id": snapshot_id,
                     "snapshots": [dict(item) for item in catalog["snapshots"]],
                 }
-                write_snapshot_catalog(self._root, next_catalog)
+                write_snapshot_catalog(self._root_guard, next_catalog)
                 catalog = next_catalog
         return {
             "snapshot_id": snapshot_id,

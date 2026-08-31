@@ -3,23 +3,31 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import multiprocessing
+import os
 import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
+from multiprocessing.connection import Connection
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from literature_evidence_mcp import snapshot as snapshot_module
 from literature_evidence_mcp.catalog import (
+    CATALOG_LOCK_NAME,
     load_snapshot_catalog,
     snapshot_catalog_lock,
     write_snapshot_catalog,
 )
 from literature_evidence_mcp.cli import main as cli_main
-from literature_evidence_mcp.errors import SearchInputError, SnapshotError
+from literature_evidence_mcp.errors import (
+    ImportPolicyError,
+    SearchInputError,
+    SnapshotError,
+)
 from literature_evidence_mcp.library import FixedLibrary
 from literature_evidence_mcp.mcp_tools import ReadOnlyEvidenceTools
 from literature_evidence_mcp.registry import LibraryRegistry
@@ -54,6 +62,38 @@ def _tree_identity(root: Path) -> dict[str, tuple[str, str]]:
                 hashlib.sha256(path.read_bytes()).hexdigest(),
             )
     return identity
+
+
+def _hold_snapshot_catalog_lock(
+    library_root: str,
+    ready: Connection,
+    release: Connection,
+) -> None:
+    with snapshot_catalog_lock(Path(library_root)):
+        ready.send("locked")
+        release.recv()
+
+
+def _open_fd_count() -> int | None:
+    for candidate in (Path("/dev/fd"), Path("/proc/self/fd")):
+        if candidate.is_dir():
+            return len(os.listdir(candidate))
+    return None
+
+
+def _contend_snapshot_catalog_lock(
+    library_root: str,
+    result: Connection,
+) -> None:
+    before = _open_fd_count()
+    outcomes: list[str] = []
+    for _index in range(3):
+        try:
+            with snapshot_catalog_lock(Path(library_root)):
+                outcomes.append("acquired")
+        except SnapshotError:
+            outcomes.append("rejected")
+    result.send((outcomes, before, _open_fd_count()))
 
 
 class ProductStageTwoSnapshotTests(unittest.TestCase):
@@ -436,6 +476,157 @@ class ProductStageTwoSnapshotTests(unittest.TestCase):
         self.assertEqual((code, stderr), (0, ""))
         self.assertEqual(listed["current_snapshot_id"], second["snapshot_id"])
         self.assertEqual(len(listed["snapshots"]), 2)
+
+    def test_fixed_library_rejects_ancestor_swap_before_and_after_construction(
+        self,
+    ) -> None:
+        constructor_case = self.root / "constructor-after-swap"
+        managed_parent = constructor_case / "managed-parent"
+        outside_parent = constructor_case / "outside-parent"
+        managed_parent.mkdir(parents=True)
+        registry = LibraryRegistry(managed_parent / "application")
+        record = registry.create("Constructor")
+        original_library = Path(record["library_root"])
+        managed_parent.rename(outside_parent)
+        managed_parent.symlink_to(outside_parent, target_is_directory=True)
+        before = _tree_identity(outside_parent)
+        with self.assertRaises(ImportPolicyError):
+            FixedLibrary(original_library)
+        self.assertEqual(_tree_identity(outside_parent), before)
+
+        for action_name in (
+            "build",
+            "activate",
+            "catalog_status",
+            "list",
+            "verify",
+            "search",
+            "status",
+            "catalog_load",
+            "catalog_lock",
+        ):
+            with self.subTest(action=action_name):
+                case_root = self.root / f"long-lived-{action_name}"
+                managed_parent = case_root / "managed-parent"
+                outside_parent = case_root / "outside-parent"
+                managed_parent.mkdir(parents=True)
+                registry = LibraryRegistry(managed_parent / "application")
+                record = registry.create(action_name)
+                original_library = Path(record["library_root"])
+                library = FixedLibrary(original_library)
+                first_source = case_root / "first.md"
+                second_source = case_root / "second.md"
+                third_source = case_root / "third.md"
+                _write_markdown(first_source, "firstunique")
+                _write_markdown(second_source, "secondunique")
+                _write_markdown(third_source, "thirdunique")
+                first = library.build([first_source])
+                second = library.build([second_source])
+
+                managed_parent.rename(outside_parent)
+                managed_parent.symlink_to(outside_parent, target_is_directory=True)
+                before = _tree_identity(outside_parent)
+
+                def catalog_lock() -> None:
+                    with snapshot_catalog_lock(original_library):
+                        pass
+
+                actions = {
+                    "build": lambda: library.build([third_source]),
+                    "activate": lambda: library.activate(second["snapshot_id"]),
+                    "catalog_status": library.catalog_status,
+                    "list": library.list_snapshots,
+                    "verify": lambda: library.verify(first["snapshot_id"]),
+                    "search": lambda: library.search(
+                        first["snapshot_id"], "firstunique"
+                    ),
+                    "catalog_load": lambda: load_snapshot_catalog(original_library),
+                    "catalog_lock": catalog_lock,
+                }
+                if action_name == "status":
+                    status = library.status()
+                    self.assertFalse(status["ready"])
+                    self.assertIn("error", status)
+                else:
+                    with self.assertRaises((SnapshotError, ImportPolicyError)):
+                        actions[action_name]()
+                self.assertEqual(_tree_identity(outside_parent), before)
+
+        if Path("/tmp").is_symlink():
+            with tempfile.TemporaryDirectory(
+                prefix="lemcp-fixed-library-alias-", dir="/tmp"
+            ) as alias_root:
+                alias_library = FixedLibrary(Path(alias_root) / "library")
+                self.assertFalse(alias_library.status()["ready"])
+
+    def test_recreated_catalog_lock_cannot_bypass_library_root_lock(self) -> None:
+        _library_id, library_path, library = self._create_library("Root lock")
+        source = self.root / "lock-source.md"
+        _write_markdown(source, "lockunique")
+        library.build([source])
+        lock_path = library_path / CATALOG_LOCK_NAME
+
+        context = multiprocessing.get_context("fork")
+        ready_reader, ready_writer = context.Pipe(duplex=False)
+        release_reader, release_writer = context.Pipe(duplex=False)
+        holder = context.Process(
+            target=_hold_snapshot_catalog_lock,
+            args=(str(library_path), ready_writer, release_reader),
+        )
+        holder.start()
+        ready_writer.close()
+        release_reader.close()
+        try:
+            self.assertTrue(ready_reader.poll(5), "持锁子进程未及时就绪")
+            self.assertEqual(ready_reader.recv(), "locked")
+
+            old_inode = lock_path.stat().st_ino
+            lock_path.unlink()
+            descriptor = os.open(
+                lock_path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.close(descriptor)
+            self.assertNotEqual(lock_path.stat().st_ino, old_inode)
+            before = _tree_identity(library_path)
+
+            result_reader, result_writer = context.Pipe(duplex=False)
+            contender = context.Process(
+                target=_contend_snapshot_catalog_lock,
+                args=(str(library_path), result_writer),
+            )
+            contender.start()
+            result_writer.close()
+            try:
+                self.assertTrue(result_reader.poll(5), "竞争子进程未及时返回")
+                outcomes, before_fds, after_fds = result_reader.recv()
+            finally:
+                result_reader.close()
+            contender.join(5)
+            if contender.is_alive():
+                contender.terminate()
+                contender.join(5)
+                self.fail("竞争子进程发生死锁")
+            self.assertEqual(contender.exitcode, 0)
+            self.assertEqual(outcomes, ["rejected"] * 3)
+            if before_fds is not None and after_fds is not None:
+                self.assertEqual(after_fds, before_fds)
+            self.assertEqual(_tree_identity(library_path), before)
+        finally:
+            try:
+                release_writer.send("release")
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+            release_writer.close()
+            ready_reader.close()
+            holder.join(5)
+            if holder.is_alive():
+                holder.terminate()
+                holder.join(5)
+        self.assertEqual(holder.exitcode, 0)
+        with snapshot_catalog_lock(library_path):
+            pass
 
 
 if __name__ == "__main__":

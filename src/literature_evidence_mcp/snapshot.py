@@ -20,6 +20,8 @@ from typing import Any, Mapping, Sequence
 
 from . import __version__
 from .catalog import (
+    _root_guard,
+    _validated_root,
     empty_snapshot_catalog,
     load_snapshot_catalog,
     snapshot_catalog_exists,
@@ -34,6 +36,7 @@ from .ingest import (
     prepare_document,
     prepare_documents,
 )
+from .registry import LibraryRegistry
 
 
 SNAPSHOT_FORMAT = "literature-evidence-snapshot"
@@ -168,14 +171,11 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _prepare_library(library: Path) -> tuple[Path, Path]:
-    requested = Path(library).expanduser()
-    if requested.is_symlink():
-        raise ImportPolicyError("资料库目录不能是符号链接。")
-    requested.mkdir(parents=True, exist_ok=True)
-    root = requested.resolve(strict=True)
-    if not root.is_dir():
-        raise ImportPolicyError("资料库路径不是目录。")
+def _prepare_library(
+    library: Path | LibraryRegistry,
+) -> tuple[Path, Path]:
+    root = _validated_root(library, create=True)
+    assert root is not None
     snapshots = root / "snapshots"
     if snapshots.is_symlink():
         raise ImportPolicyError("snapshots 目录不能是符号链接。")
@@ -607,7 +607,7 @@ def _base_documents(
 
 
 def build_snapshot(
-    library: Path,
+    library: Path | LibraryRegistry,
     sources: Sequence[Path],
     *,
     base_snapshot_id: str | None = None,
@@ -615,6 +615,7 @@ def build_snapshot(
     remove_document_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Publish one complete snapshot, optionally derived from an explicit base."""
+    root_guard = _root_guard(library)
     if isinstance(remove_document_ids, (str, bytes)):
         raise ImportPolicyError("remove_document_ids 必须是 document_id 列表。")
     removed = tuple(
@@ -643,11 +644,11 @@ def build_snapshot(
         if not additions:
             raise ImportPolicyError("请至少选择一个 Markdown 或 PDF 文件。")
 
-    library_root, snapshots_root = _prepare_library(library)
-    with snapshot_catalog_lock(library_root):
-        catalog = load_snapshot_catalog(library_root)
-        if not snapshot_catalog_exists(library_root):
-            write_snapshot_catalog(library_root, empty_snapshot_catalog())
+    library_root, snapshots_root = _prepare_library(root_guard)
+    with snapshot_catalog_lock(root_guard):
+        catalog = load_snapshot_catalog(root_guard)
+        if not snapshot_catalog_exists(root_guard):
+            write_snapshot_catalog(root_guard, empty_snapshot_catalog())
             catalog = empty_snapshot_catalog()
 
         members: dict[str, PreparedDocument]
@@ -701,14 +702,14 @@ def build_snapshot(
             "snapshots": [*catalog["snapshots"], record],
         }
         try:
-            write_snapshot_catalog(library_root, next_catalog)
+            write_snapshot_catalog(root_guard, next_catalog)
         except BaseException:
             # An asynchronous interruption can arrive after the atomic catalog
             # replace but before the writer returns.  Never delete a directory
             # whose ID is already visible in the authoritative catalog.
             registered: bool | None = None
             try:
-                persisted = load_snapshot_catalog(library_root)
+                persisted = load_snapshot_catalog(root_guard)
             except (SnapshotError, OSError):
                 pass
             else:
