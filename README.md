@@ -2,7 +2,7 @@
 
 一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 复制进新的冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
 
-项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成阶段一至阶段四；阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
+项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四；下一轮产品化阶段 0 已冻结合同，阶段 1–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
 
 ## 当前已实现：阶段一至阶段四
 
@@ -171,14 +171,16 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 
 快照不会保存原始绝对路径，只保留源文件名和冻结副本。在相同项目、Python、SQLite 与 pypdf 版本下，相同输入再次构建会得到新的 snapshot ID 和目录，但 corpus hash、数据库内容、排序与搜索结果应保持一致；manifest 会记录这些版本，避免跨版本作不恰当比较。
 
-## 最小实施顺序
+## 历史实现基线
 
 1. **阶段一（已完成）**：导入、冻结快照、哈希/schema/数量核验、SQLite BM25 与 CLI 预览。
 2. **阶段二（已完成）**：本机 `127.0.0.1` Starlette 静态管理页；写操作只能由页面中的明确按钮触发。
 3. **阶段三（已完成）**：八类 closed-world stdio 只读 MCP 能力；`search_documents` 与 `find_in_document` 只走本地 BM25，不含 combo、API Key 或 Tunnel。
 4. **阶段四（已完成）**：macOS Apple Silicon 开发版 `.command` 入口、首次预检/受控安装、默认用户资料库和前台管理页启动。自包含、签名/公证 App、DMG 或 pkg 仍属范围外。
 
-v0.1 暂不加入远程 combo、阿里云、Secure MCP Tunnel、OCR、Zotero、Windows/Linux、自动更新、完整聊天界面、Electron/Tauri/Flet。
+下一轮阶段 0–9 与上面的历史编号分开：阶段 0 只冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1–9 必须依次验收，当前均未实现。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
+
+OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完整聊天界面、自动删除/垃圾回收、App/DMG 打包、签名、公证和发布不在阶段 0–9 范围内。
 
 ## 已知限制
 
