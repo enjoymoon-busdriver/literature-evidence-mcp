@@ -274,6 +274,14 @@ class ReadOnlyEvidenceTools:
             enhanced_search=self._enhanced_search,
         )
 
+    def enhanced_zero_call_audit(self) -> dict[str, Any]:
+        simulated = None
+        if self._enhanced_search is not None:
+            summary = self._enhanced_search.public_summary()
+            if type(summary.get("simulated")) is bool:
+                simulated = summary["simulated"]
+        return {"simulated": simulated, "call_count": 0, "calls": []}
+
     @contextlib.contextmanager
     def _database(
         self, library_id: str, snapshot_id: str

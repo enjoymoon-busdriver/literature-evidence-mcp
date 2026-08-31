@@ -967,6 +967,16 @@ def create_app(
     enhanced_summary = (
         None if enhanced_search is None else enhanced_search.public_summary()
     )
+    enhanced_zero_call_audit = {
+        "simulated": (
+            enhanced_summary["simulated"]
+            if enhanced_summary is not None
+            and type(enhanced_summary.get("simulated")) is bool
+            else None
+        ),
+        "call_count": 0,
+        "calls": [],
+    }
 
     async def index(_request: Request) -> Response:
         return FileResponse(_STATIC_ROOT / "index.html", media_type="text/html")
@@ -1103,14 +1113,22 @@ def create_app(
         library_id = request.path_params["library_id"]
         body = await _bounded_json(request, upload_limits.max_json_bytes)
         allowed = {"snapshot_id", "query", "top_k", "excerpt_chars", "mode"}
-        if set(body) - allowed:
-            raise RequestBoundaryError(400, "搜索请求包含未允许的参数。")
         mode = body.get("mode", "bm25")
+        if set(body) - allowed:
+            if mode == "enhanced":
+                raise EnhancedSearchError(
+                    "增强搜索请求包含未允许的参数。",
+                    enhanced_zero_call_audit,
+                )
+            raise RequestBoundaryError(400, "搜索请求包含未允许的参数。")
         if type(mode) is not str or mode not in {"bm25", "enhanced"}:
             raise RequestBoundaryError(400, "mode 必须是 bm25 或 enhanced。")
         if "snapshot_id" not in body or "query" not in body:
             if mode == "enhanced":
-                raise EnhancedSearchError("增强搜索请求缺少 snapshot_id 或 query。")
+                raise EnhancedSearchError(
+                    "增强搜索请求缺少 snapshot_id 或 query。",
+                    enhanced_zero_call_audit,
+                )
             raise RequestBoundaryError(400, "搜索请求缺少 snapshot_id 或 query。")
         try:
             library = await run_in_threadpool(
@@ -1119,7 +1137,8 @@ def create_app(
         except LiteratureEvidenceError as exc:
             if mode == "enhanced":
                 raise EnhancedSearchError(
-                    "增强搜索本地核验失败：资料库或快照不可用。"
+                    "增强搜索本地核验失败：资料库或快照不可用。",
+                    enhanced_zero_call_audit,
                 ) from exc
             raise
         result = await run_in_threadpool(

@@ -383,6 +383,11 @@ def create_server(service: ReadOnlyEvidenceTools) -> Server[object]:
     ) -> CallToolResult:
         if params.name not in _REQUIRED_ARGUMENTS:
             return _error("LEMCP_E_UNKNOWN_TOOL", "未知工具。")
+        enhanced_requested = (
+            params.name == "search_documents"
+            and isinstance(params.arguments, dict)
+            and params.arguments.get("mode") == "enhanced"
+        )
         try:
             arguments = _strict_arguments(params.name, params.arguments)
             if params.name == "search_documents":
@@ -452,7 +457,15 @@ def create_server(service: ReadOnlyEvidenceTools) -> Server[object]:
                 audit=exc.audit,
             )
         except SearchInputError as exc:
-            return _error("LEMCP_E_INVALID_INPUT", str(exc))
+            return _error(
+                "LEMCP_E_INVALID_INPUT",
+                str(exc),
+                audit=(
+                    service.enhanced_zero_call_audit()
+                    if enhanced_requested
+                    else None
+                ),
+            )
         except SnapshotError:
             return _error(
                 "LEMCP_E_SNAPSHOT",

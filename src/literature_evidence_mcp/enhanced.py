@@ -79,9 +79,21 @@ class EnhancedSearchConfig:
             )
         for label, value, maximum in (
             ("max_rewrite_chars", self.max_rewrite_chars, MAX_REWRITE_CHARS),
-            ("max_rerank_candidates", self.max_rerank_candidates, 20),
-            ("max_candidate_text_chars", self.max_candidate_text_chars, 1200),
-            ("max_rerank_total_chars", self.max_rerank_total_chars, 6000),
+            (
+                "max_rerank_candidates",
+                self.max_rerank_candidates,
+                MAX_RERANK_CANDIDATES,
+            ),
+            (
+                "max_candidate_text_chars",
+                self.max_candidate_text_chars,
+                MAX_CANDIDATE_TEXT_CHARS,
+            ),
+            (
+                "max_rerank_total_chars",
+                self.max_rerank_total_chars,
+                MAX_RERANK_TOTAL_CHARS,
+            ),
         ):
             if type(value) is not int or not 1 <= value <= maximum:
                 raise ValueError(f"{label} 必须是 1-{maximum} 的整数。")
@@ -104,6 +116,8 @@ class EnhancedSearchConfig:
 
 
 class EnhancedTransport(Protocol):
+    simulated: bool
+
     def invoke(
         self,
         *,
@@ -114,8 +128,14 @@ class EnhancedTransport(Protocol):
     ) -> object: ...
 
 
-def _audit(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    return {"call_count": len(calls), "calls": [dict(call) for call in calls]}
+def _audit(
+    calls: Sequence[Mapping[str, Any]], simulated: bool
+) -> dict[str, Any]:
+    return {
+        "simulated": simulated,
+        "call_count": len(calls),
+        "calls": [dict(call) for call in calls],
+    }
 
 
 def _validated_library_id(value: object) -> str:
@@ -197,13 +217,17 @@ class EnhancedSearchService:
             raise ValueError("config 必须是 EnhancedSearchConfig。")
         if not callable(getattr(transport, "invoke", None)):
             raise ValueError("transport 必须实现 invoke。")
+        simulated = getattr(transport, "simulated", None)
+        if type(simulated) is not bool:
+            raise ValueError("transport.simulated 必须是明确的 bool。")
         self._config = config
         self._transport = transport
+        self._simulated = simulated
 
     def public_summary(self) -> dict[str, Any]:
         return {
             "vector_profile_id": self._config.vector_profile_id,
-            "simulated": bool(getattr(self._transport, "simulated", False)),
+            "simulated": self._simulated,
             "roles": [
                 {
                     "role": role,
@@ -238,7 +262,8 @@ class EnhancedSearchService:
             )
         except Exception as exc:
             raise EnhancedSearchError(
-                f"增强搜索的 {role} 调用失败；未重试。", _audit(calls)
+                f"增强搜索的 {role} 调用失败；未重试。",
+                _audit(calls, self._simulated),
             ) from exc
 
     def _preflight(
@@ -303,7 +328,7 @@ class EnhancedSearchService:
         except Exception as exc:
             raise EnhancedSearchError(
                 "增强搜索本地核验失败：向量 artifact 缺失、不匹配或不可用。",
-                _audit(calls),
+                _audit(calls, self._simulated),
             ) from exc
 
         rewrite = self._invoke(
@@ -318,7 +343,8 @@ class EnhancedSearchService:
                 raise ValueError("rewrite length")
         except (LiteratureEvidenceError, TypeError, ValueError) as exc:
             raise EnhancedSearchError(
-                "增强搜索的 query_rewrite 输出无效；未重试。", _audit(calls)
+                "增强搜索的 query_rewrite 输出无效；未重试。",
+                _audit(calls, self._simulated),
             ) from exc
 
         raw_query_vector = self._invoke(
@@ -340,7 +366,8 @@ class EnhancedSearchService:
             )[: self._config.max_rerank_candidates]
         except (ArithmeticError, TypeError, ValueError) as exc:
             raise EnhancedSearchError(
-                "增强搜索的 vector_recall 输出无效；未重试。", _audit(calls)
+                "增强搜索的 vector_recall 输出无效；未重试。",
+                _audit(calls, self._simulated),
             ) from exc
 
         candidates: list[dict[str, str]] = []
@@ -376,10 +403,10 @@ class EnhancedSearchService:
         except (TypeError, ValueError) as exc:
             raise EnhancedSearchError(
                 "增强搜索的 candidate_rerank 输出无效；未重试。",
-                _audit(calls),
+                _audit(calls, self._simulated),
             ) from exc
 
-        audit = _audit(calls)
+        audit = _audit(calls, self._simulated)
         if not reranked:
             return {
                 "found": False,

@@ -235,6 +235,41 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
                 break
         return expected
 
+    def test_config_bounds_only_tighten_and_transport_truth_is_explicit(self) -> None:
+        base = {
+            "provider": self.profile["provider"],
+            "query_rewrite_model_id": "offline-rewrite-v1",
+            "vector_recall_model_id": self.profile["model_id"],
+            "candidate_rerank_model_id": "offline-rerank-v1",
+            "vector_profile": self.profile,
+        }
+        for name, value in (
+            ("max_rewrite_chars", 401),
+            ("max_rerank_candidates", 11),
+            ("max_candidate_text_chars", 601),
+            ("max_rerank_total_chars", 4001),
+        ):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                EnhancedSearchConfig(**base, **{name: value})
+
+        class MissingTruth:
+            def invoke(self, **_kwargs: object) -> object:
+                return None
+
+        class InvalidTruth(MissingTruth):
+            simulated = "yes"
+
+        for transport in (MissingTruth(), InvalidTruth()):
+            with self.subTest(transport=type(transport).__name__), self.assertRaises(
+                ValueError
+            ):
+                EnhancedSearchService(self.config, transport)
+
+        explicit_real = RecordingFake(self.query_vector)
+        explicit_real.simulated = False
+        summary = self._service(explicit_real).public_summary()
+        self.assertIs(summary["simulated"], False)
+
     def test_success_exact_payload_audit_empty_and_readonly_tree(self) -> None:
         before = _tree_identity(self.application_root)
         fake = RecordingFake(self.query_vector)
@@ -271,6 +306,7 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["snapshot_id"], self.snapshot_id)
         self.assertEqual(result["retrieval_mode"], "enhanced")
         self.assertEqual(result["audit"]["call_count"], 3)
+        self.assertIs(result["audit"]["simulated"], True)
         self.assertEqual(
             [item["role"] for item in result["audit"]["calls"]],
             [QUERY_REWRITE, VECTOR_RECALL, CANDIDATE_RERANK],
@@ -306,6 +342,7 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(empty["found"])
         self.assertEqual(empty["results"], [])
         self.assertEqual(empty["audit"]["call_count"], 3)
+        self.assertIs(empty["audit"]["simulated"], True)
 
     def test_first_error_stops_after_one_two_or_three_attempts(self) -> None:
         for expected, role in enumerate(
@@ -317,6 +354,7 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
                     self._enhanced(fake)
                 self.assertEqual(len(fake.calls), expected)
                 self.assertEqual(raised.exception.audit["call_count"], expected)
+                self.assertIs(raised.exception.audit["simulated"], True)
                 self.assertEqual(
                     [item["role"] for item in raised.exception.audit["calls"]],
                     list((QUERY_REWRITE, VECTOR_RECALL, CANDIDATE_RERANK)[:expected]),
@@ -386,7 +424,10 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(EnhancedSearchError) as raised:
                     self._enhanced(fake, query=query, config=config)
                 self.assertEqual(fake.calls, [])
-                self.assertEqual(raised.exception.audit, {"call_count": 0, "calls": []})
+                self.assertEqual(
+                    raised.exception.audit,
+                    {"simulated": True, "call_count": 0, "calls": []},
+                )
 
     def test_missing_or_tampered_artifact_is_zero_call_and_not_repaired(self) -> None:
         artifact = self.library_root / str(self.vector_build["artifact_path"])
@@ -444,6 +485,7 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
                 mode="enhanced",
             )
         self.assertEqual(unavailable.exception.audit["call_count"], 0)
+        self.assertIsNone(unavailable.exception.audit["simulated"])
 
     def test_http_modes_status_simulation_audit_ui_and_no_leak(self) -> None:
         fake = RecordingFake(self.query_vector)
@@ -479,6 +521,26 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
                 "excerpt_chars": 18,
             }
             path = f"/api/libraries/{self.library_id}/search"
+            for body in (
+                {**base, "mode": "enhanced", "unexpected": "do-not-leak"},
+                {
+                    "snapshot_id": self.snapshot_id,
+                    "mode": "enhanced",
+                },
+            ):
+                with self.subTest(http_body=body):
+                    invalid = client.post(
+                        path,
+                        headers=headers,
+                        content=json.dumps(body),
+                    )
+                    self.assertEqual(invalid.status_code, 422, invalid.text)
+                    self.assertEqual(
+                        invalid.json()["audit"],
+                        {"simulated": True, "call_count": 0, "calls": []},
+                    )
+                    self.assertNotIn("do-not-leak", invalid.text)
+                    self.assertEqual(fake.calls, [])
             implicit = client.post(path, headers=headers, content=json.dumps(base))
             explicit = client.post(
                 path,
@@ -496,6 +558,7 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(enhanced.status_code, 200, enhanced.text)
             self.assertEqual(enhanced.json()["audit"]["call_count"], 3)
+            self.assertIs(enhanced.json()["audit"]["simulated"], True)
             self.assertEqual(len(fake.calls), 3)
             serialized = enhanced.text
             self.assertNotIn(str(self.root), serialized)
@@ -506,7 +569,10 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("https://", page.text + script.text)
             self.assertNotIn("innerHTML", script.text)
             self.assertIn("增强搜索（离线模拟）", script.text)
-            self.assertIn("离线模拟", script.text)
+            self.assertIn("enhancedSimulated: null", script.text)
+            self.assertIn("离线模拟增强搜索", script.text)
+            self.assertIn("联网增强搜索", script.text)
+            self.assertIn("增强状态未知", script.text)
             self.assertIn("error.payload.audit", script.text)
 
         failing = RecordingFake(self.query_vector, fail_role=VECTOR_RECALL)
@@ -538,6 +604,7 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(response.status_code, 422, response.text)
             self.assertEqual(response.json()["audit"]["call_count"], 2)
+            self.assertIs(response.json()["audit"]["simulated"], True)
             self.assertNotIn("transport-secret", response.text)
             self.assertNotIn(str(self.root), response.text)
 
@@ -556,6 +623,32 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
             "top_k": 2,
             "excerpt_chars": 18,
         }
+        for arguments in (
+            {
+                "library_id": self.library_id,
+                "snapshot_id": self.snapshot_id,
+                "mode": "enhanced",
+            },
+            {**base, "mode": "enhanced", "unexpected": "do-not-leak"},
+        ):
+            with self.subTest(mcp_arguments=arguments):
+                invalid_protocol = await handler(
+                    None,
+                    CallToolRequestParams(
+                        name="search_documents", arguments=arguments
+                    ),
+                )
+                self.assertTrue(invalid_protocol.is_error)
+                invalid_payload = _mcp_payload(invalid_protocol)
+                self.assertEqual(
+                    invalid_payload["error"]["code"], "LEMCP_E_INVALID_INPUT"
+                )
+                self.assertEqual(
+                    invalid_payload["audit"],
+                    {"simulated": True, "call_count": 0, "calls": []},
+                )
+                self.assertNotIn("do-not-leak", json.dumps(invalid_payload))
+                self.assertEqual(fake.calls, [])
         implicit = await handler(None, CallToolRequestParams(name="search_documents", arguments=base))
         explicit = await handler(
             None,
@@ -575,6 +668,7 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(enhanced.is_error)
         self.assertEqual(_mcp_payload(enhanced)["audit"]["call_count"], 3)
+        self.assertIs(_mcp_payload(enhanced)["audit"]["simulated"], True)
         self.assertEqual(len(fake.calls), 3)
         self.assertEqual(len(TOOLS), 8)
         self.assertEqual(
@@ -614,6 +708,7 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(failure.is_error)
         failure_payload = _mcp_payload(failure)
         self.assertEqual(failure_payload["audit"]["call_count"], 3)
+        self.assertIs(failure_payload["audit"]["simulated"], True)
         self.assertNotIn("transport-secret", json.dumps(failure_payload))
         self.assertNotIn(str(self.root), json.dumps(failure_payload))
 
@@ -631,6 +726,7 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(invalid.is_error)
         self.assertEqual(_mcp_payload(invalid)["audit"]["call_count"], 0)
+        self.assertIs(_mcp_payload(invalid)["audit"]["simulated"], True)
 
 
 if __name__ == "__main__":

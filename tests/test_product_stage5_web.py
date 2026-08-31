@@ -265,7 +265,7 @@ class ProductStageFiveWebTests(unittest.TestCase):
         self.assertEqual(enhanced_payload["mode"], "enhanced")
         self.assertEqual(
             enhanced_payload["audit"],
-            {"call_count": 0, "calls": []},
+            {"simulated": None, "call_count": 0, "calls": []},
         )
         status = self.client.get("/api/status")
         self.assertEqual(status.status_code, 200, status.text)

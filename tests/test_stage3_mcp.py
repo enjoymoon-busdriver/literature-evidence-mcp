@@ -716,7 +716,8 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         "LEMCP_E_ENHANCED_UNAVAILABLE",
                     )
                     self.assertEqual(
-                        enhanced_payload["audit"], {"call_count": 0, "calls": []}
+                        enhanced_payload["audit"],
+                        {"simulated": None, "call_count": 0, "calls": []},
                     )
                     _assert_no_private_keys(self, enhanced_payload)
                     self.assertNotIn(

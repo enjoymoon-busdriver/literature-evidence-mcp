@@ -15,6 +15,7 @@ const state = {
   completed: false,
   searching: false,
   enhancedAvailable: false,
+  enhancedSimulated: null,
 };
 
 const elements = {
@@ -107,14 +108,30 @@ function appendDefinition(list, term, value) {
   appendText(list, "dd", value || "—");
 }
 
+function enhancedRunLabel(simulated) {
+  if (simulated === true) {
+    return "离线模拟增强搜索";
+  }
+  if (simulated === false) {
+    return "联网增强搜索";
+  }
+  return "增强状态未知";
+}
+
 async function loadStatus() {
   const payload = await api("/api/status");
   state.csrfToken = payload.csrf_token;
-  state.enhancedAvailable = payload.enhanced_available === true;
-  const enhancedSimulated = Boolean(payload.enhanced && payload.enhanced.simulated);
+  const reportedSimulated = payload.enhanced && payload.enhanced.simulated;
+  state.enhancedSimulated = typeof reportedSimulated === "boolean"
+    ? reportedSimulated
+    : null;
+  state.enhancedAvailable =
+    payload.enhanced_available === true && state.enhancedSimulated !== null;
   elements.enhancedModeOption.disabled = !state.enhancedAvailable;
   elements.enhancedModeOption.textContent = state.enhancedAvailable
-    ? (enhancedSimulated ? "增强搜索（离线模拟）" : "增强搜索（显式联网外发）")
+    ? (state.enhancedSimulated
+      ? "增强搜索（离线模拟）"
+      : "增强搜索（显式联网外发）")
     : "增强搜索（当前不可用）";
   if (!state.enhancedAvailable && elements.searchMode.value === "enhanced") {
     elements.searchMode.value = "bm25";
@@ -124,7 +141,7 @@ async function loadStatus() {
     ? payload.enhanced.roles
     : [];
   elements.enhancedAvailability.textContent = state.enhancedAvailable
-    ? `${enhancedSimulated ? "离线模拟" : "增强"} transport 已配置：${roles.map((item) => `${item.role}=${item.provider}/${item.model_id}`).join("；")}。`
+    ? `${state.enhancedSimulated ? "离线模拟" : "联网增强"} transport 已配置：${roles.map((item) => `${item.role}=${item.provider}/${item.model_id}`).join("；")}。`
     : "增强搜索尚未配置或当前不可用；请使用默认 BM25。";
   setNotice(
     elements.serviceStatus,
@@ -701,11 +718,14 @@ function renderResults(payload) {
   renderSearchAudit(payload.audit);
   if (!payload.found) {
     const hint = payload.input_hint ? ` ${payload.input_hint}` : "";
-    setNotice(elements.searchStatus, `${payload.message}${hint}`);
+    const prefix = payload.retrieval_mode === "enhanced"
+      ? `${enhancedRunLabel(payload.audit && payload.audit.simulated)}：`
+      : "";
+    setNotice(elements.searchStatus, `${prefix}${payload.message}${hint}`);
     return;
   }
   const modeLabel = payload.retrieval_mode === "enhanced"
-    ? "增强搜索证据"
+    ? `${enhancedRunLabel(payload.audit && payload.audit.simulated)}证据`
     : "本地 BM25 证据";
   setNotice(elements.searchStatus, `找到 ${payload.results.length} 条${modeLabel}。`);
   for (const result of payload.results) {
@@ -729,7 +749,11 @@ function renderSearchAudit(audit) {
   if (!audit) {
     return;
   }
-  appendText(elements.searchAudit, "h3", `增强调用审计：实际 ${audit.call_count} 次`);
+  appendText(
+    elements.searchAudit,
+    "h3",
+    `${enhancedRunLabel(audit.simulated)}调用审计：实际 ${audit.call_count} 次`,
+  );
   const list = document.createElement("ul");
   for (const call of audit.calls) {
     const details = [`${call.role} · ${call.provider}/${call.model_id}`, call.sent];
@@ -747,7 +771,7 @@ function renderSearchAudit(audit) {
 
 function updateSearchButton() {
   elements.searchButton.textContent = elements.searchMode.value === "enhanced"
-    ? "在所选资料库和快照中执行增强搜索"
+    ? `在所选资料库和快照中执行${enhancedRunLabel(state.enhancedSimulated)}`
     : "在所选资料库和快照中本地搜索";
   elements.searchButton.disabled =
     state.searching ||
@@ -794,7 +818,7 @@ async function search() {
   setNotice(
     elements.searchStatus,
     mode === "enhanced"
-      ? "正在先做本地完整核验，再按三角色顺序执行增强搜索……"
+      ? `正在先做本地完整核验，再按三角色顺序执行${enhancedRunLabel(state.enhancedSimulated)}……`
       : "正在实时核验明确快照并执行离线本地 BM25 搜索……",
   );
   try {
@@ -821,8 +845,12 @@ async function search() {
       return;
     }
     elements.searchResults.replaceChildren();
-    renderSearchAudit(error.payload && error.payload.audit ? error.payload.audit : null);
-    setNotice(elements.searchStatus, error.message, true);
+    const audit = error.payload && error.payload.audit ? error.payload.audit : null;
+    renderSearchAudit(audit);
+    const prefix = mode === "enhanced" && audit
+      ? `${enhancedRunLabel(audit.simulated)}失败：`
+      : "";
+    setNotice(elements.searchStatus, `${prefix}${error.message}`, true);
   } finally {
     if (searchRequestIsCurrent(requestId, requestedLibraryId, requestedEpoch)) {
       state.searching = false;

@@ -30,8 +30,14 @@ class EnhancedSearchError(LiteratureEvidenceError):
 
     def __init__(self, message: str, audit: dict[str, object] | None = None) -> None:
         super().__init__(message)
-        source = {"call_count": 0, "calls": []} if audit is None else audit
+        source = (
+            {"simulated": None, "call_count": 0, "calls": []}
+            if audit is None
+            else audit
+        )
+        simulated = source.get("simulated")
         self.audit = {
+            "simulated": simulated if type(simulated) is bool else None,
             "call_count": source.get("call_count", 0),
             "calls": [dict(item) for item in source.get("calls", [])],
         }
