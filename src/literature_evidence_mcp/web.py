@@ -706,7 +706,13 @@ def create_app(
     )
 
 
-def serve_local(library_path: Path, *, port: int = DEFAULT_PORT) -> None:
+def serve_local(
+    library_path: Path,
+    *,
+    port: int = DEFAULT_PORT,
+    open_browser: bool = False,
+    browser_opener: Callable[[str], object] | None = None,
+) -> None:
     """Run one foreground Uvicorn process bound only to IPv4 loopback."""
     import uvicorn
 
@@ -732,8 +738,20 @@ def serve_local(library_path: Path, *, port: int = DEFAULT_PORT) -> None:
             raise ImportPolicyError(
                 f"无法绑定本机端口 {port}；端口可能已被占用。"
             ) from exc
+        listener.listen(socket.SOMAXCONN)
         print(f"本机管理页：{url}")
         print("按 Ctrl+C 可停止服务并释放端口。")
+        if open_browser:
+            if browser_opener is None:
+                import webbrowser
+
+                browser_opener = webbrowser.open
+            try:
+                opened = browser_opener(url)
+            except Exception:
+                opened = False
+            if opened is False:
+                print("未能自动打开浏览器；请手动打开上述本机地址。")
         server.run(sockets=[listener])
     finally:
         listener.close()

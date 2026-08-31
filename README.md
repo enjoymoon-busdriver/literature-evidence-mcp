@@ -2,9 +2,9 @@
 
 一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 复制进新的冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
 
-项目目标是“可审计的本地文献证据桌面应用 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成阶段一核心、阶段二本机管理页和阶段三本地 stdio MCP；还没有 App/DMG。
+项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成阶段一至阶段四；阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
 
-## 当前已实现：阶段一至阶段三
+## 当前已实现：阶段一至阶段四
 
 - 显式导入 UTF-8 Markdown 和带文本层 PDF。
 - 每次 `build` 都新建快照；不覆盖或修改旧快照。
@@ -23,6 +23,9 @@
 - MCP 工具只接受受控 `snapshot_id`、`document_id`、`chunk_id`、`section_id`、查询和数量上限，不接受 library、快照、SQLite 或源文件路径，也不接受任意 URI。
 - 每次 MCP 内容调用都重新执行现有快照哈希、schema、数量和语义核验，再在 `query_only` 内存 SQLite 镜像上安装只读 authorizer；不会写缓存、日志或 SQLite sidecar。
 - `search_documents` 与 `find_in_document` 只使用现有 SQLite FTS5/BM25，真实无命中返回 `found=false, results=[]`，不会强行补 top-k。
+- Finder 可双击的 [`启动文献证据管理页.command`](./启动文献证据管理页.command)：从自身位置确定完整项目，路径含空格也可使用。
+- 首次运行先核对 macOS、arm64、Python 3.11+、SQLite `serialize/deserialize` 和 FTS5，再在项目 `.venv/` 中做非 editable 安装。
+- 双击入口使用稳定的用户资料库目录，端口绑定成功后才打开默认浏览器；终端前台运行，`Ctrl+C` 即停止。
 
 ## 读写边界
 
@@ -32,23 +35,36 @@
 
 用户导入的 PDF/Markdown、快照、数据库和运行态不属于项目代码，也不应提交到公开仓库。`.gitignore` 默认排除示例使用的 `local-library/`、常见 `library/runtime/snapshots` 目录、SQLite、虚拟环境、密钥和缓存；如果把 `--library` 指向仓库内的其他自定义目录，需要自行加入 ignore，或者把资料库放到仓库外。
 
-## 本地试用
+## Apple Silicon macOS 最短流程
 
-需要 Python 3.11 或更新版本，并要求该 Python 的 `sqlite3` 提供 `serialize/deserialize`（标准 CPython 的常见构建通常具备；缺失时命令会明确报错，不会发布半成品快照）。依赖用于本地 PDF 文本层、管理页 HTTP/ASGI、multipart 文件解析和 MCP stdio 协议；运行时不调用网络模型、付费 API 或外部数据服务。MCP SDK 的依赖树包含其他标准 transport 组件，但本项目入口只启动 stdio。
+1. 保留完整项目文件夹，不要只单独移动 `.command` 文件。
+2. 在 Finder 双击 [`启动文献证据管理页.command`](./启动文献证据管理页.command)。如果 macOS 首次拦截未签名开发脚本，可在 Finder 中右键它并选“打开”；不需要关闭系统安全功能。
+3. 首次等待环境准备完成。端口 `8765` 成功绑定后，默认浏览器会打开 `http://127.0.0.1:8765/`。
+4. 保持 Terminal（终端）窗口打开。用完后在该窗口按 `Ctrl+C`，服务停止且端口随即释放。
+
+入口只支持 Apple Silicon macOS，需要 Python 3.11 或更新版本，且该 Python 的 `sqlite3` 必须能真实使用 `serialize/deserialize` 和 FTS5（Full-Text Search 5，SQLite 全文检索模块）。不满足时入口会给出中文提示；可从 [Python.org 的 macOS 下载页](https://www.python.org/downloads/macos/) 获取合适安装包，然后重新双击。入口不使用 `sudo`，不自动安装 Homebrew，不执行 `curl` 管道脚本，也不修改 `PATH` 或 shell 配置文件。
+
+长期运行与资料数据主要使用两个明确目录：
+
+- `<完整项目>/.venv/`：安装当前本地项目和免费开源依赖的受控虚拟环境；已被 `.gitignore` 排除。
+- `~/Library/Application Support/literature-evidence-mcp/library/`：默认用户资料库；位于项目外，不会被提交 Git。第一次成功准备时建立目录，只有用户在管理页明确选文件并点击构建后，才会在其中新增快照。
+
+预检和创建 `.venv` 本身只是本机操作。首次安装可能访问默认的 [PyPI](https://pypi.org/) 软件包索引，下载 PEP 517 构建所需的 `setuptools` 以及项目声明的免费开源直接/传递依赖。为防止安装位置被外部配置改到 `.venv` 之外，入口会忽略用户的 `PIP_*`、`pip.conf`、`PYTHONPATH`、`PYTHONHOME` 和当前激活的虚拟环境，要求 `.venv` 明确禁用系统 site-packages，并把安装前缀固定为项目 `.venv`；因此不会使用用户配置的私有索引、其中的凭据或项目外 Python 包。这些对外请求只用于依赖解析和软件包下载；不发送文献或资料库内容，不主动请求 Keychain（钥匙串）凭据，不下载模型，不调用云模型或付费 API。pip 缓存已禁用；pip 可能对暂时网络失败做有限自动重试，不会由启动器另加循环或无限重试。本地构建可能在项目中生成已被 `.gitignore` 排除的 `build/` 和 `src/literature_evidence_mcp.egg-info/`；它们是包构建产物，不含文献或资料库。当本地项目内容没变且环境完整时，后续双击不再运行 pip、不检查更新；管理页只监听 `127.0.0.1`。
+
+## 管理页与 MCP 的区别
+
+双击入口只启动本机管理页。管理页用于用户明确选择 PDF/Markdown、新增冻结快照、核验和本地搜索；“构建全新快照”是明确写操作。MCP 则是给支持本地 stdio（标准输入/输出）的 MCP host 调用的八个只读工具。双击入口不会自动启动 MCP，也不会修改任何 Codex、ChatGPT 或 Claude 配置。
+
+需要 MCP 时，由用户在支持 stdio command/args 的 host 中手工设置下列等价命令；它只固定 library，没有 host、port、URL 或其他 transport 参数：
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
+"<完整项目>/.venv/bin/python" -m literature_evidence_mcp.mcp_server \
+  --library "$HOME/Library/Application Support/literature-evidence-mcp/library"
 ```
 
-启动阶段三 MCP（这条命令只固定 library；没有 host、port、URL 或 transport 参数）：
+`literature-evidence-mcp --library <library>` 这个原有 console command 仍保留。上面用 `python -m` 写法，是为了让虚拟环境的项目路径含空格时也能稳定启动。MCP 会在前台等待 host 通过 stdin/stdout 发送协议消息，所以直接运行时没有普通交互提示。stdout 只用于 MCP 协议；可操作启动错误写入 stderr，且不回显内部路径或 traceback。host 每次调用都必须提供目标 `snapshot_id`，服务不会暗中选择“最新”或“当前”快照。
 
-```bash
-literature-evidence-mcp --library ./local-library
-```
-
-它会在前台等待 MCP host 通过 stdin/stdout 发送协议消息，所以直接运行时没有普通交互提示。stdout 只用于 MCP 协议；可操作启动错误写入 stderr，且不回显内部路径或 traceback。host 每次调用都必须提供目标 `snapshot_id`，服务不会暗中选择“最新”或“当前”快照。
+只安装 wheel 不会得到 Finder `.command`；这个双击入口属于完整源码项目的开发版外层。wheel 仍包含两个正式 Python CLI 入口和管理页静态资源。
 
 ### 八个 MCP 工具
 
@@ -67,6 +83,16 @@ literature-evidence-mcp --library ./local-library
 
 工具 annotations 均为 `readOnlyHint=true`、`destructiveHint=false`、`openWorldHint=false`。这些 annotations 是给客户端的提示；真正的只读边界来自固定 library、严格逻辑 ID、完整快照核验、只读内存 SQLite、authorizer 和输出白名单。
 
+## 命令行与贡献者用法
+
+需要 Python 3.11 或更新版本，并要求该 Python 的 `sqlite3` 提供可用的 `serialize/deserialize` 和 FTS5。贡献者可手工建立 editable 环境：
+
+```bash
+python3 -m venv .venv-dev
+source .venv-dev/bin/activate
+python -m pip install -e .
+```
+
 启动管理页（这条命令固定 library 和端口；没有 `--host` 参数）：
 
 ```bash
@@ -81,6 +107,15 @@ literature-evidence serve --library ./local-library --port 8765
 python -m pip install -e '.[test]'
 python -m unittest discover -s tests -v
 ```
+
+自动验收可显式指定测试用 Python，但该变量不会写入 shell 配置，也不会修改 `PATH`：
+
+```bash
+LITERATURE_EVIDENCE_PYTHON=/absolute/path/to/python3.12 \
+  ./启动文献证据管理页.command --preflight-only
+```
+
+`--preflight-only` 只读，不创建文件。自动验收还可用 `--prepare-only` 只准备环境和默认资料库，或用 `--no-browser` 启动服务但不打开浏览器；普通 Finder 双击不需要这些参数。
 
 也可以继续使用阶段一 CLI。用合成 Markdown 建立新快照（这一步会在 `local-library/` 新增文件）：
 
@@ -121,7 +156,7 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 - [Starlette](https://pypi.org/project/starlette/) `>=1.6,<2`：轻量 ASGI 应用层；BSD-3-Clause。
 - [Uvicorn](https://pypi.org/project/uvicorn/) `>=0.52,<1`：只绑定本机回环地址的 ASGI 服务；BSD-3-Clause。
 - [python-multipart](https://pypi.org/project/python-multipart/) `>=0.0.32,<1`：流式解析浏览器文件选择；Apache-2.0。
-- [HTTPX2](https://pypi.org/project/httpx2/) `>=2.12,<3`：仅用于测试管理页，不是运行依赖；BSD-3-Clause。
+- [HTTPX2](https://pypi.org/project/httpx2/) `>=2.12,<3`：项目代码只在管理页测试中直接使用；MCP SDK 的传递依赖树也会安装它；BSD-3-Clause。
 
 ## 快照结构
 
@@ -141,7 +176,7 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 1. **阶段一（已完成）**：导入、冻结快照、哈希/schema/数量核验、SQLite BM25 与 CLI 预览。
 2. **阶段二（已完成）**：本机 `127.0.0.1` Starlette 静态管理页；写操作只能由页面中的明确按钮触发。
 3. **阶段三（已完成）**：八类 closed-world stdio 只读 MCP 能力；`search_documents` 与 `find_in_document` 只走本地 BM25，不含 combo、API Key 或 Tunnel。
-4. **阶段四**：macOS Apple Silicon 小白入口；自包含启动器和 App/DMG 再单独评估。
+4. **阶段四（已完成）**：macOS Apple Silicon 开发版 `.command` 入口、首次预检/受控安装、默认用户资料库和前台管理页启动。自包含、签名/公证 App、DMG 或 pkg 仍属范围外。
 
 v0.1 暂不加入远程 combo、阿里云、Secure MCP Tunnel、OCR、Zotero、Windows/Linux、自动更新、完整聊天界面、Electron/Tauri/Flet。
 

@@ -45,6 +45,11 @@ def _parser() -> argparse.ArgumentParser:
         default=8765,
         help="本机端口（1024-65535，默认 8765）。",
     )
+    serve.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="端口成功绑定后打开默认浏览器。",
+    )
     return parser
 
 
@@ -70,7 +75,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             from .web import serve_local
 
-            serve_local(args.library, port=args.port)
+            serve_local(
+                args.library,
+                port=args.port,
+                open_browser=args.open_browser,
+            )
             return 0
     except LiteratureEvidenceError as exc:
         sys.stderr.write(f"错误：{exc}\n")
