@@ -12,6 +12,7 @@ import os
 import platform
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -686,14 +687,43 @@ def prepare_environment(
 
 
 def ensure_application_root(path: Path) -> None:
-    if path.is_symlink():
-        raise LauncherError("应用根目录不能是符号链接；未写入该位置。")
     try:
-        path.mkdir(parents=True, exist_ok=True)
+        absolute = Path(os.path.abspath(os.fspath(path)))
+    except (OSError, TypeError, ValueError) as exc:
+        raise LauncherError("无法确定应用根目录；未写入该位置。") from exc
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(absolute.anchor, flags)
+        for part in absolute.parts[1:]:
+            try:
+                status = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                status = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+                raise LauncherError(
+                    "应用根路径不能经过符号链接或非目录；未写入该位置。"
+                )
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except LauncherError:
+        raise
     except OSError as exc:
-        raise LauncherError("无法创建应用根目录，请检查用户目录写入权限。") from exc
-    if not path.is_dir():
-        raise LauncherError("应用根路径不是目录；请移走同名文件后重试。")
+        raise LauncherError("无法安全创建应用根目录，请检查用户目录写入权限。") from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _port(value: str) -> int:

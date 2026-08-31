@@ -710,6 +710,25 @@ class StageFourEnvironmentTests(unittest.TestCase):
             ):
                 self.assertFalse((home / forbidden).exists())
 
+    def test_application_root_rejects_ancestor_symlink_before_outside_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            home = root / "home"
+            project = root / "project"
+            outside = root / "outside"
+            home.mkdir()
+            project.mkdir()
+            outside.mkdir()
+            (home / "Library").symlink_to(outside, target_is_directory=True)
+            paths = launcher.resolve_paths(project, home=home)
+
+            with self.assertRaisesRegex(launcher.LauncherError, "符号链接"):
+                launcher.ensure_application_root(paths.application_root)
+
+            self.assertEqual(list(outside.iterdir()), [])
+
 
 class StageFourBrowserAndLifecycleTests(unittest.TestCase):
     def test_browser_opens_only_after_successful_bind_and_listen(self) -> None:
