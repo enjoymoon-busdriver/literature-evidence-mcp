@@ -402,6 +402,7 @@ function renderSnapshots() {
 
 async function loadSnapshots(preferredId = "") {
   const requestId = ++state.snapshotRequestId;
+  const previousSnapshotId = elements.snapshotSelect.value;
   if (!state.libraryId) {
     state.snapshots = [];
     renderSnapshots();
@@ -424,6 +425,9 @@ async function loadSnapshots(preferredId = "") {
     if (preferredId && state.snapshots.some((item) => item.snapshot_id === preferredId)) {
       elements.snapshotSelect.value = preferredId;
       elements.baseSnapshotSelect.value = preferredId;
+    }
+    if (elements.snapshotSelect.value !== previousSnapshotId) {
+      invalidateSearch();
     }
     return true;
   } catch (error) {

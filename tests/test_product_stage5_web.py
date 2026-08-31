@@ -367,12 +367,25 @@ class ProductStageFiveWebTests(unittest.TestCase):
             1,
         )[1].split("async function verifySnapshot(", 1)[0]
         self.assertIn("const requestId = ++state.snapshotRequestId;", load_snapshots)
+        self.assertIn(
+            "const previousSnapshotId = elements.snapshotSelect.value;",
+            load_snapshots,
+        )
         snapshot_guard = "requestId !== state.snapshotRequestId"
         self.assertIn(snapshot_guard, load_snapshots)
         self.assertLess(
             load_snapshots.index(snapshot_guard),
             load_snapshots.index("state.snapshots = payload.snapshots;"),
         )
+        snapshot_change = (
+            "if (elements.snapshotSelect.value !== previousSnapshotId)"
+        )
+        self.assertIn(snapshot_change, load_snapshots)
+        self.assertLess(
+            load_snapshots.index("elements.snapshotSelect.value = preferredId;"),
+            load_snapshots.index(snapshot_change),
+        )
+        self.assertIn("invalidateSearch();", load_snapshots)
         choose_files = script.text.split("function chooseFiles(fileList) {", 1)[1].split(
             "function renderSelectedFiles()",
             1,
