@@ -2,9 +2,9 @@
 
 一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 复制进新的冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
 
-项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四；下一轮产品化阶段 0 已冻结合同，阶段 1–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
+项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同和阶段 1 多资料库核心；下一轮阶段 2–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
 
-## 当前已实现：阶段一至阶段四
+## 当前已实现：历史阶段一至阶段四与产品化阶段 1
 
 - 显式导入 UTF-8 Markdown 和带文本层 PDF。
 - 每次 `build` 都新建快照；不覆盖或修改旧快照。
@@ -26,10 +26,12 @@
 - Finder 可双击的 [`启动文献证据管理页.command`](./启动文献证据管理页.command)：从自身位置确定完整项目，路径含空格也可使用。
 - 首次运行先核对 macOS、arm64、Python 3.11+、SQLite `serialize/deserialize` 和 FTS5，再在项目 `.venv/` 中做非 editable 安装。
 - 双击入口使用稳定的用户资料库目录，端口绑定成功后才打开默认浏览器；终端前台运行，`Ctrl+C` 即停止。
+- 固定应用根中的多资料库注册表：每个库使用随机、稳定、与名称和路径无关的 `library_id`，物理数据位于相互隔离的 `libraries/<library_id>/`。
+- 本地 `libraries` CLI 可显式创建、列出、选择、重命名和修改描述；允许同名显示名称，重命名、修改描述或重启不会改变 ID。
 
 ## 读写边界
 
-`build` 是用户主动执行的本地写操作：CLI 读取用户逐个列出的源文件；管理页只接收浏览器明确选择的文件字节。二者都只在固定 library 中新增快照，不修改源文件或旧快照。
+`build` 是用户主动执行的本地写操作：CLI 读取用户逐个列出的源文件；管理页只接收浏览器明确选择的文件字节。二者都只在固定 library 中新增快照，不修改源文件或旧快照。`libraries create/select/rename/describe` 也是用户明确执行的本地注册表写操作；`libraries list` 只读，空状态下不会创建应用目录。
 
 `status`、`list`、`verify`、`search` 与八个 MCP 工具是只读操作：它们不会创建 library、重建数据库、写回快照或创建 SQLite sidecar。MCP 不暴露导入、重建、激活、删除、监控、迁移或任意文件读取能力。完整边界见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
 
@@ -44,10 +46,11 @@
 
 入口只支持 Apple Silicon macOS，需要 Python 3.11 或更新版本，且该 Python 的 `sqlite3` 必须能真实使用 `serialize/deserialize` 和 FTS5（Full-Text Search 5，SQLite 全文检索模块）。不满足时入口会给出中文提示；可从 [Python.org 的 macOS 下载页](https://www.python.org/downloads/macos/) 获取合适安装包，然后重新双击。入口不使用 `sudo`，不自动安装 Homebrew，不执行 `curl` 管道脚本，也不修改 `PATH` 或 shell 配置文件。
 
-长期运行与资料数据主要使用两个明确目录：
+长期运行与资料数据使用以下明确目录：
 
 - `<完整项目>/.venv/`：安装当前本地项目和免费开源依赖的受控虚拟环境；已被 `.gitignore` 排除。
 - `~/Library/Application Support/literature-evidence-mcp/library/`：默认用户资料库；位于项目外，不会被提交 Git。第一次成功准备时建立目录，只有用户在管理页明确选文件并点击构建后，才会在其中新增快照。
+- `~/Library/Application Support/literature-evidence-mcp/registry.json` 与同级 `libraries/<library_id>/`：产品化阶段 1 的持久化注册表和物理隔离多库。注册表不保存任意路径；名称和描述不参与目录派生。现有 `.command`、HTTP 和 MCP 的单库入口保持兼容，不会暗中采用注册表中的所选库。
 
 预检和创建 `.venv` 本身只是本机操作。首次安装可能访问默认的 [PyPI](https://pypi.org/) 软件包索引，下载 PEP 517 构建所需的 `setuptools` 以及项目声明的免费开源直接/传递依赖。为防止安装位置被外部配置改到 `.venv` 之外，入口会忽略用户的 `PIP_*`、`pip.conf`、`PYTHONPATH`、`PYTHONHOME` 和当前激活的虚拟环境，要求 `.venv` 明确禁用系统 site-packages，并把安装前缀固定为项目 `.venv`；因此不会使用用户配置的私有索引、其中的凭据或项目外 Python 包。这些对外请求只用于依赖解析和软件包下载；不发送文献或资料库内容，不主动请求 Keychain（钥匙串）凭据，不下载模型，不调用云模型或付费 API。pip 缓存已禁用；pip 可能对暂时网络失败做有限自动重试，不会由启动器另加循环或无限重试。本地构建可能在项目中生成已被 `.gitignore` 排除的 `build/` 和 `src/literature_evidence_mcp.egg-info/`；它们是包构建产物，不含文献或资料库。当本地项目内容没变且环境完整时，后续双击不再运行 pip、不检查更新；管理页只监听 `127.0.0.1`。
 
@@ -92,6 +95,18 @@ python3 -m venv .venv-dev
 source .venv-dev/bin/activate
 python -m pip install -e .
 ```
+
+管理多个本地资料库（这些命令固定使用用户 Application Support 下的受控应用根；不接受任意 `--app-root`）：
+
+```bash
+literature-evidence libraries create "研究资料" --description "本地合成测试与公开文献"
+literature-evidence libraries list
+literature-evidence libraries rename <library_id> "新名称"
+literature-evidence libraries describe <library_id> "新描述"
+literature-evidence libraries select <library_id>
+```
+
+创建结果和列表会返回本地 `library_root`，可继续显式传给现有 `build --library`、`serve --library` 或只读 MCP `--library`。阶段 1 的选择只持久化本地产品状态；HTTP/MCP 不会隐式选择当前库，MCP schema 仍是原有单库八工具合同。
 
 启动管理页（这条命令固定 library 和端口；没有 `--host` 参数）：
 
@@ -178,7 +193,7 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 3. **阶段三（已完成）**：八类 closed-world stdio 只读 MCP 能力；`search_documents` 与 `find_in_document` 只走本地 BM25，不含 combo、API Key 或 Tunnel。
 4. **阶段四（已完成）**：macOS Apple Silicon 开发版 `.command` 入口、首次预检/受控安装、默认用户资料库和前台管理页启动。自包含、签名/公证 App、DMG 或 pkg 仍属范围外。
 
-下一轮阶段 0–9 与上面的历史编号分开：阶段 0 只冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1–9 必须依次验收，当前均未实现。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
+下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1 已实现多资料库注册表与本地管理 CLI，阶段 2–9 尚未实现。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
 
 OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完整聊天界面、自动删除/垃圾回收、App/DMG 打包、签名、公证和发布不在阶段 0–9 范围内。
 
@@ -190,6 +205,7 @@ OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完�
 - `get_document_toc` 的 Markdown 标题与 PDF 页码导航来自现有 chunk 索引，不等同于作者提供的正式目录；`section_id` 只对生成它的快照与文档有效。
 - TOC 当前一次最多返回前 100 节且没有翻页参数；章节读取一次最多返回该节开头 1200 字符且没有续读游标。`truncated=true` 只诚实标记截断，不代表可由本工具继续翻页。
 - MCP 成功结果当前用单个 JSON `TextContent` 返回，没有另行声明 output schema。
+- 产品化阶段 1 只保存多资料库选择；管理页切库以及 MCP 的 `library_id + snapshot_id` 双级 schema 属于后续阶段，当前不会隐式使用所选库。
 - pypdf 能提取文本不等于排版、全文或公式已经人工核验。
 - 无文本层 PDF 会明确拒绝，当前不会静默 OCR。
 - 一个导入文件暂视为一个文档；多资产合并和人工元数据编辑留待后续。

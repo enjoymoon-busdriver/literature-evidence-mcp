@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .errors import LiteratureEvidenceError
+from .registry import LibraryRegistry, default_application_root
 from .retrieval import search_snapshot
 from .snapshot import build_snapshot, verify_snapshot
 
@@ -50,6 +51,31 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="端口成功绑定后打开默认浏览器。",
     )
+
+    libraries = subparsers.add_parser(
+        "libraries", help="在固定应用目录中显式管理多个本地资料库。"
+    )
+    library_actions = libraries.add_subparsers(
+        dest="library_action", required=True
+    )
+    library_actions.add_parser("list", help="只读列出资料库和当前选择。")
+
+    create = library_actions.add_parser("create", help="创建一个新的物理资料库。")
+    create.add_argument("name", help="显示名称；允许与其他资料库同名。")
+    create.add_argument("--description", default="", help="可选描述。")
+
+    select = library_actions.add_parser("select", help="按稳定 ID 选择资料库。")
+    select.add_argument("library_id", help="要选择的稳定 library_id。")
+
+    rename = library_actions.add_parser("rename", help="修改显示名称，不改变 ID。")
+    rename.add_argument("library_id", help="稳定 library_id。")
+    rename.add_argument("name", help="新的显示名称。")
+
+    describe = library_actions.add_parser(
+        "describe", help="修改描述，不改变 ID。"
+    )
+    describe.add_argument("library_id", help="稳定 library_id。")
+    describe.add_argument("description", help="新的描述；空字符串表示清空。")
     return parser
 
 
@@ -72,6 +98,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 top_k=args.top_k,
                 excerpt_chars=args.excerpt_chars,
             )
+        elif args.command == "libraries":
+            registry = LibraryRegistry(default_application_root())
+            if args.library_action == "list":
+                result = {"libraries": registry.list_libraries()}
+            elif args.library_action == "create":
+                result = {
+                    "library": registry.create(
+                        args.name, description=args.description
+                    )
+                }
+            elif args.library_action == "select":
+                result = {"library": registry.select(args.library_id)}
+            elif args.library_action == "rename":
+                result = {"library": registry.rename(args.library_id, args.name)}
+            else:
+                result = {
+                    "library": registry.update_description(
+                        args.library_id, args.description
+                    )
+                }
         else:
             from .web import serve_local
 

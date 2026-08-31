@@ -12,3 +12,7 @@ class SnapshotError(LiteratureEvidenceError):
 
 class SearchInputError(LiteratureEvidenceError):
     """A local search request is outside the bounded read-only contract."""
+
+
+class LibraryRegistryError(LiteratureEvidenceError):
+    """The local multi-library registry is invalid or cannot be updated safely."""
