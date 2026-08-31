@@ -344,6 +344,7 @@ class ProductStageFiveWebTests(unittest.TestCase):
         self.assertIn("requestedLibraryId", script.text)
         self.assertIn("requestedEpoch", script.text)
         self.assertIn('elements.files.value = ""', script.text)
+        self.assertIn("cleanup_warning", script.text)
         load_libraries = script.text.split(
             'async function loadLibraries(candidateId = "") {',
             1,
@@ -361,6 +362,39 @@ class ProductStageFiveWebTests(unittest.TestCase):
         )[1].split("function badge(", 1)[0]
         self.assertEqual(switch_library.count("loadLibraries(libraryId)"), 1)
         self.assertIn("if (!(await loadLibraries(libraryId)))", switch_library)
+        load_snapshots = script.text.split(
+            'async function loadSnapshots(preferredId = "") {',
+            1,
+        )[1].split("async function verifySnapshot(", 1)[0]
+        self.assertIn("const requestId = ++state.snapshotRequestId;", load_snapshots)
+        snapshot_guard = "requestId !== state.snapshotRequestId"
+        self.assertIn(snapshot_guard, load_snapshots)
+        self.assertLess(
+            load_snapshots.index(snapshot_guard),
+            load_snapshots.index("state.snapshots = payload.snapshots;"),
+        )
+        choose_files = script.text.split("function chooseFiles(fileList) {", 1)[1].split(
+            "function renderSelectedFiles()",
+            1,
+        )[0]
+        self.assertLess(
+            choose_files.index('elements.files.value = "";'),
+            choose_files.index("state.files = files;"),
+        )
+        search_function = script.text.split("async function search() {", 1)[1].split(
+            "async function refreshAll()",
+            1,
+        )[0]
+        self.assertIn("const requestId = ++state.searchRequestId;", search_function)
+        self.assertEqual(search_function.count("searchRequestIsCurrent("), 3)
+        self.assertIn(
+            'elements.query.addEventListener("input", invalidateSearch);',
+            script.text,
+        )
+        self.assertIn(
+            'elements.snapshotSelect.addEventListener("change", invalidateSearch);',
+            script.text,
+        )
         self.assertNotIn("innerHTML", script.text)
         self.assertNotIn("insertAdjacentHTML", script.text)
         self.assertNotIn("https://", page.text + script.text)

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import stat
 import tempfile
@@ -717,8 +718,9 @@ async def _copy_uploads_and_build(
                     ),
                 )
 
-            with tempfile.TemporaryDirectory(prefix=UPLOAD_TEMP_PREFIX) as raw:
-                temporary = Path(raw)
+            raw = tempfile.mkdtemp(prefix=UPLOAD_TEMP_PREFIX)
+            temporary = Path(raw)
+            try:
                 os.chmod(temporary, 0o700)
                 controlled_sources: list[Path] = []
                 total_bytes = 0
@@ -872,7 +874,7 @@ async def _copy_uploads_and_build(
                             ],
                         },
                     ) from exc
-                return {
+                response = {
                     **result,
                     "published": True,
                     "members": sorted(
@@ -893,6 +895,20 @@ async def _copy_uploads_and_build(
                         for _index, filename, _upload in uploads
                     ],
                 }
+            except BaseException:
+                try:
+                    shutil.rmtree(temporary)
+                except OSError:
+                    pass
+                raise
+            try:
+                shutil.rmtree(temporary)
+            except OSError:
+                response["cleanup_warning"] = (
+                    "快照已成功发布，但本次上传临时文件未能完全清理；"
+                    "请勿重复构建。"
+                )
+            return response
     except RequestBoundaryError:
         raise
     except MultipartParseError:
@@ -1024,7 +1040,6 @@ def create_app(
     async def snapshots(request: Request) -> Response:
         library_id = request.path_params["library_id"]
         library = await run_in_threadpool(_fixed_library, registry, library_id)
-        status = await run_in_threadpool(library.catalog_status)
         values = await run_in_threadpool(library.list_snapshots)
         views = [
             await run_in_threadpool(_snapshot_view, library, item)
@@ -1033,10 +1048,22 @@ def create_app(
         return JSONResponse(
             {
                 "library_id": library_id,
-                "current_snapshot_id": status["current_snapshot_id"],
-                "last_successful_snapshot_id": status[
-                    "last_successful_snapshot_id"
-                ],
+                "current_snapshot_id": next(
+                    (
+                        item["snapshot_id"]
+                        for item in values
+                        if item["current"]
+                    ),
+                    None,
+                ),
+                "last_successful_snapshot_id": next(
+                    (
+                        item["snapshot_id"]
+                        for item in values
+                        if item["last_successful"]
+                    ),
+                    None,
+                ),
                 "snapshots": views,
             }
         )

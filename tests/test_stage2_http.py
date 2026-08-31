@@ -422,6 +422,48 @@ class StageTwoHttpTests(unittest.TestCase):
         ).json()["snapshots"]
         self.assertEqual(len(listed), 2)
 
+    def test_snapshot_list_derives_top_level_pointers_from_the_same_rows(
+        self,
+    ) -> None:
+        token = self.bootstrap()
+        library_id = self.create_library(token)
+        first = self.build_files(
+            token,
+            library_id,
+            [("files", ("first.md", b"# First\n\nalpha\n", "text/markdown"))],
+        )
+        second = self.build_files(
+            token,
+            library_id,
+            [("files", ("second.md", b"# Second\n\nbeta\n", "text/markdown"))],
+        )
+        self.assertEqual((first.status_code, second.status_code), (201, 201))
+        second_id = second.json()["snapshot_id"]
+        activated = self.client.post(
+            f"/api/libraries/{library_id}/snapshots/{second_id}/activate",
+            headers=self.post_headers(token, "activate-snapshot"),
+        )
+        self.assertEqual(activated.status_code, 200, activated.text)
+
+        with mock.patch.object(
+            FixedLibrary,
+            "catalog_status",
+            side_effect=AssertionError("snapshot listing must use one catalog read"),
+        ):
+            listed = self.client.get(f"/api/libraries/{library_id}/snapshots")
+        self.assertEqual(listed.status_code, 200, listed.text)
+        payload = listed.json()
+        current_rows = [
+            item["snapshot_id"] for item in payload["snapshots"] if item["current"]
+        ]
+        last_rows = [
+            item["snapshot_id"]
+            for item in payload["snapshots"]
+            if item["last_successful"]
+        ]
+        self.assertEqual(current_rows, [payload["current_snapshot_id"]])
+        self.assertEqual(last_rows, [payload["last_successful_snapshot_id"]])
+
     def test_build_mode_upload_names_types_and_limits_are_strict(self) -> None:
         token = self.bootstrap()
         library_id = self.create_library(token)
@@ -631,8 +673,8 @@ class StageTwoHttpTests(unittest.TestCase):
         self.assertEqual(path_json.status_code, 415)
 
         with mock.patch(
-            "literature_evidence_mcp.web.tempfile.TemporaryDirectory"
-        ) as temporary_directory:
+            "literature_evidence_mcp.web.tempfile.mkdtemp"
+        ) as make_temporary_directory:
             rejected_before_parse = self.client.post(
                 route,
                 headers={
@@ -643,7 +685,7 @@ class StageTwoHttpTests(unittest.TestCase):
                 files=[("files", ("note.md", b"text", "text/markdown"))],
             )
         self.assertEqual(rejected_before_parse.status_code, 400)
-        temporary_directory.assert_not_called()
+        make_temporary_directory.assert_not_called()
 
         malformed = self.client.post(
             route,
@@ -845,6 +887,59 @@ class StageTwoHttpTests(unittest.TestCase):
             )
         )
         self.assertEqual(_sidecars(library_root), [])
+
+    def test_cleanup_failure_after_publish_keeps_truthful_success_response(
+        self,
+    ) -> None:
+        token = self.bootstrap()
+        library_id = self.create_library(token)
+        upload_parent = self.root / "cleanup-warning-uploads"
+        upload_parent.mkdir()
+        original_build = FixedLibrary.build
+
+        def counted_build(instance, controlled_sources, **kwargs):
+            return original_build(instance, controlled_sources, **kwargs)
+
+        with mock.patch.object(tempfile, "tempdir", str(upload_parent)):
+            with mock.patch.object(
+                FixedLibrary,
+                "build",
+                autospec=True,
+                side_effect=counted_build,
+            ) as build_mock:
+                with mock.patch(
+                    "literature_evidence_mcp.web.shutil.rmtree",
+                    side_effect=OSError("forced /private/cleanup path"),
+                ) as cleanup_mock:
+                    response = self.build_files(
+                        token,
+                        library_id,
+                        [
+                            (
+                                "files",
+                                (
+                                    "published.md",
+                                    b"# Published\n\ntruthful success\n",
+                                    "text/markdown",
+                                ),
+                            )
+                        ],
+                    )
+        self.assertEqual(response.status_code, 201, response.text)
+        payload = response.json()
+        self.assertTrue(payload["published"])
+        self.assertIn("已成功发布", payload["cleanup_warning"])
+        self.assertIn("请勿重复构建", payload["cleanup_warning"])
+        self.assertNotIn("/private", response.text)
+        self.assertEqual(build_mock.call_count, 1)
+        self.assertEqual(cleanup_mock.call_count, 1)
+        snapshot_id = payload["snapshot_id"]
+        library_root = self.application_root / "libraries" / library_id
+        self.assertTrue((library_root / "snapshots" / snapshot_id).is_dir())
+        listed = self.client.get(f"/api/libraries/{library_id}/snapshots")
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json()["current_snapshot_id"], snapshot_id)
+        self.assertEqual(listed.json()["last_successful_snapshot_id"], snapshot_id)
 
     def test_concurrent_build_is_rejected_without_retry(self) -> None:
         token = self.bootstrap()

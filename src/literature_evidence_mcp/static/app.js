@@ -6,11 +6,14 @@ const state = {
   libraryId: "",
   libraryEpoch: 0,
   libraryRequestId: 0,
+  snapshotRequestId: 0,
+  searchRequestId: 0,
   snapshots: [],
   files: [],
   fileStates: [],
   building: false,
   completed: false,
+  searching: false,
 };
 
 const elements = {
@@ -120,6 +123,9 @@ function selectedLibraryCandidate() {
 
 function resetLibraryContext() {
   state.libraryEpoch += 1;
+  state.snapshotRequestId += 1;
+  state.searchRequestId += 1;
+  state.searching = false;
   state.snapshots = [];
   state.files = [];
   state.fileStates = [];
@@ -137,6 +143,13 @@ function resetLibraryContext() {
 
 function libraryContextIsCurrent(libraryId, epoch) {
   return state.libraryId === libraryId && state.libraryEpoch === epoch;
+}
+
+function searchRequestIsCurrent(requestId, libraryId, epoch) {
+  return (
+    requestId === state.searchRequestId &&
+    libraryContextIsCurrent(libraryId, epoch)
+  );
 }
 
 function renderLibraryDetails() {
@@ -221,7 +234,9 @@ async function createLibrary() {
     if (!(await loadLibraries())) {
       return;
     }
-    await loadSnapshots();
+    if (!(await loadSnapshots())) {
+      return;
+    }
     setNotice(
       elements.libraryStatus,
       `已创建“${payload.library.name}”；稳定 ID：${payload.library.library_id}。`,
@@ -248,7 +263,9 @@ async function switchLibrary() {
     if (!(await loadLibraries(libraryId))) {
       return;
     }
-    await loadSnapshots();
+    if (!(await loadSnapshots())) {
+      return;
+    }
     const active = state.libraries.find((item) => item.library_id === state.libraryId);
     setNotice(elements.libraryStatus, `已切换到“${active.name}”。`);
   } catch (error) {
@@ -384,10 +401,11 @@ function renderSnapshots() {
 }
 
 async function loadSnapshots(preferredId = "") {
+  const requestId = ++state.snapshotRequestId;
   if (!state.libraryId) {
     state.snapshots = [];
     renderSnapshots();
-    return;
+    return true;
   }
   const requestedLibraryId = state.libraryId;
   const requestedEpoch = state.libraryEpoch;
@@ -395,8 +413,11 @@ async function loadSnapshots(preferredId = "") {
     const payload = await api(
       `/api/libraries/${encodeURIComponent(requestedLibraryId)}/snapshots`,
     );
-    if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
-      return;
+    if (
+      requestId !== state.snapshotRequestId ||
+      !libraryContextIsCurrent(requestedLibraryId, requestedEpoch)
+    ) {
+      return false;
     }
     state.snapshots = payload.snapshots;
     renderSnapshots();
@@ -404,13 +425,18 @@ async function loadSnapshots(preferredId = "") {
       elements.snapshotSelect.value = preferredId;
       elements.baseSnapshotSelect.value = preferredId;
     }
+    return true;
   } catch (error) {
-    if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
-      return;
+    if (
+      requestId !== state.snapshotRequestId ||
+      !libraryContextIsCurrent(requestedLibraryId, requestedEpoch)
+    ) {
+      return false;
     }
     state.snapshots = [];
     renderSnapshots();
     setNotice(elements.serviceStatus, error.message, true);
+    return false;
   }
 }
 
@@ -425,7 +451,9 @@ async function verifySnapshot(snapshotId) {
     if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
       return;
     }
-    await loadSnapshots(snapshotId);
+    if (!(await loadSnapshots(snapshotId))) {
+      return;
+    }
     if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
       return;
     }
@@ -460,7 +488,9 @@ async function activateSnapshot(snapshotId) {
     if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
       return;
     }
-    await loadSnapshots(snapshotId);
+    if (!(await loadSnapshots(snapshotId))) {
+      return;
+    }
     if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
       return;
     }
@@ -480,9 +510,9 @@ function acceptedFile(file) {
 
 function chooseFiles(fileList) {
   const files = Array.from(fileList);
+  elements.files.value = "";
   const unsupported = files.find((file) => !acceptedFile(file));
   if (unsupported) {
-    elements.files.value = "";
     setNotice(
       elements.buildStatus,
       `不接受 ${unsupported.name}；这里只接受 .md、.markdown、.pdf。`,
@@ -557,6 +587,9 @@ function renderBuildSummary(payload) {
     "以上只统计 source/parsed/chunks 对象 payload；每个快照独立的 BM25 固定开销不计入节省量。",
     "hint",
   );
+  if (payload.cleanup_warning) {
+    appendText(elements.buildSummary, "p", payload.cleanup_warning, "file-error");
+  }
 }
 
 async function buildSnapshot() {
@@ -602,11 +635,19 @@ async function buildSnapshot() {
     elements.files.value = "";
     renderSelectedFiles();
     renderBuildSummary(payload);
-    setNotice(elements.buildStatus, `整批已发布：${payload.snapshot_id}。`);
+    const cleanupWarning = payload.cleanup_warning
+      ? ` ${payload.cleanup_warning}`
+      : "";
+    setNotice(
+      elements.buildStatus,
+      `整批已发布：${payload.snapshot_id}。${cleanupWarning}`,
+    );
     if (!(await loadLibraries(requestedLibraryId))) {
       return;
     }
-    await loadSnapshots(payload.snapshot_id);
+    if (!(await loadSnapshots(payload.snapshot_id))) {
+      return;
+    }
   } catch (error) {
     if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
       return;
@@ -655,10 +696,19 @@ function renderResults(payload) {
 
 function updateSearchButton() {
   elements.searchButton.disabled =
+    state.searching ||
     !state.libraryId ||
     elements.librarySelect.value !== state.libraryId ||
     !elements.query.value.trim() ||
     !elements.snapshotSelect.value;
+}
+
+function invalidateSearch() {
+  state.searchRequestId += 1;
+  state.searching = false;
+  elements.searchResults.replaceChildren();
+  setNotice(elements.searchStatus, "");
+  updateSearchButton();
 }
 
 function libraryCandidateChanged() {
@@ -680,7 +730,9 @@ async function search() {
   }
   const requestedLibraryId = state.libraryId;
   const requestedEpoch = state.libraryEpoch;
-  elements.searchButton.disabled = true;
+  const requestId = ++state.searchRequestId;
+  state.searching = true;
+  updateSearchButton();
   setNotice(elements.searchStatus, "正在实时核验明确快照并执行离线本地 BM25 搜索……");
   try {
     const payload = await api(
@@ -696,18 +748,21 @@ async function search() {
         }),
       },
     );
-    if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
+    if (!searchRequestIsCurrent(requestId, requestedLibraryId, requestedEpoch)) {
       return;
     }
     renderResults(payload);
   } catch (error) {
-    if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
+    if (!searchRequestIsCurrent(requestId, requestedLibraryId, requestedEpoch)) {
       return;
     }
     elements.searchResults.replaceChildren();
     setNotice(elements.searchStatus, error.message, true);
   } finally {
-    updateSearchButton();
+    if (searchRequestIsCurrent(requestId, requestedLibraryId, requestedEpoch)) {
+      state.searching = false;
+      updateSearchButton();
+    }
   }
 }
 
@@ -717,7 +772,9 @@ async function refreshAll() {
     if (!(await loadLibraries())) {
       return;
     }
-    await loadSnapshots(elements.snapshotSelect.value);
+    if (!(await loadSnapshots(elements.snapshotSelect.value))) {
+      return;
+    }
   } catch (error) {
     setNotice(elements.serviceStatus, error.message, true);
   }
@@ -733,7 +790,8 @@ elements.buildInherit.addEventListener("change", updateBuildControls);
 elements.baseSnapshotSelect.addEventListener("change", updateBuildControls);
 elements.refreshButton.addEventListener("click", refreshAll);
 elements.searchButton.addEventListener("click", search);
-elements.query.addEventListener("input", updateSearchButton);
+elements.query.addEventListener("input", invalidateSearch);
+elements.snapshotSelect.addEventListener("change", invalidateSearch);
 elements.dropZone.addEventListener("dragover", (event) => {
   event.preventDefault();
   elements.dropZone.classList.add("dragging");
