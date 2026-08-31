@@ -48,6 +48,13 @@ def _source_ids(snapshot: Path) -> dict[str, str]:
     }
 
 
+def _source_object(snapshot: Path, source_name: str) -> Path:
+    source = next(
+        item for item in _manifest(snapshot)["sources"] if item["source_name"] == source_name
+    )
+    return snapshot.parent.parent / source["objects"]["source"]["path"]
+
+
 def _tree_identity(root: Path) -> dict[str, tuple[str, str]]:
     identity: dict[str, tuple[str, str]] = {}
     for path in sorted(root.rglob("*")):
@@ -145,11 +152,10 @@ class ProductStageTwoSnapshotTests(unittest.TestCase):
             second["last_successful_snapshot_id"], second["snapshot_id"]
         )
 
-        first_a = next((first_path / "sources").glob(f"{_source_ids(first_path)['A.md']}.*"))
-        second_a = next((second_path / "sources").glob(f"{_source_ids(second_path)['A.md']}.*"))
-        self.assertNotEqual(first_a.stat().st_ino, second_a.stat().st_ino)
+        first_a = _source_object(first_path, "A.md")
+        second_a = _source_object(second_path, "A.md")
+        self.assertTrue(first_a.samefile(second_a))
         self.assertEqual(first_a.stat().st_nlink, 1)
-        self.assertEqual(second_a.stat().st_nlink, 1)
 
         second_ids = _source_ids(second_path)
         third = library.build(
@@ -210,7 +216,9 @@ class ProductStageTwoSnapshotTests(unittest.TestCase):
             library.catalog_status()["current_snapshot_id"], first["snapshot_id"]
         )
 
-        source = next((library_path / "snapshots" / first["snapshot_id"] / "sources").iterdir())
+        source = _source_object(
+            library_path / "snapshots" / first["snapshot_id"], "A.md"
+        )
         source.write_bytes(source.read_bytes() + b"tampered")
         with self.assertRaises(SnapshotError):
             library.activate(first["snapshot_id"])

@@ -36,11 +36,18 @@ from .ingest import (
     prepare_document,
     prepare_documents,
 )
+from .object_store import (
+    OBJECT_KINDS,
+    ensure_document_objects,
+    load_document,
+    object_store_manifest,
+    referenced_object_identities,
+)
 from .registry import LibraryRegistry
 
 
 SNAPSHOT_FORMAT = "literature-evidence-snapshot"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DATABASE_NAME = "evidence.sqlite"
 MANIFEST_NAME = "manifest.json"
 SCHEMA_NAME = "schema.sql"
@@ -70,7 +77,7 @@ CREATE TABLE document(
 CREATE TABLE asset(
     asset_id TEXT PRIMARY KEY,
     document_id TEXT NOT NULL REFERENCES document(document_id),
-    stored_path TEXT NOT NULL UNIQUE,
+    stored_path TEXT NOT NULL,
     source_sha256 TEXT NOT NULL,
     byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
     extraction_method TEXT NOT NULL,
@@ -187,6 +194,7 @@ def _populate_database(
     path: Path,
     documents: Sequence[PreparedDocument],
     corpus_sha256: str,
+    objects_by_document: Mapping[str, dict[str, dict[str, Any]]],
 ) -> dict[str, int]:
     database = sqlite3.connect(path)
     try:
@@ -223,7 +231,7 @@ def _populate_database(
                     "imported_source",
                 ),
             )
-            stored_path = f"sources/{document.document_id}{document.suffix}"
+            stored_path = objects_by_document[document.document_id]["source"]["path"]
             database.execute(
                 """INSERT INTO asset(
                     asset_id,document_id,stored_path,source_sha256,byte_size,
@@ -427,12 +435,15 @@ def _dependency_version(name: str) -> str:
         return "not-installed"
 
 
-def _source_manifest(document: PreparedDocument) -> dict[str, Any]:
+def _source_manifest(
+    document: PreparedDocument,
+    objects: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
     return {
         "document_id": document.document_id,
         "asset_id": document.asset_id,
         "source_name": document.source_name,
-        "stored_path": f"sources/{document.document_id}{document.suffix}",
+        "stored_path": objects["source"]["path"],
         "media_type": document.media_type,
         "title": document.title,
         "source_sha256": document.source_sha256,
@@ -444,6 +455,33 @@ def _source_manifest(document: PreparedDocument) -> dict[str, Any]:
         "chunk_count": len(document.chunks),
         "fulltext_verification": "unverified",
         "formula_verification": "unverified",
+        "objects": objects,
+    }
+
+
+def _storage_statistics(
+    objects_by_document: Mapping[str, dict[str, dict[str, Any]]],
+) -> dict[str, int]:
+    references = [
+        objects[kind]
+        for objects in objects_by_document.values()
+        for kind in OBJECT_KINDS
+    ]
+    new_objects = [item for item in references if item["created_in_snapshot"]]
+    created_identities = [
+        (item["path"], item["sha256"]) for item in new_objects
+    ]
+    if len(created_identities) != len(set(created_identities)):
+        raise SnapshotError("同一对象不能在一个快照中重复记为新增。")
+    logical_bytes = sum(item["byte_size"] for item in references)
+    new_bytes = sum(item["byte_size"] for item in new_objects)
+    return {
+        "object_references": len(references),
+        "new_objects": len(new_objects),
+        "reused_objects": len(references) - len(new_objects),
+        "logical_object_bytes": logical_bytes,
+        "new_object_bytes": new_bytes,
+        "reused_object_bytes": logical_bytes - new_bytes,
     }
 
 
@@ -475,10 +513,12 @@ def _publish_directory_no_replace(source: Path, target: Path) -> None:
 
 
 def _publish_prepared_snapshot(
+    library_root: Path,
     snapshots_root: Path,
     documents: Sequence[PreparedDocument],
     *,
     reserved_snapshot_ids: set[str],
+    required_existing_objects: set[tuple[str, str]],
 ) -> dict[str, Any]:
     """Build, verify, and no-replace publish one complete prepared snapshot."""
     corpus_sha256 = _corpus_sha256(documents)
@@ -497,17 +537,32 @@ def _publish_prepared_snapshot(
     )
 
     try:
-        sources_directory = temporary_directory / "sources"
-        sources_directory.mkdir()
+        objects_by_document: dict[str, dict[str, dict[str, Any]]] = {}
         for document in documents:
-            stored = sources_directory / f"{document.document_id}{document.suffix}"
-            _write_new_file(stored, document.payload)
-        _fsync_directory(sources_directory)
+            objects, writes = ensure_document_objects(
+                library_root,
+                document,
+                required_existing=required_existing_objects,
+            )
+            created = {kind: was_created for kind, was_created, _size in writes}
+            objects_by_document[document.document_id] = {
+                kind: {
+                    **objects[kind],
+                    "created_in_snapshot": created[kind],
+                }
+                for kind in OBJECT_KINDS
+            }
+        storage = _storage_statistics(objects_by_document)
 
         schema_path = temporary_directory / SCHEMA_NAME
         _write_new_file(schema_path, SCHEMA_SQL.encode("utf-8"))
         database_path = temporary_directory / DATABASE_NAME
-        counts = _populate_database(database_path, documents, corpus_sha256)
+        counts = _populate_database(
+            database_path,
+            documents,
+            corpus_sha256,
+            objects_by_document,
+        )
         database_hash, database_size = _sha256_regular_file(
             database_path, label="SQLite 数据库"
         )
@@ -536,7 +591,12 @@ def _publish_prepared_snapshot(
                 "byte_size": database_size,
             },
             "counts": counts,
-            "sources": [_source_manifest(document) for document in documents],
+            "object_store": object_store_manifest(),
+            "storage": storage,
+            "sources": [
+                _source_manifest(document, objects_by_document[document.document_id])
+                for document in documents
+            ],
             "limitations": [
                 "BM25 uses SQLite FTS5 unicode61 without language-specific tokenization.",
                 "Text extraction does not promote fulltext or formula verification.",
@@ -566,6 +626,7 @@ def _publish_prepared_snapshot(
         "database_sha256": database_hash,
         "schema_version": SCHEMA_VERSION,
         "counts": counts,
+        "storage": storage,
     }
 
 
@@ -576,6 +637,7 @@ def _validated_document_id(value: str, *, label: str) -> str:
 
 
 def _base_documents(
+    library_root: Path,
     snapshots_root: Path,
     catalog: dict[str, Any],
     base_snapshot_id: str,
@@ -593,9 +655,11 @@ def _base_documents(
 
     documents: list[PreparedDocument] = []
     for source in manifest["sources"]:
-        source_name = source.get("source_name")
-        stored = _snapshot_member(snapshot_directory, source.get("stored_path"))
-        document = prepare_document(stored, source_name=source_name)
+        document = load_document(
+            library_root,
+            source,
+            current_pipeline=True,
+        )
         if (
             document.document_id != source.get("document_id")
             or document.asset_id != source.get("asset_id")
@@ -604,6 +668,36 @@ def _base_documents(
             raise SnapshotError("基础快照成员在继承读取期间发生变化。")
         documents.append(document)
     return tuple(sorted(documents, key=lambda item: item.document_id))
+
+
+def _catalog_object_identities(
+    snapshots_root: Path,
+    catalog: dict[str, Any],
+) -> set[tuple[str, str]]:
+    identities: set[tuple[str, str]] = set()
+    for record in catalog["snapshots"]:
+        snapshot_directory = snapshots_root / record["snapshot_id"]
+        try:
+            status = snapshot_directory.lstat()
+        except OSError as exc:
+            raise SnapshotError("找不到已登记快照目录。") from exc
+        if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+            raise SnapshotError("已登记快照必须是普通目录且不能是符号链接。")
+        manifest, manifest_sha256 = _load_manifest(snapshot_directory)
+        if manifest_sha256 != record["manifest_sha256"]:
+            raise SnapshotError("已登记快照的 manifest 与目录册绑定不一致。")
+        if manifest.get("object_store") != object_store_manifest():
+            raise SnapshotError("已登记快照缺少受支持的对象库声明。")
+        if manifest.get("snapshot_id") != record["snapshot_id"]:
+            raise SnapshotError("已登记快照目录名与 manifest 身份不一致。")
+        sources = manifest.get("sources")
+        if not isinstance(sources, list):
+            raise SnapshotError("已登记快照的完整成员清单无效。")
+        for source in sources:
+            if not isinstance(source, dict):
+                raise SnapshotError("已登记快照的成员记录无效。")
+            identities.update(referenced_object_identities(source))
+    return identities
 
 
 def build_snapshot(
@@ -650,6 +744,10 @@ def build_snapshot(
         if not snapshot_catalog_exists(root_guard):
             write_snapshot_catalog(root_guard, empty_snapshot_catalog())
             catalog = empty_snapshot_catalog()
+        required_existing_objects = _catalog_object_identities(
+            snapshots_root,
+            catalog,
+        )
 
         members: dict[str, PreparedDocument]
         if base_snapshot_id is None:
@@ -658,7 +756,7 @@ def build_snapshot(
             members = {
                 document.document_id: document
                 for document in _base_documents(
-                    snapshots_root, catalog, base_snapshot_id
+                    library_root, snapshots_root, catalog, base_snapshot_id
                 )
             }
             requested = set(removed) | set(prepared_replacements)
@@ -681,11 +779,13 @@ def build_snapshot(
             raise ImportPolicyError("完整快照必须至少包含一个文件。")
 
         result = _publish_prepared_snapshot(
+            library_root,
             snapshots_root,
             tuple(sorted(members.values(), key=lambda item: item.document_id)),
             reserved_snapshot_ids={
                 item["snapshot_id"] for item in catalog["snapshots"]
             },
+            required_existing_objects=required_existing_objects,
         )
         record = {
             "snapshot_id": result["snapshot_id"],
@@ -792,6 +892,24 @@ def _snapshot_member(snapshot_directory: Path, raw: object) -> Path:
     except (OSError, ValueError) as exc:
         raise SnapshotError("manifest 中的快照路径越界或不存在。") from exc
     return target
+
+
+def _snapshot_library_root(snapshot_directory: Path) -> Path:
+    snapshots = snapshot_directory.parent
+    library_root = snapshots.parent
+    if snapshots.name != "snapshots":
+        raise SnapshotError("快照不位于固定 snapshots 目录中。")
+    for path, label in (
+        (snapshots, "snapshots 目录"),
+        (library_root, "资料库根目录"),
+    ):
+        try:
+            status = path.lstat()
+        except OSError as exc:
+            raise SnapshotError(f"无法读取{label}状态。") from exc
+        if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+            raise SnapshotError(f"{label}必须是普通目录且不能是符号链接。")
+    return library_root
 
 
 def _database_counts(database: sqlite3.Connection) -> dict[str, int]:
@@ -939,11 +1057,12 @@ def _verify_snapshot(
         raise SnapshotError("快照 schema_version 不受支持。")
     if require_directory_name and manifest.get("snapshot_id") != directory.name:
         raise SnapshotError("快照目录名与 snapshot_id 不一致。")
+    library_root = _snapshot_library_root(directory)
 
     for suffix in ("-journal", "-wal", "-shm"):
         if (directory / (DATABASE_NAME + suffix)).exists():
             raise SnapshotError("冻结 SQLite 快照旁存在 sidecar 文件。")
-    expected_root_entries = {MANIFEST_NAME, SCHEMA_NAME, DATABASE_NAME, "sources"}
+    expected_root_entries = {MANIFEST_NAME, SCHEMA_NAME, DATABASE_NAME}
     actual_root_entries = {entry.name for entry in directory.iterdir()}
     if actual_root_entries != expected_root_entries:
         raise SnapshotError("快照根目录含未登记文件或缺少固定文件。")
@@ -952,6 +1071,8 @@ def _verify_snapshot(
     database_info = manifest.get("database")
     sources = manifest.get("sources")
     counts = manifest.get("counts")
+    object_store = manifest.get("object_store")
+    storage = manifest.get("storage")
     if not isinstance(schema_info, dict) or not isinstance(database_info, dict):
         raise SnapshotError("manifest 缺少 schema 或 database 记录。")
     if schema_info.get("path") != SCHEMA_NAME:
@@ -960,6 +1081,17 @@ def _verify_snapshot(
         raise SnapshotError("manifest database.path 必须固定为 evidence.sqlite。")
     if not isinstance(sources, list) or not isinstance(counts, dict):
         raise SnapshotError("manifest 缺少 sources 或 counts 记录。")
+    if object_store != object_store_manifest():
+        raise SnapshotError("manifest 对象库格式或版本不受支持。")
+    if not isinstance(storage, dict) or set(storage) != {
+        "object_references",
+        "new_objects",
+        "reused_objects",
+        "logical_object_bytes",
+        "new_object_bytes",
+        "reused_object_bytes",
+    } or any(type(value) is not int or value < 0 for value in storage.values()):
+        raise SnapshotError("manifest storage 统计无效。")
     if set(counts) != {"documents", "assets", "chunks", "fts_rows"} or any(
         type(value) is not int or value < 0 for value in counts.values()
     ):
@@ -987,9 +1119,10 @@ def _verify_snapshot(
     if _sha256_bytes(database_image) != database_hash or len(database_image) != database_size:
         raise SnapshotError("SQLite 数据库在哈希核验与读取之间发生变化。")
 
-    expected_source_paths: set[str] = set()
     expected_document_ids: set[str] = set()
     expected_asset_ids: set[str] = set()
+    object_documents: dict[str, PreparedDocument] = {}
+    objects_by_document: dict[str, dict[str, dict[str, Any]]] = {}
     for source in sources:
         if not isinstance(source, dict):
             raise SnapshotError("manifest source 记录无效。")
@@ -999,39 +1132,21 @@ def _verify_snapshot(
             raise SnapshotError("manifest source 缺少 document_id 或 asset_id。")
         expected_document_ids.add(document_id)
         expected_asset_ids.add(asset_id)
-        stored_path = source.get("stored_path")
-        source_path = _snapshot_member(directory, stored_path)
-        source_hash, source_size = _sha256_regular_file(
-            source_path, label="冻结源文件"
-        )
-        if source_hash != source.get("source_sha256"):
-            raise SnapshotError("冻结源文件 SHA-256 不匹配。")
-        if source_size != source.get("byte_size"):
-            raise SnapshotError("冻结源文件字节数不匹配。")
         if source.get("fulltext_verification") != "unverified" or source.get(
             "formula_verification"
         ) != "unverified":
             raise SnapshotError("v0.1 快照不得自动提升全文或公式核验状态。")
-        expected_source_paths.add(str(stored_path))
-    if len(expected_source_paths) != len(sources):
-        raise SnapshotError("manifest 中的冻结源路径重复。")
+        document = load_document(library_root, source, current_pipeline=False)
+        object_documents[document_id] = document
+        objects_by_document[document_id] = source["objects"]
     if len(expected_document_ids) != len(sources) or len(expected_asset_ids) != len(
         sources
     ):
         raise SnapshotError("manifest 中的 document_id 或 asset_id 重复。")
     if _manifest_corpus_sha256(sources) != manifest.get("corpus_sha256"):
         raise SnapshotError("manifest corpus_sha256 与源记录不一致。")
-
-    sources_directory = directory / "sources"
-    if sources_directory.is_symlink() or not sources_directory.is_dir():
-        raise SnapshotError("快照 sources 目录无效。")
-    actual_source_paths: set[str] = set()
-    for path in sources_directory.iterdir():
-        if path.is_symlink() or not path.is_file():
-            raise SnapshotError("快照 sources 中含未登记或非普通文件。")
-        actual_source_paths.add(path.relative_to(directory).as_posix())
-    if actual_source_paths != expected_source_paths:
-        raise SnapshotError("冻结源文件集合与 manifest 不一致。")
+    if _storage_statistics(objects_by_document) != storage:
+        raise SnapshotError("manifest storage 统计与对象引用不一致。")
 
     database = _open_serialized_readonly(database_image)
     try:
@@ -1039,7 +1154,9 @@ def _verify_snapshot(
         if actual_sqlite_schema_hash != schema_info.get("sqlite_schema_sha256"):
             raise SnapshotError("SQLite 实际 schema 哈希与 manifest 不匹配。")
         if actual_sqlite_schema_hash != _expected_sqlite_schema_sha256():
-            raise SnapshotError("SQLite 实际 schema 不符合 schema_version 1。")
+            raise SnapshotError(
+                f"SQLite 实际 schema 不符合 schema_version {SCHEMA_VERSION}。"
+            )
         integrity = database.execute("PRAGMA integrity_check").fetchone()
         if not integrity or integrity[0] != "ok":
             raise SnapshotError("SQLite integrity_check 未通过。")
@@ -1096,6 +1213,23 @@ def _verify_snapshot(
     if promoted_chunk is not None:
         raise SnapshotError("v0.1 chunk 不得自动提升全文或公式核验状态。")
     _validate_chunk_semantics(database_chunks)
+    for row in database_chunks:
+        document = object_documents.get(row["document_id"])
+        if document is None or not 1 <= row["ordinal"] <= len(document.chunks):
+            raise SnapshotError("SQLite chunk 未对应到 chunks 对象。")
+        expected = document.chunks[row["ordinal"] - 1]
+        if (
+            row["asset_id"] != document.asset_id
+            or row["chunk_text"] != expected.text
+            or _json_string_list(row["heading_path"], label="heading_path")
+            != list(expected.heading_path)
+            or row["pdf_page_start"] != expected.pdf_page_start
+            or row["pdf_page_end"] != expected.pdf_page_end
+            or row["source_line_start"] != expected.source_line_start
+            or row["source_line_end"] != expected.source_line_end
+            or row["anchor_label"] != expected.anchor_label
+        ):
+            raise SnapshotError("SQLite chunk 与内容寻址 chunks 对象不一致。")
     source_by_document = {source["document_id"]: source for source in sources}
     for row in database_sources:
         source = source_by_document.get(row["document_id"])
@@ -1124,6 +1258,10 @@ def _verify_snapshot(
         _json_string_list(row["topics"], label="topics")
         if row["fulltext_verified"] != 0 or row["formula_verified"] != 0:
             raise SnapshotError("v0.1 SQLite 不得自动提升全文或公式核验状态。")
+    for source in sources:
+        document = object_documents[source["document_id"]]
+        if _source_manifest(document, source["objects"]) != source:
+            raise SnapshotError("manifest source 元数据与对象内容不一致。")
 
     status = {
         "verified": True,
@@ -1134,6 +1272,7 @@ def _verify_snapshot(
         "database_sha256": database_hash,
         "schema_version": SCHEMA_VERSION,
         "counts": actual_counts,
+        "storage": storage,
         "readonly": True,
     }
     return status, database_image

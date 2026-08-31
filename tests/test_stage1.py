@@ -68,6 +68,21 @@ def _tree_hashes(root: Path) -> dict[str, str]:
     }
 
 
+def _object_path(snapshot: Path, source: dict[str, object], kind: str) -> Path:
+    record = source["objects"][kind]
+    return snapshot.parent.parent / record["path"]
+
+
+def _copy_snapshot_fixture(baseline: Path, case_root: Path) -> Path:
+    library = case_root / "library"
+    snapshots = library / "snapshots"
+    snapshots.mkdir(parents=True)
+    shutil.copytree(baseline.parent.parent / "objects", library / "objects")
+    snapshot = snapshots / baseline.name
+    shutil.copytree(baseline, snapshot)
+    return snapshot
+
+
 def _refresh_database_manifest(snapshot: Path) -> None:
     database_path = snapshot / "evidence.sqlite"
     manifest_path = snapshot / "manifest.json"
@@ -252,13 +267,13 @@ class StageOneSnapshotTests(unittest.TestCase):
             manifest = json.loads(manifest_bytes)
 
             self.assertNotIn(str(root), manifest_bytes.decode("utf-8"))
-            self.assertEqual(manifest["schema_version"], 1)
+            self.assertEqual(manifest["schema_version"], 2)
             self.assertRegex(manifest["schema"]["sha256"], r"^[0-9a-f]{64}$")
             self.assertEqual(
                 manifest["database"]["sha256"],
                 hashlib.sha256((snapshot / "evidence.sqlite").read_bytes()).hexdigest(),
             )
-            frozen = snapshot / manifest["sources"][0]["stored_path"]
+            frozen = _object_path(snapshot, manifest["sources"][0], "source")
             self.assertEqual(
                 manifest["sources"][0]["source_sha256"],
                 hashlib.sha256(frozen.read_bytes()).hexdigest(),
@@ -278,7 +293,8 @@ class StageOneSnapshotTests(unittest.TestCase):
             source.write_text("# Evidence\n\noriginal content\n", encoding="utf-8")
             built = build_snapshot(root / "library", [source])
             snapshot = Path(built["snapshot_path"])
-            frozen = next((snapshot / "sources").iterdir())
+            manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+            frozen = _object_path(snapshot, manifest["sources"][0], "source")
             frozen.write_text("changed", encoding="utf-8")
 
             with self.assertRaisesRegex(SnapshotError, "SHA-256"):
@@ -419,9 +435,7 @@ class StageOneSnapshotTests(unittest.TestCase):
 
             for name, statement, parameters, message in cases:
                 with self.subTest(name=name):
-                    snapshot = root / name / baseline.name
-                    snapshot.parent.mkdir()
-                    shutil.copytree(baseline, snapshot)
+                    snapshot = _copy_snapshot_fixture(baseline, root / name)
                     rebuild_fts = name in {
                         "empty-chunk-text",
                         "oversized-chunk-text",
@@ -453,9 +467,7 @@ class StageOneSnapshotTests(unittest.TestCase):
                     ):
                         self.assertNotIn(leaked, stderr.getvalue())
 
-            deep_manifest = root / "deep-manifest" / baseline.name
-            deep_manifest.parent.mkdir()
-            shutil.copytree(baseline, deep_manifest)
+            deep_manifest = _copy_snapshot_fixture(baseline, root / "deep-manifest")
             manifest_path = deep_manifest / "manifest.json"
             manifest_text = manifest_path.read_text(encoding="utf-8")
             manifest_path.write_text(
@@ -471,9 +483,7 @@ class StageOneSnapshotTests(unittest.TestCase):
             self.assertEqual(exit_code, 2)
             self.assertNotIn("RecursionError", stderr.getvalue())
 
-            zero_chunks = root / "zero-chunk-asset" / baseline.name
-            zero_chunks.parent.mkdir()
-            shutil.copytree(baseline, zero_chunks)
+            zero_chunks = _copy_snapshot_fixture(baseline, root / "zero-chunk-asset")
             _remove_all_chunks_from_one_asset(zero_chunks)
 
             with self.assertRaisesRegex(SnapshotError, "至少包含一个 chunk"):
@@ -484,9 +494,7 @@ class StageOneSnapshotTests(unittest.TestCase):
             self.assertEqual(exit_code, 2)
             self.assertNotIn("Traceback", stderr.getvalue())
 
-            corrupted = root / "corrupted-sqlite" / baseline.name
-            corrupted.parent.mkdir()
-            shutil.copytree(baseline, corrupted)
+            corrupted = _copy_snapshot_fixture(baseline, root / "corrupted-sqlite")
             (corrupted / "evidence.sqlite").write_bytes(b"not a sqlite database")
             _refresh_database_manifest(corrupted)
 

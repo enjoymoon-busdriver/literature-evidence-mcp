@@ -1,15 +1,16 @@
 # literature-evidence-mcp
 
-一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 复制进新的冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
+一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 写入资料库自己的内容寻址对象区，生成完整冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
 
-项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–2；下一轮阶段 3–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
+项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–3；下一轮阶段 4–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
 
-## 当前已实现：历史阶段一至阶段四与产品化阶段 1–2
+## 当前已实现：历史阶段一至阶段四与产品化阶段 1–3
 
 - 显式导入 UTF-8 Markdown 和带文本层 PDF。
 - 每次 `build` 都新建快照；不覆盖或修改旧快照。
-- 快照自带冻结源副本、`evidence.sqlite`、`schema.sql` 和 `manifest.json`。
-- `manifest.json` 记录源文件 SHA-256、数据库 SHA-256、schema 哈希、软件版本和 document/asset/chunk/FTS 数量。
+- 每库独立保存 raw source、规范化 parsed text 和 chunks 三层不可变对象；不同库不共享对象。
+- 快照自带独立 `evidence.sqlite`、`schema.sql` 和完整 `manifest.json`；不依赖基础快照解释成员。
+- `manifest.json` 记录三层对象引用、源文件/数据库/schema 哈希、软件版本、document/asset/chunk/FTS 数量和真实新增/复用对象统计。
 - PDF 结果保留页码 anchor；Markdown 结果保留标题路径和行号 anchor。
 - `fulltext_verified` 与 `formula_verified` 默认均为 `false`。成功提取文本不会自动提升核验状态。
 - 本地 BM25 预览严格返回真实空结果：`found=false, results=[]`。
@@ -20,7 +21,9 @@
 - 严格 Host/Origin、随机签名会话和 CSRF 防护；没有 CORS，静态 HTML/CSS/JS 全部随包安装。
 - 上传文件先进入一次性受控临时目录，无论构建成功或失败都清理；每次构建仍只新增快照。
 - 每个资料库根持久保存独立 `snapshot-catalog.json`，把每个成功 `snapshot_id` 绑定到发布时的 manifest 哈希，并分别记录“当前快照”和“上次成功快照”。首次成功同时成为二者；后续成功只推进上次成功，当前只能由本地用户显式激活。
-- 从明确 `base_snapshot_id` 构建时可继承完整成员，并显式新增、替换或移除文件；新快照仍物理保存完整冻结副本，本阶段不声称节省存储。
+- 从明确 `base_snapshot_id` 构建时可继承完整成员，并显式新增、替换或移除文件；不变 raw/parsed/chunks 对象在同库复用，新快照仍生成独立 BM25 SQLite。
+- parser 身份包含上游 raw 摘要、实现版本和精确配置；chunker 身份包含完整 parsed 摘要、实现版本和精确配置。配置变化只让对应层及其下游失效。
+- 构建返回对象引用、新增/复用对象、逻辑对象字节和实际新增/复用 payload 字节；本阶段不删除孤立或旧对象。
 - 一个独立的 `literature-evidence-mcp` 命令通过本地标准输入/输出（stdio）暴露恰好八个 closed-world 只读工具；服务固定应用注册表，而不是固定或暗选一个资料库。
 - 七个内容工具都必须提供受控 `library_id + snapshot_id`，再提供适用的 `document_id`、`chunk_id`、`section_id`、查询和数量上限；工具不接受资料库、快照、SQLite 或源文件路径，也不接受任意 URI。
 - 第八个 `retrieval_status` 无 ID 时列库、只给 `library_id` 时列该库成功快照、同时给两级 ID 时核验具体快照；只给 `snapshot_id` 明确拒绝。
@@ -53,7 +56,7 @@
 
 - `<完整项目>/.venv/`：安装当前本地项目和免费开源依赖的受控虚拟环境；已被 `.gitignore` 排除。
 - `~/Library/Application Support/literature-evidence-mcp/library/`：默认用户资料库；位于项目外，不会被提交 Git。第一次成功准备时建立目录，只有用户在管理页明确选文件并点击构建后，才会在其中新增快照。
-- `~/Library/Application Support/literature-evidence-mcp/registry.json` 与同级 `libraries/<library_id>/`：产品化阶段 1–2 的持久化注册表和物理隔离多库。每库根另有 `snapshot-catalog.json`、目录册写锁和独立 `snapshots/`；全局注册表不保存任意路径。现有 `.command` 与 HTTP 仍是显式单库入口；MCP 固定应用根并在每次内容调用中要求两级 ID，不采用注册表中的所选库或快照指针。
+- `~/Library/Application Support/literature-evidence-mcp/registry.json` 与同级 `libraries/<library_id>/`：产品化阶段 1–3 的持久化注册表和物理隔离多库。每库根另有 `snapshot-catalog.json`、目录册写锁、独立 `objects/` 和 `snapshots/`；全局注册表不保存任意路径。现有 `.command` 与 HTTP 仍是显式单库入口；MCP 固定应用根并在每次内容调用中要求两级 ID，不采用注册表中的所选库或快照指针。
 
 预检和创建 `.venv` 本身只是本机操作。首次安装可能访问默认的 [PyPI](https://pypi.org/) 软件包索引，下载 PEP 517 构建所需的 `setuptools` 以及项目声明的免费开源直接/传递依赖。为防止安装位置被外部配置改到 `.venv` 之外，入口会忽略用户的 `PIP_*`、`pip.conf`、`PYTHONPATH`、`PYTHONHOME` 和当前激活的虚拟环境，要求 `.venv` 明确禁用系统 site-packages，并把安装前缀固定为项目 `.venv`；因此不会使用用户配置的私有索引、其中的凭据或项目外 Python 包。这些对外请求只用于依赖解析和软件包下载；不发送文献或资料库内容，不主动请求 Keychain（钥匙串）凭据，不下载模型，不调用云模型或付费 API。pip 缓存已禁用；pip 可能对暂时网络失败做有限自动重试，不会由启动器另加循环或无限重试。本地构建可能在项目中生成已被 `.gitignore` 排除的 `build/` 和 `src/literature_evidence_mcp.egg-info/`；它们是包构建产物，不含文献或资料库。当本地项目内容没变且环境完整时，后续双击不再运行 pip、不检查更新；管理页只监听 `127.0.0.1`。
 
@@ -164,7 +167,7 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 - 文件名最多 240 个 UTF-8 字节，且不得含路径分隔符、控制字符或同批冲突名。
 - 搜索 JSON 最多 8 KiB；核心查询仍限制为 1–400 字符、`top_k` 1–10、摘录 1–1200 字符。
 
-选择依据是 2026-08-31 在 Apple M5 / 16 GiB、macOS arm64、Python 3.12.14、SQLite 3.53.1 上对完全合成 Markdown 的最小测量：
+资源上限的选择依据是 2026-08-31 在 Apple M5 / 16 GiB、macOS arm64、Python 3.12.14、SQLite 3.53.1 上对完全合成 Markdown 的阶段 2 历史测量；表中容量不是阶段 3 对象库的当前基准：
 
 | 合成输入 | 构建耗时 | 峰值 RSS | 冻结快照大小 |
 |---|---:|---:|---:|
@@ -189,15 +192,17 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 <library>/
 ├── snapshot-catalog.json
 ├── .snapshot-catalog.lock
+├── objects/
+│   ├── source/<sha256>/payload
+│   ├── parsed/<sha256>/payload
+│   └── chunks/<sha256>/payload
 └── snapshots/<snapshot-id>/
     ├── manifest.json
     ├── schema.sql
-    ├── evidence.sqlite
-    └── sources/
-        └── <content-derived-document-id>.md-or-pdf
+    └── evidence.sqlite
 ```
 
-快照不会保存原始绝对路径，只保留源文件名和冻结副本。在相同项目、Python、SQLite 与 pypdf 版本下，相同输入再次构建会得到新的 snapshot ID 和目录，但 corpus hash、数据库内容、排序与搜索结果应保持一致；manifest 会记录这些版本，避免跨版本作不恰当比较。
+快照不会保存原始绝对路径，只保留源文件名和本库对象引用。每个 manifest 都列出完整成员，不需要沿 `base_snapshot_id` 读取历史链；每个快照的 BM25 SQLite 仍独立冻结。在相同 parser/chunker 配置、Python、SQLite 与 pypdf 版本下，相同输入再次构建会得到新的 snapshot ID 和目录，但 corpus hash、数据库内容、排序与搜索结果应保持一致。
 
 ## 历史实现基线
 
@@ -206,7 +211,7 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 3. **阶段三（已完成）**：八类 closed-world stdio 只读 MCP 能力；`search_documents` 与 `find_in_document` 只走本地 BM25，不含 combo、API Key 或 Tunnel。
 4. **阶段四（已完成）**：macOS Apple Silicon 开发版 `.command` 入口、首次预检/受控安装、默认用户资料库和前台管理页启动。自包含、签名/公证 App、DMG 或 pkg 仍属范围外。
 
-下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1 已实现多资料库注册表与本地管理 CLI，阶段 2 已实现快照生命周期和 AI 双级发现/核验，阶段 3–9 尚未实现。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
+下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1 已实现多资料库注册表与本地管理 CLI，阶段 2 已实现快照生命周期和 AI 双级发现/核验，阶段 3 已实现库内内容寻址增量存储，阶段 4–9 尚未实现。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
 
 OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完整聊天界面、自动删除/垃圾回收、App/DMG 打包、签名、公证和发布不在阶段 0–9 范围内。
 
@@ -219,6 +224,7 @@ OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完�
 - TOC 当前一次最多返回前 100 节且没有翻页参数；章节读取一次最多返回该节开头 1200 字符且没有续读游标。`truncated=true` 只诚实标记截断，不代表可由本工具继续翻页。
 - MCP 成功结果当前用单个 JSON `TextContent` 返回，没有另行声明 output schema。
 - 产品化阶段 2 不迁移目录册出现前的旧快照；目录册缺失而检测到既有快照时会明确停止，既不改写也不覆盖。管理页切库仍属于阶段 5。
+- 产品化阶段 3 不迁移阶段 2 的快照内 `sources/` 布局；对象库缺失、对象损坏或摘要错配都会明确失败，不静默重建。自动删除和 GC 仍不存在。
 - pypdf 能提取文本不等于排版、全文或公式已经人工核验。
 - 无文本层 PDF 会明确拒绝，当前不会静默 OCR。
 - 一个导入文件暂视为一个文档；多资产合并和人工元数据编辑留待后续。

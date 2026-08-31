@@ -215,8 +215,14 @@ class ProductStageOneLibraryTests(unittest.TestCase):
         second_copy_snapshot = Path(
             build_snapshot(second_root, [second_identical])["snapshot_path"]
         )
-        first_copy = next((first_copy_snapshot / "sources").iterdir())
-        second_copy = next((second_copy_snapshot / "sources").iterdir())
+        first_manifest = json.loads(
+            (first_copy_snapshot / "manifest.json").read_text(encoding="utf-8")
+        )
+        second_manifest = json.loads(
+            (second_copy_snapshot / "manifest.json").read_text(encoding="utf-8")
+        )
+        first_copy = first_root / first_manifest["sources"][0]["stored_path"]
+        second_copy = second_root / second_manifest["sources"][0]["stored_path"]
         self.assertEqual(first_copy.read_bytes(), second_copy.read_bytes())
         self.assertNotEqual(first_copy.resolve(), second_copy.resolve())
         self.assertFalse(first_copy.samefile(second_copy))

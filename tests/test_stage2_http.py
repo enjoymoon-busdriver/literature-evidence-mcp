@@ -551,7 +551,8 @@ class StageTwoHttpTests(unittest.TestCase):
             [("files", ("kept.md", b"# Kept\n\nold evidence\n", "text/markdown"))],
         )
         self.assertEqual(first.status_code, 201)
-        before = _tree_hashes(self.library)
+        before_catalog = (self.library / "snapshot-catalog.json").read_bytes()
+        before_snapshots = _tree_hashes(self.library / "snapshots")
         upload_parent = self.root / "upload-parent"
         upload_parent.mkdir()
 
@@ -573,12 +574,18 @@ class StageTwoHttpTests(unittest.TestCase):
         self.assertEqual(failed.status_code, 400, failed.text)
         self.assertNotIn("/private/secret", failed.text)
         self.assertNotIn("Traceback", failed.text)
-        self.assertEqual(before, _tree_hashes(self.library))
+        self.assertEqual(
+            before_catalog, (self.library / "snapshot-catalog.json").read_bytes()
+        )
+        self.assertEqual(before_snapshots, _tree_hashes(self.library / "snapshots"))
         self.assertEqual(list(upload_parent.iterdir()), [])
         snapshots = self.library / "snapshots"
         self.assertEqual(
             [path for path in snapshots.iterdir() if path.name.startswith(".building-")],
             [],
+        )
+        self.assertFalse(
+            any(path.name.startswith(".building-") for path in (self.library / "objects").rglob("*"))
         )
         self.assertEqual(_sidecars(self.library), [])
 

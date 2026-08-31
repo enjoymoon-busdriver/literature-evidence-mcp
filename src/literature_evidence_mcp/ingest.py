@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import io
 import os
 import re
@@ -14,6 +15,9 @@ from .errors import ImportPolicyError
 
 
 MAX_CHUNK_CHARS = 1200
+MARKDOWN_PARSER_VERSION = 1
+PDF_PARSER_VERSION = 1
+CHUNKER_VERSION = 1
 _HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _SUPPORTED_SUFFIXES = {".md", ".markdown", ".pdf"}
 
@@ -28,6 +32,17 @@ class ChunkDraft:
     source_line_start: int | None
     source_line_end: int | None
     anchor_label: str
+
+
+@dataclass(frozen=True)
+class ParsedDocument:
+    media_type: str
+    extraction_method: str
+    extraction_status: str
+    title_hint: str
+    units: tuple[str, ...]
+    page_count: int | None
+    parser: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -46,6 +61,9 @@ class PreparedDocument:
     page_count: int | None
     extracted_char_count: int
     chunks: tuple[ChunkDraft, ...]
+    parsed: ParsedDocument
+    chunker: dict[str, object]
+    chunk_title_hint: str
 
 
 def _clean_title(value: object, fallback: str) -> str:
@@ -56,6 +74,76 @@ def _clean_title(value: object, fallback: str) -> str:
     )
     cleaned = re.sub(r"\s+", " ", visible).strip()
     return (cleaned or fallback)[:500]
+
+
+def _dependency_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not-installed"
+
+
+def _parser_identity(suffix: str) -> dict[str, object]:
+    if suffix in {".md", ".markdown"}:
+        return {
+            "implementation": "native_utf8_markdown",
+            "version": MARKDOWN_PARSER_VERSION,
+            "config": {
+                "encoding": "utf-8",
+                "decode_errors": "strict",
+                "newline_normalization": "lf",
+                "reject_replacement_character": True,
+            },
+        }
+    if suffix == ".pdf":
+        return {
+            "implementation": "pypdf_text_layer",
+            "version": PDF_PARSER_VERSION,
+            "config": {
+                "pypdf_version": _dependency_version("pypdf"),
+                "strict": False,
+                "encrypted_pdf": "reject",
+                "extract_text_arguments": [],
+                "nul_replacement": "space",
+                "outer_whitespace": "strip",
+                "newline_normalization": "lf",
+                "minimum_visible_characters": 10,
+            },
+        }
+    raise ImportPolicyError("暂不支持该文件类型。")
+
+
+def _chunker_identity(media_type: str) -> dict[str, object]:
+    common: dict[str, object] = {
+        "max_chunk_chars": MAX_CHUNK_CHARS,
+        "horizontal_whitespace": "collapse_spaces_and_tabs_then_strip",
+        "blank_lines": "drop",
+        "oversize_line": "fixed_width",
+        "ordinal_start": 1,
+    }
+    if media_type == "text/markdown":
+        config = {
+            **common,
+            "heading_pattern": _HEADING.pattern,
+            "heading_flags": _HEADING.flags,
+            "heading_levels": 6,
+            "anchor_format": "markdown-lines-heading-path-v1",
+        }
+        implementation = "markdown_evidence_chunks"
+    elif media_type == "application/pdf":
+        config = {
+            **common,
+            "page_scope": "single_page",
+            "anchor_format": "pdf-page-v1",
+        }
+        implementation = "pdf_evidence_chunks"
+    else:
+        raise ImportPolicyError("解析结果的媒体类型不受支持。")
+    return {
+        "implementation": implementation,
+        "version": CHUNKER_VERSION,
+        "config": config,
+    }
 
 
 def _read_regular_file_once(path: Path) -> tuple[bytes, str]:
@@ -212,9 +300,29 @@ def _split_plain_text(text: str) -> list[str]:
     return [item[0] for item in _split_numbered_lines(lines, ())]
 
 
-def _pdf_chunks(payload: bytes, fallback_title: str) -> tuple[
-    str, tuple[ChunkDraft, ...], int, int
-]:
+def _normalized_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _parse_payload(payload: bytes, suffix: str) -> ParsedDocument:
+    parser = _parser_identity(suffix)
+    if suffix in {".md", ".markdown"}:
+        try:
+            text = payload.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ImportPolicyError("Markdown 必须是 UTF-8 编码。") from exc
+        if "\ufffd" in text:
+            raise ImportPolicyError("Markdown 含 U+FFFD 替换字符，已拒绝导入。")
+        return ParsedDocument(
+            media_type="text/markdown",
+            extraction_method="native_utf8_markdown",
+            extraction_status="native_text",
+            title_hint="",
+            units=(_normalized_newlines(text),),
+            page_count=None,
+            parser=parser,
+        )
+
     try:
         from pypdf import PdfReader
         from pypdf.errors import PdfReadError
@@ -230,7 +338,9 @@ def _pdf_chunks(payload: bytes, fallback_title: str) -> tuple[
         page_texts: list[str] = []
         for page in reader.pages:
             extracted = page.extract_text() or ""
-            page_texts.append(extracted.replace("\x00", " ").strip())
+            page_texts.append(
+                _normalized_newlines(extracted.replace("\x00", " ")).strip()
+            )
     except ImportPolicyError:
         raise
     except (PdfReadError, OSError, ValueError, TypeError, KeyError) as exc:
@@ -243,6 +353,18 @@ def _pdf_chunks(payload: bytes, fallback_title: str) -> tuple[
             "PDF 没有可用文本层；v0.1 不会静默执行 OCR。"
         )
 
+    return ParsedDocument(
+        media_type="application/pdf",
+        extraction_method="pypdf_text_layer",
+        extraction_status="text_layer",
+        title_hint=_clean_title(metadata_title, ""),
+        units=tuple(page_texts),
+        page_count=len(page_texts),
+        parser=parser,
+    )
+
+
+def _pdf_chunks(page_texts: Sequence[str]) -> tuple[tuple[ChunkDraft, ...], int]:
     staged: list[ChunkDraft] = []
     for page_number, text in enumerate(page_texts, 1):
         for piece in _split_plain_text(text):
@@ -260,8 +382,79 @@ def _pdf_chunks(payload: bytes, fallback_title: str) -> tuple[
             )
     if not staged:
         raise ImportPolicyError("PDF 文本层没有生成任何证据片段。")
-    title = _clean_title(metadata_title, fallback_title)
-    return title, tuple(staged), len(page_texts), sum(len(item.text) for item in staged)
+    chunks = tuple(staged)
+    return chunks, sum(len(item.text) for item in chunks)
+
+
+def _chunk_parsed(
+    parsed: ParsedDocument,
+) -> tuple[str, tuple[ChunkDraft, ...], int, dict[str, object]]:
+    chunker = _chunker_identity(parsed.media_type)
+    if parsed.media_type == "text/markdown":
+        if len(parsed.units) != 1 or parsed.page_count is not None:
+            raise ImportPolicyError("Markdown 解析对象结构无效。")
+        title_hint, chunks, extracted_chars = _markdown_chunks(parsed.units[0])
+    elif parsed.media_type == "application/pdf":
+        if (
+            type(parsed.page_count) is not int
+            or parsed.page_count < 1
+            or parsed.page_count != len(parsed.units)
+        ):
+            raise ImportPolicyError("PDF 解析对象页数无效。")
+        chunks, extracted_chars = _pdf_chunks(parsed.units)
+        title_hint = ""
+    else:
+        raise ImportPolicyError("解析对象的媒体类型不受支持。")
+    return title_hint, chunks, extracted_chars, chunker
+
+
+def _prepared_document(
+    *,
+    source_name: str,
+    suffix: str,
+    payload: bytes,
+    source_sha256: str,
+    parsed: ParsedDocument,
+    chunk_title_hint: str,
+    chunks: tuple[ChunkDraft, ...],
+    extracted_char_count: int,
+    chunker: dict[str, object],
+) -> PreparedDocument:
+    expected_media_type = (
+        "application/pdf" if suffix == ".pdf" else "text/markdown"
+    )
+    if parsed.media_type != expected_media_type:
+        raise ImportPolicyError("解析对象与源文件类型不一致。")
+    if not chunks or extracted_char_count != sum(len(item.text) for item in chunks):
+        raise ImportPolicyError("切块对象的文本数量或字符数无效。")
+    if [item.ordinal for item in chunks] != list(range(1, len(chunks) + 1)):
+        raise ImportPolicyError("切块对象的序号必须从 1 连续排列。")
+    identity_seed = f"{source_name}\0{source_sha256}".encode("utf-8")
+    identity = hashlib.sha256(identity_seed).hexdigest()[:24]
+    fallback_title = _clean_title(Path(source_name).stem, "Untitled document")
+    title = _clean_title(
+        chunk_title_hint or parsed.title_hint,
+        fallback_title,
+    )
+    return PreparedDocument(
+        source_name=source_name,
+        suffix=suffix,
+        media_type=parsed.media_type,
+        payload=payload,
+        source_sha256=source_sha256,
+        byte_size=len(payload),
+        document_id="doc_" + identity,
+        asset_id="asset_" + identity,
+        title=title,
+        extraction_method=parsed.extraction_method,
+        extraction_status=parsed.extraction_status,
+        page_count=parsed.page_count,
+        extracted_char_count=extracted_char_count,
+        chunks=chunks,
+        parsed=parsed,
+        chunker=chunker,
+        chunk_title_hint=chunk_title_hint,
+    )
 
 
 def prepare_document(source: Path, *, source_name: str | None = None) -> PreparedDocument:
@@ -283,46 +476,18 @@ def prepare_document(source: Path, *, source_name: str | None = None) -> Prepare
             f"暂不支持 {path.suffix or '无扩展名'}；v0.1 仅接受 Markdown 和 PDF。"
         )
     payload, source_sha256 = _read_regular_file_once(path)
-    identity_seed = f"{source_name}\0{source_sha256}".encode("utf-8")
-    identity = hashlib.sha256(identity_seed).hexdigest()[:24]
-    document_id = "doc_" + identity
-    asset_id = "asset_" + identity
-    fallback_title = _clean_title(Path(source_name).stem, "Untitled document")
-
-    if suffix in {".md", ".markdown"}:
-        try:
-            text = payload.decode("utf-8", errors="strict")
-        except UnicodeDecodeError as exc:
-            raise ImportPolicyError("Markdown 必须是 UTF-8 编码。") from exc
-        if "\ufffd" in text:
-            raise ImportPolicyError("Markdown 含 U+FFFD 替换字符，已拒绝导入。")
-        parsed_title, chunks, extracted_chars = _markdown_chunks(text)
-        title = _clean_title(parsed_title, fallback_title)
-        media_type = "text/markdown"
-        extraction_method = "native_utf8_markdown"
-        extraction_status = "native_text"
-        page_count = None
-    else:
-        title, chunks, page_count, extracted_chars = _pdf_chunks(payload, fallback_title)
-        media_type = "application/pdf"
-        extraction_method = "pypdf_text_layer"
-        extraction_status = "text_layer"
-
-    return PreparedDocument(
+    parsed = _parse_payload(payload, suffix)
+    chunk_title_hint, chunks, extracted_chars, chunker = _chunk_parsed(parsed)
+    return _prepared_document(
         source_name=source_name,
         suffix=suffix,
-        media_type=media_type,
         payload=payload,
         source_sha256=source_sha256,
-        byte_size=len(payload),
-        document_id=document_id,
-        asset_id=asset_id,
-        title=title,
-        extraction_method=extraction_method,
-        extraction_status=extraction_status,
-        page_count=page_count,
-        extracted_char_count=extracted_chars,
+        parsed=parsed,
+        chunk_title_hint=chunk_title_hint,
         chunks=chunks,
+        extracted_char_count=extracted_chars,
+        chunker=chunker,
     )
 
 
