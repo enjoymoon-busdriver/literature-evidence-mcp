@@ -5,6 +5,7 @@ const state = {
   libraries: [],
   libraryId: "",
   libraryEpoch: 0,
+  libraryRequestId: 0,
   snapshots: [],
   files: [],
   fileStates: [],
@@ -188,9 +189,14 @@ function renderLibraries(candidateId = "") {
 }
 
 async function loadLibraries(candidateId = "") {
+  const requestId = ++state.libraryRequestId;
   const payload = await api("/api/libraries");
+  if (requestId !== state.libraryRequestId) {
+    return false;
+  }
   state.libraries = payload.libraries;
   renderLibraries(candidateId);
+  return true;
 }
 
 async function createLibrary() {
@@ -212,7 +218,9 @@ async function createLibrary() {
     });
     elements.libraryName.value = "";
     elements.libraryDescription.value = "";
-    await loadLibraries();
+    if (!(await loadLibraries())) {
+      return;
+    }
     await loadSnapshots();
     setNotice(
       elements.libraryStatus,
@@ -237,7 +245,9 @@ async function switchLibrary() {
       method: "POST",
       headers: actionHeaders("select-library"),
     });
-    await loadLibraries(libraryId);
+    if (!(await loadLibraries(libraryId))) {
+      return;
+    }
     await loadSnapshots();
     const active = state.libraries.find((item) => item.library_id === state.libraryId);
     setNotice(elements.libraryStatus, `已切换到“${active.name}”。`);
@@ -444,7 +454,9 @@ async function activateSnapshot(snapshotId) {
     if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
       return;
     }
-    await loadLibraries(requestedLibraryId);
+    if (!(await loadLibraries(requestedLibraryId))) {
+      return;
+    }
     if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
       return;
     }
@@ -591,7 +603,9 @@ async function buildSnapshot() {
     renderSelectedFiles();
     renderBuildSummary(payload);
     setNotice(elements.buildStatus, `整批已发布：${payload.snapshot_id}。`);
-    await loadLibraries(requestedLibraryId);
+    if (!(await loadLibraries(requestedLibraryId))) {
+      return;
+    }
     await loadSnapshots(payload.snapshot_id);
   } catch (error) {
     if (!libraryContextIsCurrent(requestedLibraryId, requestedEpoch)) {
@@ -700,7 +714,9 @@ async function search() {
 async function refreshAll() {
   try {
     await loadStatus();
-    await loadLibraries();
+    if (!(await loadLibraries())) {
+      return;
+    }
     await loadSnapshots(elements.snapshotSelect.value);
   } catch (error) {
     setNotice(elements.serviceStatus, error.message, true);

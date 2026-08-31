@@ -344,6 +344,23 @@ class ProductStageFiveWebTests(unittest.TestCase):
         self.assertIn("requestedLibraryId", script.text)
         self.assertIn("requestedEpoch", script.text)
         self.assertIn('elements.files.value = ""', script.text)
+        load_libraries = script.text.split(
+            'async function loadLibraries(candidateId = "") {',
+            1,
+        )[1].split("async function createLibrary()", 1)[0]
+        self.assertIn("const requestId = ++state.libraryRequestId;", load_libraries)
+        stale_guard = "if (requestId !== state.libraryRequestId)"
+        self.assertIn(stale_guard, load_libraries)
+        self.assertLess(
+            load_libraries.index(stale_guard),
+            load_libraries.index("state.libraries = payload.libraries;"),
+        )
+        switch_library = script.text.split(
+            "async function switchLibrary() {",
+            1,
+        )[1].split("function badge(", 1)[0]
+        self.assertEqual(switch_library.count("loadLibraries(libraryId)"), 1)
+        self.assertIn("if (!(await loadLibraries(libraryId)))", switch_library)
         self.assertNotIn("innerHTML", script.text)
         self.assertNotIn("insertAdjacentHTML", script.text)
         self.assertNotIn("https://", page.text + script.text)
