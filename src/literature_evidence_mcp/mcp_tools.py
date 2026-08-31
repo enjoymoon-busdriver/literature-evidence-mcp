@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from . import __version__
-from .errors import SearchInputError, SnapshotError
+from .errors import (
+    EnhancedSearchError,
+    LiteratureEvidenceError,
+    SearchInputError,
+    SnapshotError,
+)
 from .library import FixedLibrary
 from .registry import LibraryRegistry
 from .retrieval import (
@@ -253,11 +258,21 @@ def _section_item(section: _Section) -> dict[str, Any]:
 class ReadOnlyEvidenceTools:
     """Eight path-free operations over the fixed local library registry."""
 
-    def __init__(self, application_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        application_root: Path | None = None,
+        *,
+        enhanced_search: Any | None = None,
+    ) -> None:
         self._registry = LibraryRegistry(application_root)
+        self._enhanced_search = enhanced_search
 
     def _library(self, library_id: str) -> FixedLibrary:
-        return FixedLibrary(self._registry.library_path(library_id))
+        return FixedLibrary(
+            self._registry.library_path(library_id),
+            library_id=library_id,
+            enhanced_search=self._enhanced_search,
+        )
 
     @contextlib.contextmanager
     def _database(
@@ -294,14 +309,33 @@ class ReadOnlyEvidenceTools:
         *,
         top_k: int = 5,
         excerpt_chars: int = 1000,
+        mode: str = "bm25",
     ) -> dict[str, Any]:
-        query = _validated_tool_query(query)
-        result = self._library(library_id).search(
-            snapshot_id,
-            query,
-            top_k=top_k,
-            excerpt_chars=excerpt_chars,
-        )
+        if mode == "bm25":
+            query = _validated_tool_query(query)
+            result = self._library(library_id).search(
+                snapshot_id,
+                query,
+                top_k=top_k,
+                excerpt_chars=excerpt_chars,
+            )
+        elif mode == "enhanced":
+            try:
+                result = self._library(library_id).search(
+                    snapshot_id,
+                    query,
+                    top_k=top_k,
+                    excerpt_chars=excerpt_chars,
+                    mode=mode,
+                )
+            except EnhancedSearchError:
+                raise
+            except LiteratureEvidenceError as exc:
+                raise EnhancedSearchError(
+                    "增强搜索本地核验失败：资料库或快照不可用。"
+                ) from exc
+        else:
+            raise SearchInputError("mode 必须是 bm25 或 enhanced。")
         result["library_id"] = library_id
         return result
 

@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+
 class LiteratureEvidenceError(RuntimeError):
     """Base class for expected, user-facing project errors."""
 
@@ -20,3 +23,15 @@ class LibraryRegistryError(LiteratureEvidenceError):
 
 class VectorError(SnapshotError):
     """A derived vector object or complete snapshot mapping is invalid."""
+
+
+class EnhancedSearchError(LiteratureEvidenceError):
+    """An explicit enhanced search failed closed with a path-free call audit."""
+
+    def __init__(self, message: str, audit: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        source = {"call_count": 0, "calls": []} if audit is None else audit
+        self.audit = {
+            "call_count": source.get("call_count", 0),
+            "calls": [dict(item) for item in source.get("calls", [])],
+        }

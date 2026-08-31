@@ -259,7 +259,17 @@ class ProductStageFiveWebTests(unittest.TestCase):
                 }
             ),
         )
-        self.assertEqual(enhanced.status_code, 400)
+        self.assertEqual(enhanced.status_code, 503, enhanced.text)
+        enhanced_payload = enhanced.json()
+        self.assertIn("尚未配置", enhanced_payload["error"])
+        self.assertEqual(enhanced_payload["mode"], "enhanced")
+        self.assertEqual(
+            enhanced_payload["audit"],
+            {"call_count": 0, "calls": []},
+        )
+        status = self.client.get("/api/status")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertIs(status.json()["enhanced_available"], False)
 
         isolated = self._build(second_id, [("A.md", a)], mode="blank")
         self.assertEqual(isolated.status_code, 201, isolated.text)
@@ -411,8 +421,16 @@ class ProductStageFiveWebTests(unittest.TestCase):
         self.assertNotIn("innerHTML", script.text)
         self.assertNotIn("insertAdjacentHTML", script.text)
         self.assertNotIn("https://", page.text + script.text)
-        self.assertNotIn("enhanced", page.text + script.text)
-        self.assertNotIn("vector", page.text.lower() + script.text.lower())
+        self.assertIn('id="search-mode"', page.text)
+        self.assertIn("BM25（离线、零密钥、零模型调用）", page.text)
+        self.assertIn("增强搜索（当前不可用）", page.text)
+        self.assertIn("第 1 次发送原问题做改写", page.text)
+        self.assertIn("第 2 次发送改写问题取得查询向量", page.text)
+        self.assertIn(
+            "第 3 次只发送所选快照中本地向量召回的有界候选 ID",
+            page.text,
+        )
+        self.assertIn("增强搜索尚未配置或当前不可用", page.text + script.text)
 
         self.assertEqual(len(TOOLS), 8)
         self.assertEqual(
@@ -431,7 +449,10 @@ class ProductStageFiveWebTests(unittest.TestCase):
         for tool in TOOLS:
             self.assertTrue(tool.annotations.read_only_hint)
             self.assertFalse(tool.annotations.destructive_hint)
-            self.assertFalse(tool.annotations.open_world_hint)
+            self.assertEqual(
+                tool.annotations.open_world_hint,
+                tool.name == "search_documents",
+            )
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .errors import (
+    EnhancedSearchError,
     ImportPolicyError,
     LibraryRegistryError,
     LiteratureEvidenceError,
@@ -468,8 +469,16 @@ def _expected_error_status(message: str) -> int:
     return 400
 
 
-def _fixed_library(registry: LibraryRegistry, library_id: str) -> FixedLibrary:
-    return FixedLibrary(registry.library_path(library_id))
+def _fixed_library(
+    registry: LibraryRegistry,
+    library_id: str,
+    enhanced_search: Any | None = None,
+) -> FixedLibrary:
+    return FixedLibrary(
+        registry.library_path(library_id),
+        library_id=library_id,
+        enhanced_search=enhanced_search,
+    )
 
 
 def _public_library(
@@ -934,6 +943,7 @@ def create_app(
     *,
     port: int = DEFAULT_PORT,
     upload_limits: UploadLimits = DEFAULT_UPLOAD_LIMITS,
+    enhanced_search: Any | None = None,
 ) -> Starlette:
     if type(port) is not int or not 1024 <= port <= 65535:
         raise ImportPolicyError("port 必须是 1024-65535 的整数。")
@@ -954,6 +964,9 @@ def create_app(
     authority = f"{LOOPBACK_HOST}:{port}"
     origin = f"http://{authority}"
     cookie_name = f"{SESSION_COOKIE}_{port}"
+    enhanced_summary = (
+        None if enhanced_search is None else enhanced_search.public_summary()
+    )
 
     async def index(_request: Request) -> Response:
         return FileResponse(_STATIC_ROOT / "index.html", media_type="text/html")
@@ -983,6 +996,8 @@ def create_app(
             "binding": "127.0.0.1",
             "local_only": True,
             "offline_default": "bm25",
+            "enhanced_available": enhanced_search is not None,
+            "enhanced": enhanced_summary,
             "library_count": len(library_records),
             "readonly_actions": ["status", "list", "verify", "search"],
             "write_actions": ["create", "select", "build", "activate"],
@@ -1087,18 +1102,33 @@ def create_app(
     async def search(request: Request) -> Response:
         library_id = request.path_params["library_id"]
         body = await _bounded_json(request, upload_limits.max_json_bytes)
-        allowed = {"snapshot_id", "query", "top_k", "excerpt_chars"}
+        allowed = {"snapshot_id", "query", "top_k", "excerpt_chars", "mode"}
         if set(body) - allowed:
             raise RequestBoundaryError(400, "搜索请求包含未允许的参数。")
+        mode = body.get("mode", "bm25")
+        if type(mode) is not str or mode not in {"bm25", "enhanced"}:
+            raise RequestBoundaryError(400, "mode 必须是 bm25 或 enhanced。")
         if "snapshot_id" not in body or "query" not in body:
+            if mode == "enhanced":
+                raise EnhancedSearchError("增强搜索请求缺少 snapshot_id 或 query。")
             raise RequestBoundaryError(400, "搜索请求缺少 snapshot_id 或 query。")
-        library = await run_in_threadpool(_fixed_library, registry, library_id)
+        try:
+            library = await run_in_threadpool(
+                _fixed_library, registry, library_id, enhanced_search
+            )
+        except LiteratureEvidenceError as exc:
+            if mode == "enhanced":
+                raise EnhancedSearchError(
+                    "增强搜索本地核验失败：资料库或快照不可用。"
+                ) from exc
+            raise
         result = await run_in_threadpool(
             library.search,
             body["snapshot_id"],
             body["query"],
             top_k=body.get("top_k", 5),
             excerpt_chars=body.get("excerpt_chars", 1000),
+            mode=mode,
         )
         return JSONResponse({"library_id": library_id, **result})
 
@@ -1136,6 +1166,17 @@ def create_app(
     async def search_error_handler(_request: Request, exc: Exception) -> JSONResponse:
         assert isinstance(exc, SearchInputError)
         return _error_response(400, str(exc))
+
+    async def enhanced_error_handler(
+        _request: Request, exc: Exception
+    ) -> JSONResponse:
+        assert isinstance(exc, EnhancedSearchError)
+        unavailable = "尚未配置" in str(exc) or "当前不可用" in str(exc)
+        return _error_response(
+            503 if unavailable else 422,
+            str(exc),
+            {"mode": "enhanced", "audit": exc.audit},
+        )
 
     async def snapshot_error_handler(
         _request: Request, exc: Exception
@@ -1218,6 +1259,7 @@ def create_app(
         middleware=middleware,
         exception_handlers={
             RequestBoundaryError: request_boundary_handler,
+            EnhancedSearchError: enhanced_error_handler,
             ImportPolicyError: import_error_handler,
             SearchInputError: search_error_handler,
             SnapshotError: snapshot_error_handler,

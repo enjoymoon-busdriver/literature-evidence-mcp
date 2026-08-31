@@ -58,6 +58,7 @@ EXPECTED_PROPERTIES = {
         "query",
         "top_k",
         "excerpt_chars",
+        "mode",
     },
     "get_excerpt": {
         "library_id",
@@ -98,7 +99,7 @@ EXPECTED_PROPERTIES = {
     "retrieval_status": {"library_id", "snapshot_id"},
 }
 EXPECTED_DEFAULTS = {
-    "search_documents": {"top_k": 5, "excerpt_chars": 1000},
+    "search_documents": {"top_k": 5, "excerpt_chars": 1000, "mode": "bm25"},
     "get_excerpt": {"max_chars": 600},
     "get_multiple_excerpts": {"per_item_chars": 600},
     "get_document_metadata": {},
@@ -642,6 +643,11 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                             self.assertEqual(properties["max_items"]["minimum"], 1)
                             self.assertEqual(properties["max_items"]["maximum"], 100)
                             self.assertEqual(properties["max_items"]["default"], 100)
+                        if "mode" in properties:
+                            self.assertEqual(properties["mode"]["type"], "string")
+                            self.assertEqual(
+                                properties["mode"]["enum"], ["bm25", "enhanced"]
+                            )
                         self.assertEqual(
                             {
                                 name: definition["default"]
@@ -653,7 +659,10 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         self.assertIsNotNone(tool.annotations)
                         self.assertIs(tool.annotations.read_only_hint, True)
                         self.assertIs(tool.annotations.destructive_hint, False)
-                        self.assertIs(tool.annotations.open_world_hint, False)
+                        self.assertIs(
+                            tool.annotations.open_world_hint,
+                            tool.name == "search_documents",
+                        )
 
                     search = await client.call_tool(
                         "search_documents",
@@ -676,6 +685,57 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                             top_k=10,
                             excerpt_chars=1200,
                         ),
+                    )
+                    explicit_bm25 = await client.call_tool(
+                        "search_documents",
+                        {
+                            "library_id": self.library_id,
+                            "snapshot_id": self.snapshot_id,
+                            "query": "calibrationmarker",
+                            "top_k": 10,
+                            "excerpt_chars": 1200,
+                            "mode": "bm25",
+                        },
+                    )
+                    self.assertFalse(explicit_bm25.is_error)
+                    self.assertEqual(search_payload, _protocol_payload(explicit_bm25))
+
+                    enhanced = await client.call_tool(
+                        "search_documents",
+                        {
+                            "library_id": self.library_id,
+                            "snapshot_id": self.snapshot_id,
+                            "query": "calibrationmarker",
+                            "mode": "enhanced",
+                        },
+                    )
+                    self.assertTrue(enhanced.is_error)
+                    enhanced_payload = _protocol_payload(enhanced)
+                    self.assertEqual(
+                        enhanced_payload["error"]["code"],
+                        "LEMCP_E_ENHANCED_UNAVAILABLE",
+                    )
+                    self.assertEqual(
+                        enhanced_payload["audit"], {"call_count": 0, "calls": []}
+                    )
+                    _assert_no_private_keys(self, enhanced_payload)
+                    self.assertNotIn(
+                        str(self.root), json.dumps(enhanced_payload, ensure_ascii=False)
+                    )
+
+                    invalid_mode = await client.call_tool(
+                        "search_documents",
+                        {
+                            "library_id": self.library_id,
+                            "snapshot_id": self.snapshot_id,
+                            "query": "calibrationmarker",
+                            "mode": "hybrid",
+                        },
+                    )
+                    self.assertTrue(invalid_mode.is_error)
+                    self.assertEqual(
+                        _protocol_payload(invalid_mode)["error"]["code"],
+                        "LEMCP_E_INVALID_INPUT",
                     )
                     self.assertEqual(
                         before, _tree_identity(self.application_root)

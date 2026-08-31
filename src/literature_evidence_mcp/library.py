@@ -15,7 +15,13 @@ from .catalog import (
     snapshot_record,
     write_snapshot_catalog,
 )
-from .errors import ImportPolicyError, LiteratureEvidenceError, SnapshotError
+from .errors import (
+    EnhancedSearchError,
+    ImportPolicyError,
+    LiteratureEvidenceError,
+    SearchInputError,
+    SnapshotError,
+)
 from .retrieval import search_snapshot
 from .snapshot import _load_manifest, build_snapshot, verify_snapshot
 
@@ -44,7 +50,13 @@ def _public_result(value: Any) -> Any:
 class FixedLibrary:
     """Thin application boundary around one fixed local snapshot library."""
 
-    def __init__(self, library: Path) -> None:
+    def __init__(
+        self,
+        library: Path,
+        *,
+        library_id: str | None = None,
+        enhanced_search: Any | None = None,
+    ) -> None:
         try:
             requested = Path(library).expanduser()
             if requested.is_symlink():
@@ -55,6 +67,8 @@ class FixedLibrary:
             raise
         except (SnapshotError, OSError, RuntimeError, TypeError, ValueError) as exc:
             raise ImportPolicyError("无法固定资料库根目录。") from exc
+        self._library_id = library_id
+        self._enhanced_search = enhanced_search
 
     def _snapshots_directory(self, *, allow_missing: bool) -> Path | None:
         root = _validated_root(
@@ -237,7 +251,21 @@ class FixedLibrary:
         *,
         top_k: int = 5,
         excerpt_chars: int = 1000,
+        mode: str = "bm25",
     ) -> dict[str, Any]:
+        if mode == "enhanced":
+            if self._enhanced_search is None or self._library_id is None:
+                raise EnhancedSearchError("增强搜索尚未配置或当前不可用。")
+            return self._enhanced_search.search(
+                self,
+                self._library_id,
+                snapshot_id,
+                query,
+                top_k=top_k,
+                excerpt_chars=excerpt_chars,
+            )
+        if mode != "bm25":
+            raise SearchInputError("mode 必须是 bm25 或 enhanced。")
         snapshot, record, _catalog = self._published_snapshot(snapshot_id)
         result = search_snapshot(
             snapshot,

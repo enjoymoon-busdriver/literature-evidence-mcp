@@ -10,7 +10,7 @@
   <body>
     <main>
       <header class="hero">
-        <p class="eyebrow">literature-evidence-mcp · 阶段五</p>
+        <p class="eyebrow">literature-evidence-mcp · 阶段六</p>
         <h1>本地文献证据管理页</h1>
         <p>
           你明确选择的 Markdown/PDF 只交给本机 <code>127.0.0.1</code>；
@@ -116,15 +116,29 @@
       </section>
 
       <section aria-labelledby="search-heading">
-        <p class="eyebrow">只读 · 离线本地 BM25</p>
+        <p class="eyebrow">只读 · 默认离线本地 BM25</p>
         <h2 id="search-heading">4. 在明确快照中搜索</h2>
         <label for="snapshot-select">明确选择已核验快照</label>
         <select id="snapshot-select"></select>
+        <label for="search-mode">搜索模式</label>
+        <select id="search-mode">
+          <option value="bm25" selected>BM25（离线、零密钥、零模型调用）</option>
+          <option id="enhanced-mode-option" value="enhanced" disabled>
+            增强搜索（当前不可用）
+          </option>
+        </select>
+        <p class="hint">
+          只有明确选择增强搜索时才可能联网：第 1 次发送原问题做改写；第 2 次发送改写问题取得查询向量；
+          第 3 次只发送所选快照中本地向量召回的有界候选 ID、改写问题与候选证据文本做重排。
+          不会发送资料库路径、密钥或快照之外的正文。
+        </p>
+        <p id="enhanced-availability" class="hint">增强搜索尚未配置或当前不可用。</p>
         <label for="query">问题或关键词</label>
         <input id="query" type="search" maxlength="400" autocomplete="off">
         <p class="hint">连续中文召回有限；没有结果时，可尝试在关键词之间加入空格。</p>
         <button id="search-button" type="button" disabled>在所选资料库和快照中本地搜索</button>
         <p id="search-status" class="notice quiet" role="status" aria-live="polite"></p>
+        <div id="search-audit" class="summary" hidden></div>
         <div id="search-results" class="results"></div>
       </section>
     </main>

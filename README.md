@@ -2,9 +2,9 @@
 
 一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 写入资料库自己的内容寻址对象区，生成完整冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
 
-项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–5；下一轮阶段 6–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
+项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–6；下一轮阶段 7–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
 
-## 当前已实现：历史阶段一至阶段四与产品化阶段 1–5
+## 当前已实现：历史阶段一至阶段四与产品化阶段 1–6
 
 - 显式导入 UTF-8 Markdown 和带文本层 PDF。
 - 每次 `build` 都新建快照；不覆盖或修改旧快照。
@@ -24,11 +24,14 @@
 - 从明确 `base_snapshot_id` 构建时可继承完整成员，并显式新增、替换或移除文件；不变 raw/parsed/chunks 对象在同库复用，新快照仍生成独立 BM25 SQLite。
 - parser 身份包含上游 raw 摘要、实现版本和精确配置；chunker 身份包含完整 parsed 摘要、实现版本和精确配置。配置变化只让对应层及其下游失效。
 - 构建返回对象引用、新增/复用对象、逻辑对象字节和实际新增/复用 payload 字节；本阶段不删除孤立或旧对象。
-- 一个独立的 `literature-evidence-mcp` 命令通过本地标准输入/输出（stdio）暴露恰好八个 closed-world 只读工具；服务固定应用注册表，而不是固定或暗选一个资料库。
+- 一个独立的 `literature-evidence-mcp` 命令通过本地标准输入/输出（stdio）暴露恰好八个只读工具；服务固定应用注册表，而不是固定或暗选一个资料库。
 - 七个内容工具都必须提供受控 `library_id + snapshot_id`，再提供适用的 `document_id`、`chunk_id`、`section_id`、查询和数量上限；工具不接受资料库、快照、SQLite 或源文件路径，也不接受任意 URI。
 - 第八个 `retrieval_status` 无 ID 时列库、只给 `library_id` 时列该库成功快照、同时给两级 ID 时核验具体快照；只给 `snapshot_id` 明确拒绝。
 - 每次 MCP 内容调用都重新执行现有快照哈希、schema、数量和语义核验，再在 `query_only` 内存 SQLite 镜像上安装只读 authorizer；不会写缓存、日志或 SQLite sidecar。
-- `search_documents` 与 `find_in_document` 只使用现有 SQLite FTS5/BM25，真实无命中返回 `found=false, results=[]`，不会强行补 top-k。
+- `find_in_document` 只使用现有 SQLite FTS5/BM25；`search_documents` 省略 mode 或显式 `mode="bm25"` 时仍走同一完整本地路径。真实无命中返回 `found=false, results=[]`，不会强行补 top-k。
+- 显式 `mode="enhanced"` 可使用构造参数注入的三角色链：原问题改写一次、改写问题查询向量一次、所选快照的有界候选重排一次。三次串行、零自动重试、首错停止，且不以 BM25 暗中补候选或回退。
+- 增强链在第一次 transport 前核验明确 `library_id + snapshot_id`、完整快照和精确阶段 4 vector profile/artifact；结果只从该冻结快照投影，并返回不含正文、路径或秘密的调用审计。
+- 运行时代码只定义 provider-neutral transport 合同，以及构造注入的非秘密 provider、三个 model ID、精确 profile 和候选/字符边界；没有任何真实供应商 HTTP adapter、密钥读取或真实模型 ID 配置。生产 Web/stdio 入口未注入 transport，显式 enhanced 会明确返回“尚未配置或不可用”。
 - Finder 可双击的 [`启动文献证据管理页.command`](./启动文献证据管理页.command)：从自身位置确定完整项目，路径含空格也可使用。
 - 首次运行先核对 macOS、arm64、Python 3.11+、SQLite `serialize/deserialize` 和 FTS5，再在项目 `.venv/` 中做非 editable 安装。
 - 双击入口使用稳定的用户应用根，端口绑定成功后才打开默认浏览器；终端前台运行，`Ctrl+C` 即停止。
@@ -81,7 +84,7 @@
 
 | 工具 | 参数 | 成功返回语义 |
 |---|---|---|
-| `search_documents` | `library_id`、`snapshot_id`；`query` 1–400 字符；`top_k` 1–10（默认 5）；`excerpt_chars` 1–1200（默认 1000） | `found`、`results`、两级 ID、`retrieval_mode="bm25"`；每项含文档/资产/块 ID、标题、来源名、anchor、核验状态、score 和有界摘录 |
+| `search_documents` | `library_id`、`snapshot_id`；`query` 1–400 字符；`mode="bm25"|"enhanced"`（默认 BM25）；`top_k` 1–10（默认 5）；`excerpt_chars` 1–1200（默认 1000） | BM25 保持离线原语义；显式增强仅在注入 transport 时执行固定三角色链，并返回实际调用审计；两种模式都只返回所选快照的有界证据 |
 | `get_excerpt` | `library_id`、`snapshot_id`、`document_id`、`chunk_id`；`max_chars` 1–1200（默认 600） | 一个 `result` 及 `truncated`；先核验块确属该库、快照和文档 |
 | `get_multiple_excerpts` | `library_id`、`snapshot_id`、`document_id`；1–5 个唯一 `chunk_ids`；`per_item_chars` 1–1200（默认 600） | 按请求 ID 顺序返回全部 `results`，每项含 `truncated`；任一 ID 缺失或错配时整次拒绝，不返回部分结果 |
 | `get_document_metadata` | `library_id`、`snapshot_id`、`document_id` | 白名单化的文档元数据和资产 ID/提取状态/页数/chunk 数；不返回路径或内部 SHA |
@@ -90,7 +93,7 @@
 | `find_in_document` | `library_id`、`snapshot_id`、`document_id`、`query` 1–400；`top_k` 1–10（默认 5）；`excerpt_chars` 1–1200（默认 600） | 只在该文档内执行同一 FTS5/BM25 排序；返回真实命中或 `found=false, results=[]` |
 | `retrieval_status` | 可选 `library_id`、`snapshot_id`，但禁止只给 `snapshot_id` | 无 ID 列库；仅库 ID 列成功快照及 current/last；两级 ID 重新核验具体快照并返回 path-free 身份、数量和状态 |
 
-工具 annotations 均为 `readOnlyHint=true`、`destructiveHint=false`、`openWorldHint=false`。这些 annotations 是给客户端的提示；真正的只读边界来自固定应用注册表、两级目录册归属、完整快照核验、只读内存 SQLite、authorizer 和输出白名单。
+工具 annotations 均为 `readOnlyHint=true`、`destructiveHint=false`。因为 `search_documents` 承载显式 enhanced 的潜在外部调用，它的 `openWorldHint=true`；其余七个工具仍为 `false`。这些 annotations 是给客户端的提示；真正的只读边界来自固定应用注册表、两级目录册归属、完整快照核验、只读内存 SQLite、authorizer 和输出白名单。
 
 ## 命令行与贡献者用法
 
@@ -213,7 +216,7 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 3. **阶段三（已完成）**：八类 closed-world stdio 只读 MCP 能力；`search_documents` 与 `find_in_document` 只走本地 BM25，不含 combo、API Key 或 Tunnel。
 4. **阶段四（已完成）**：macOS Apple Silicon 开发版 `.command` 入口、首次预检/受控安装、标准用户应用根和前台管理页启动。自包含、签名/公证 App、DMG 或 pkg 仍属范围外。
 
-下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1–5 已依次实现多资料库核心、双级快照生命周期、库内对象复用、离线同配置向量复用以及小白多资料库导入界面，阶段 6–9 尚未实现。阶段 4 的向量能力没有进入管理页或 BM25/MCP 用户流程。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
+下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1–6 已依次实现多资料库核心、双级快照生命周期、库内对象复用、离线同配置向量复用、小白多资料库导入界面和离线可替换三角色增强链，阶段 7–9 尚未实现。阶段 6 没有真实 provider adapter、真实模型/密钥、真实 Keychain 或真实链路质量结论。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
 
 OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完整聊天界面、自动删除/垃圾回收、App/DMG 打包、签名、公证和发布不在阶段 0–9 范围内。
 

@@ -14,6 +14,7 @@ const state = {
   building: false,
   completed: false,
   searching: false,
+  enhancedAvailable: false,
 };
 
 const elements = {
@@ -25,6 +26,8 @@ const elements = {
   buildSummary: document.querySelector("#build-summary"),
   createLibraryButton: document.querySelector("#create-library-button"),
   dropZone: document.querySelector("#drop-zone"),
+  enhancedAvailability: document.querySelector("#enhanced-availability"),
+  enhancedModeOption: document.querySelector("#enhanced-mode-option"),
   files: document.querySelector("#source-files"),
   libraryDescription: document.querySelector("#library-description"),
   libraryDetails: document.querySelector("#library-details"),
@@ -34,6 +37,8 @@ const elements = {
   query: document.querySelector("#query"),
   refreshButton: document.querySelector("#refresh-button"),
   searchButton: document.querySelector("#search-button"),
+  searchAudit: document.querySelector("#search-audit"),
+  searchMode: document.querySelector("#search-mode"),
   searchResults: document.querySelector("#search-results"),
   searchStatus: document.querySelector("#search-status"),
   selectedFiles: document.querySelector("#selected-files"),
@@ -105,6 +110,22 @@ function appendDefinition(list, term, value) {
 async function loadStatus() {
   const payload = await api("/api/status");
   state.csrfToken = payload.csrf_token;
+  state.enhancedAvailable = payload.enhanced_available === true;
+  const enhancedSimulated = Boolean(payload.enhanced && payload.enhanced.simulated);
+  elements.enhancedModeOption.disabled = !state.enhancedAvailable;
+  elements.enhancedModeOption.textContent = state.enhancedAvailable
+    ? (enhancedSimulated ? "增强搜索（离线模拟）" : "增强搜索（显式联网外发）")
+    : "增强搜索（当前不可用）";
+  if (!state.enhancedAvailable && elements.searchMode.value === "enhanced") {
+    elements.searchMode.value = "bm25";
+    invalidateSearch();
+  }
+  const roles = payload.enhanced && Array.isArray(payload.enhanced.roles)
+    ? payload.enhanced.roles
+    : [];
+  elements.enhancedAvailability.textContent = state.enhancedAvailable
+    ? `${enhancedSimulated ? "离线模拟" : "增强"} transport 已配置：${roles.map((item) => `${item.role}=${item.provider}/${item.model_id}`).join("；")}。`
+    : "增强搜索尚未配置或当前不可用；请使用默认 BM25。";
   setNotice(
     elements.serviceStatus,
     `本机服务正常；已登记 ${payload.library_count} 个资料库；默认离线 BM25。`,
@@ -677,12 +698,16 @@ async function buildSnapshot() {
 
 function renderResults(payload) {
   elements.searchResults.replaceChildren();
+  renderSearchAudit(payload.audit);
   if (!payload.found) {
     const hint = payload.input_hint ? ` ${payload.input_hint}` : "";
     setNotice(elements.searchStatus, `${payload.message}${hint}`);
     return;
   }
-  setNotice(elements.searchStatus, `找到 ${payload.results.length} 条本地 BM25 证据。`);
+  const modeLabel = payload.retrieval_mode === "enhanced"
+    ? "增强搜索证据"
+    : "本地 BM25 证据";
+  setNotice(elements.searchStatus, `找到 ${payload.results.length} 条${modeLabel}。`);
   for (const result of payload.results) {
     const article = document.createElement("article");
     appendText(article, "h3", `${result.title} · ${result.source_name}`);
@@ -698,19 +723,47 @@ function renderResults(payload) {
   }
 }
 
+function renderSearchAudit(audit) {
+  elements.searchAudit.replaceChildren();
+  elements.searchAudit.hidden = !audit;
+  if (!audit) {
+    return;
+  }
+  appendText(elements.searchAudit, "h3", `增强调用审计：实际 ${audit.call_count} 次`);
+  const list = document.createElement("ul");
+  for (const call of audit.calls) {
+    const details = [`${call.role} · ${call.provider}/${call.model_id}`, call.sent];
+    if (Number.isInteger(call.query_chars)) {
+      details.push(`查询 ${call.query_chars} 字符`);
+    }
+    if (Number.isInteger(call.candidate_count)) {
+      details.push(`候选 ${call.candidate_count} 条 / ${call.candidate_chars} 字符`);
+      details.push(`ID：${call.candidate_ids.join("、")}`);
+    }
+    appendText(list, "li", details.join("；"));
+  }
+  elements.searchAudit.append(list);
+}
+
 function updateSearchButton() {
+  elements.searchButton.textContent = elements.searchMode.value === "enhanced"
+    ? "在所选资料库和快照中执行增强搜索"
+    : "在所选资料库和快照中本地搜索";
   elements.searchButton.disabled =
     state.searching ||
     !state.libraryId ||
     elements.librarySelect.value !== state.libraryId ||
     !elements.query.value.trim() ||
-    !elements.snapshotSelect.value;
+    !elements.snapshotSelect.value ||
+    (elements.searchMode.value === "enhanced" && !state.enhancedAvailable);
 }
 
 function invalidateSearch() {
   state.searchRequestId += 1;
   state.searching = false;
   elements.searchResults.replaceChildren();
+  elements.searchAudit.replaceChildren();
+  elements.searchAudit.hidden = true;
   setNotice(elements.searchStatus, "");
   updateSearchButton();
 }
@@ -729,6 +782,7 @@ function libraryCandidateChanged() {
 async function search() {
   const query = elements.query.value.trim();
   const snapshotId = elements.snapshotSelect.value;
+  const mode = elements.searchMode.value;
   if (!query || !snapshotId || !state.libraryId) {
     return;
   }
@@ -737,7 +791,12 @@ async function search() {
   const requestId = ++state.searchRequestId;
   state.searching = true;
   updateSearchButton();
-  setNotice(elements.searchStatus, "正在实时核验明确快照并执行离线本地 BM25 搜索……");
+  setNotice(
+    elements.searchStatus,
+    mode === "enhanced"
+      ? "正在先做本地完整核验，再按三角色顺序执行增强搜索……"
+      : "正在实时核验明确快照并执行离线本地 BM25 搜索……",
+  );
   try {
     const payload = await api(
       `/api/libraries/${encodeURIComponent(requestedLibraryId)}/search`,
@@ -747,6 +806,7 @@ async function search() {
         body: JSON.stringify({
           snapshot_id: snapshotId,
           query,
+          mode,
           top_k: 5,
           excerpt_chars: 1000,
         }),
@@ -761,6 +821,7 @@ async function search() {
       return;
     }
     elements.searchResults.replaceChildren();
+    renderSearchAudit(error.payload && error.payload.audit ? error.payload.audit : null);
     setNotice(elements.searchStatus, error.message, true);
   } finally {
     if (searchRequestIsCurrent(requestId, requestedLibraryId, requestedEpoch)) {
@@ -795,6 +856,7 @@ elements.baseSnapshotSelect.addEventListener("change", updateBuildControls);
 elements.refreshButton.addEventListener("click", refreshAll);
 elements.searchButton.addEventListener("click", search);
 elements.query.addEventListener("input", invalidateSearch);
+elements.searchMode.addEventListener("change", invalidateSearch);
 elements.snapshotSelect.addEventListener("change", invalidateSearch);
 elements.dropZone.addEventListener("dragover", (event) => {
   event.preventDefault();

@@ -20,7 +20,12 @@ from mcp.types import (
 )
 
 from . import __version__
-from .errors import LiteratureEvidenceError, SearchInputError, SnapshotError
+from .errors import (
+    EnhancedSearchError,
+    LiteratureEvidenceError,
+    SearchInputError,
+    SnapshotError,
+)
 from .mcp_tools import ReadOnlyEvidenceTools
 
 
@@ -28,6 +33,11 @@ _READ_ONLY_CLOSED = ToolAnnotations(
     read_only_hint=True,
     destructive_hint=False,
     open_world_hint=False,
+)
+_READ_ONLY_OPEN = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    open_world_hint=True,
 )
 
 _LIBRARY_ID_SCHEMA = {
@@ -69,7 +79,7 @@ _QUERY_SCHEMA = {
     "type": "string",
     "minLength": 1,
     "maxLength": 400,
-    "description": "A complete local lexical query; no path or URI.",
+    "description": "A complete search question; no path or URI.",
 }
 
 
@@ -88,8 +98,9 @@ TOOLS = (
     Tool(
         name="search_documents",
         description=(
-            "Search one verified local snapshot with the existing SQLite FTS5/BM25 "
-            "ranking. A real empty result does not prove corpus absence."
+            "Search one verified snapshot. The default bm25 mode stays local and "
+            "offline; explicit enhanced mode may send bounded query and candidate "
+            "content through a separately configured transport."
         ),
         input_schema=_input_schema(
             {
@@ -108,10 +119,15 @@ TOOLS = (
                     "maximum": 1200,
                     "default": 1000,
                 },
+                "mode": {
+                    "type": "string",
+                    "enum": ["bm25", "enhanced"],
+                    "default": "bm25",
+                },
             },
             ["library_id", "snapshot_id", "query"],
         ),
-        annotations=_READ_ONLY_CLOSED,
+        annotations=_READ_ONLY_OPEN,
     ),
     Tool(
         name="get_excerpt",
@@ -292,7 +308,7 @@ _REQUIRED_ARGUMENTS = {
     "retrieval_status": set(),
 }
 _OPTIONAL_ARGUMENTS = {
-    "search_documents": {"top_k", "excerpt_chars"},
+    "search_documents": {"top_k", "excerpt_chars", "mode"},
     "get_excerpt": {"max_chars"},
     "get_multiple_excerpts": {"per_item_chars"},
     "get_document_metadata": set(),
@@ -332,13 +348,18 @@ def _success(payload: dict[str, Any]) -> CallToolResult:
     )
 
 
-def _error(code: str, message: str) -> CallToolResult:
+def _error(
+    code: str, message: str, *, audit: dict[str, Any] | None = None
+) -> CallToolResult:
+    payload: dict[str, Any] = {"error": {"code": code, "message": message}}
+    if audit is not None:
+        payload["audit"] = audit
     return CallToolResult(
         content=[
             TextContent(
                 type="text",
                 text=json.dumps(
-                    {"error": {"code": code, "message": message}},
+                    payload,
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
@@ -371,6 +392,7 @@ def create_server(service: ReadOnlyEvidenceTools) -> Server[object]:
                     arguments["query"],
                     top_k=arguments.get("top_k", 5),
                     excerpt_chars=arguments.get("excerpt_chars", 1000),
+                    mode=arguments.get("mode", "bm25"),
                 )
             elif params.name == "get_excerpt":
                 payload = service.get_excerpt(
@@ -422,6 +444,13 @@ def create_server(service: ReadOnlyEvidenceTools) -> Server[object]:
                 payload = service.retrieval_status(
                     arguments.get("library_id"), arguments.get("snapshot_id")
                 )
+        except EnhancedSearchError as exc:
+            unavailable = "尚未配置" in str(exc) or "不可用" in str(exc)
+            return _error(
+                "LEMCP_E_ENHANCED_UNAVAILABLE" if unavailable else "LEMCP_E_ENHANCED",
+                str(exc),
+                audit=exc.audit,
+            )
         except SearchInputError as exc:
             return _error("LEMCP_E_INVALID_INPUT", str(exc))
         except SnapshotError:
@@ -438,7 +467,7 @@ def create_server(service: ReadOnlyEvidenceTools) -> Server[object]:
     return Server(
         "literature-evidence-mcp",
         version=__version__,
-        description="Closed-world read-only literature evidence retrieval over stdio.",
+        description="Read-only literature evidence retrieval over stdio.",
         on_list_tools=list_tools,
         on_call_tool=call_tool,
     )
