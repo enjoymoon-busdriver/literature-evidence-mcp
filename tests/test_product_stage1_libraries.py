@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+import multiprocessing
 import os
 import re
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from multiprocessing.connection import Connection
 from pathlib import Path
 from unittest import mock
 
@@ -26,6 +28,32 @@ from literature_evidence_mcp.registry import (
 
 
 _LIBRARY_ID = re.compile(r"\Alib_[0-9a-f]{32}\Z")
+
+
+def _tree_state(root: Path) -> tuple[tuple[str, str, object], ...]:
+    entries: list[tuple[str, str, object]] = []
+    for path in sorted(root.rglob("*")):
+        relative = str(path.relative_to(root))
+        if path.is_symlink():
+            entries.append((relative, "symlink", os.readlink(path)))
+        elif path.is_file():
+            entries.append((relative, "file", path.read_bytes()))
+        elif path.is_dir():
+            entries.append((relative, "directory", None))
+        else:
+            entries.append((relative, "other", path.lstat().st_mode))
+    return tuple(entries)
+
+
+def _hold_registry_write_lock(
+    application_root: str,
+    ready: Connection,
+    release: Connection,
+) -> None:
+    registry = LibraryRegistry(Path(application_root))
+    with registry._exclusive_write_lock():
+        ready.send("locked")
+        release.recv()
 
 
 class ProductStageOneLibraryTests(unittest.TestCase):
@@ -299,6 +327,184 @@ class ProductStageOneLibraryTests(unittest.TestCase):
         listed = restarted.list_libraries()
         self.assertEqual(len(listed), 1)
         self.assertTrue(Path(listed[0]["library_root"]).is_dir())
+
+    def test_post_construction_ancestor_swap_rejects_all_mutations(self) -> None:
+        for action_name in ("create", "select", "rename", "describe"):
+            with self.subTest(action=action_name):
+                case_root = self.root / f"ancestor-swap-{action_name}"
+                managed_parent = case_root / "managed-parent"
+                outside_parent = case_root / "outside-parent"
+                managed_parent.mkdir(parents=True)
+
+                registry = LibraryRegistry(managed_parent / "application")
+                first = registry.create("第一库")
+                second = registry.create("第二库")
+
+                managed_parent.rename(outside_parent)
+                managed_parent.symlink_to(outside_parent, target_is_directory=True)
+                before = _tree_state(outside_parent)
+                actions = {
+                    "create": lambda: registry.create("不应创建"),
+                    "select": lambda: registry.select(second["library_id"]),
+                    "rename": lambda: registry.rename(
+                        first["library_id"], "不应重命名"
+                    ),
+                    "describe": lambda: registry.update_description(
+                        first["library_id"], "不应更新"
+                    ),
+                }
+
+                with self.assertRaises(LibraryRegistryError):
+                    actions[action_name]()
+                self.assertEqual(_tree_state(outside_parent), before)
+
+    def test_missing_registry_with_managed_directory_fails_closed(self) -> None:
+        for action_name in ("list", "create"):
+            with self.subTest(action=action_name):
+                application_root = self.root / f"missing-registry-{action_name}"
+                registry = LibraryRegistry(application_root)
+                created = registry.create("已有库")
+                sentinel = Path(created["library_root"]) / "sentinel.txt"
+                sentinel.write_text("unchanged", encoding="utf-8")
+                (application_root / REGISTRY_NAME).unlink()
+                before = _tree_state(application_root)
+
+                restarted = LibraryRegistry(application_root)
+                action = (
+                    restarted.list_libraries
+                    if action_name == "list"
+                    else lambda: restarted.create("不应新建")
+                )
+                with self.assertRaisesRegex(LibraryRegistryError, "注册表缺失"):
+                    action()
+
+                self.assertEqual(_tree_state(application_root), before)
+                self.assertFalse((application_root / REGISTRY_NAME).exists())
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+
+        manual_root = self.root / "missing-registry-without-lock"
+        managed = (
+            manual_root
+            / LIBRARIES_DIRECTORY_NAME
+            / ("lib_" + "a" * 32)
+        )
+        managed.mkdir(parents=True)
+        (managed / "sentinel.txt").write_text("unchanged", encoding="utf-8")
+        before = _tree_state(manual_root)
+        with self.assertRaisesRegex(LibraryRegistryError, "注册表缺失"):
+            LibraryRegistry(manual_root).create("不应新建")
+        self.assertEqual(_tree_state(manual_root), before)
+        self.assertFalse((manual_root / LOCK_NAME).exists())
+
+        empty_root = self.root / "pure-empty-layout"
+        (empty_root / LIBRARIES_DIRECTORY_NAME).mkdir(parents=True)
+        created = LibraryRegistry(empty_root).create("空布局可创建")
+        self.assertTrue(Path(created["library_root"]).is_dir())
+
+    def test_recreated_lock_path_cannot_bypass_held_directory_lock(self) -> None:
+        holder = LibraryRegistry(self.application_root)
+        created = holder.create("原名称")
+        registry_path = self.application_root / REGISTRY_NAME
+        lock_path = self.application_root / LOCK_NAME
+
+        context = multiprocessing.get_context("fork")
+        ready_reader, ready_writer = context.Pipe(duplex=False)
+        release_reader, release_writer = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_hold_registry_write_lock,
+            args=(str(self.application_root), ready_writer, release_reader),
+        )
+        process.start()
+        ready_writer.close()
+        release_reader.close()
+        try:
+            self.assertTrue(ready_reader.poll(5), "持锁子进程未及时就绪")
+            self.assertEqual(ready_reader.recv(), "locked")
+
+            old_inode = lock_path.stat().st_ino
+            lock_path.unlink()
+            descriptor = os.open(
+                lock_path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.close(descriptor)
+            self.assertNotEqual(lock_path.stat().st_ino, old_inode)
+            contender = LibraryRegistry(self.application_root)
+            before = _tree_state(self.application_root)
+            before_registry = registry_path.read_bytes()
+
+            with self.assertRaisesRegex(
+                LibraryRegistryError, "另一个本地资料库写操作"
+            ):
+                contender.rename(created["library_id"], "不应并发写入")
+            self.assertEqual(registry_path.read_bytes(), before_registry)
+            self.assertEqual(_tree_state(self.application_root), before)
+        finally:
+            try:
+                release_writer.send("release")
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+            release_writer.close()
+            ready_reader.close()
+            process.join(5)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+        self.assertEqual(process.exitcode, 0)
+        self.assertEqual(holder.list_libraries()[0]["name"], "原名称")
+
+    def test_path_home_runtime_error_becomes_registry_error(self) -> None:
+        with mock.patch(
+            "literature_evidence_mcp.registry.Path.home",
+            side_effect=RuntimeError("synthetic home failure"),
+        ):
+            with self.assertRaisesRegex(
+                LibraryRegistryError, "无法确定受控应用目录"
+            ) as caught:
+                default_application_root()
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch(
+            "literature_evidence_mcp.registry.Path.home",
+            side_effect=RuntimeError("synthetic home failure"),
+        ):
+            with redirect_stdout(output), redirect_stderr(errors):
+                status = cli_main(["libraries", "list"])
+        self.assertEqual(status, 2)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("无法确定受控应用目录", errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_macos_var_and_tmp_top_level_aliases_remain_supported(self) -> None:
+        if not Path("/var").is_symlink() or not Path("/tmp").is_symlink():
+            self.skipTest("仅适用于 macOS 顶级系统路径别名")
+        if self.root.parts[1:3] != ("private", "var"):
+            self.skipTest("当前测试临时目录不位于 /private/var")
+
+        var_alias = Path("/var").joinpath(*self.root.parts[3:])
+        with tempfile.TemporaryDirectory(
+            prefix="lemcp-tmp-alias-",
+            dir="/tmp",
+        ) as temporary_name:
+            for label, raw_base in (
+                ("var", var_alias),
+                ("tmp", Path(temporary_name)),
+            ):
+                with self.subTest(alias=label):
+                    requested = raw_base / f"{label}-application"
+                    expected = requested.resolve()
+                    registry = LibraryRegistry(requested)
+                    self.assertEqual(registry.application_root, expected)
+                    self.assertEqual(registry.list_libraries(), [])
+                    created = registry.create(label)
+                    self.assertTrue(Path(created["library_root"]).is_dir())
+
+        if Path("/etc").is_symlink():
+            with self.assertRaisesRegex(LibraryRegistryError, "仅允许.*var.*tmp"):
+                LibraryRegistry(Path("/etc") / "lemcp-must-not-follow")
 
 
 if __name__ == "__main__":

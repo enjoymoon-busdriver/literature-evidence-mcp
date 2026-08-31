@@ -1,7 +1,7 @@
 # 最小架构合同
 
 本合同前半部分记录 `0.1.0.dev0` 历史阶段一至阶段三的已实现边界。阶段二在阶段一
-`build_snapshot` / `verify_snapshot` / `search_snapshot` 核心之外增加固定资料库应用层和本机管理页；阶段三再增加八个本地 stdio、closed-world、只读 MCP 工具。历史阶段四只增加 macOS 开发版启动入口，没有改变快照格式、SQLite schema、分块规则或 BM25 算法。文末“下一轮产品化阶段 0 合同”冻结后续阶段 1–9 的目标；除阶段 0 文档外，这些后续能力尚未实现。
+`build_snapshot` / `verify_snapshot` / `search_snapshot` 核心之外增加固定资料库应用层和本机管理页；阶段三再增加八个本地 stdio、closed-world、只读 MCP 工具。历史阶段四只增加 macOS 开发版启动入口，没有改变快照格式、SQLite schema、分块规则或 BM25 算法。文末“下一轮产品化阶段 0 合同”冻结后续阶段 1–9 的目标；阶段 1 多资料库核心已实现，阶段 2–9 尚未实现。
 
 ## 信任边界
 
