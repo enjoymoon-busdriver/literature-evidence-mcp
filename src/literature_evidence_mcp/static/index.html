@@ -10,11 +10,11 @@
   <body>
     <main>
       <header class="hero">
-        <p class="eyebrow">literature-evidence-mcp · 阶段二</p>
+        <p class="eyebrow">literature-evidence-mcp · 阶段五</p>
         <h1>本地文献证据管理页</h1>
         <p>
-          这里的“上传”只会把你明确选择的文件送到本机
-          <code>127.0.0.1</code> 服务，不会发送到云端。
+          你明确选择的 Markdown/PDF 只交给本机 <code>127.0.0.1</code>；
+          默认搜索是离线、本地 BM25，不需要密钥。
         </p>
       </header>
 
@@ -22,7 +22,7 @@
         <div class="section-heading">
           <div>
             <p class="eyebrow">只读</p>
-            <h2 id="status-heading">服务状态</h2>
+            <h2 id="status-heading">本机服务</h2>
           </div>
           <button id="refresh-button" class="secondary" type="button">刷新状态</button>
         </div>
@@ -31,57 +31,99 @@
         </p>
       </section>
 
+      <section aria-labelledby="libraries-heading">
+        <p class="eyebrow">明确写操作</p>
+        <h2 id="libraries-heading">1. 创建或切换资料库</h2>
+        <div class="two-column">
+          <div>
+            <label for="library-name">新资料库名称</label>
+            <input id="library-name" type="text" maxlength="120" autocomplete="off">
+            <label for="library-description">描述（可选）</label>
+            <textarea id="library-description" maxlength="1000"></textarea>
+            <button id="create-library-button" type="button">明确创建资料库</button>
+          </div>
+          <div>
+            <label for="library-select">已有资料库</label>
+            <select id="library-select"></select>
+            <button id="switch-library-button" class="secondary" type="button" disabled>
+              明确切换到所选资料库
+            </button>
+            <dl id="library-details" class="details"></dl>
+          </div>
+        </div>
+        <p id="library-status" class="notice quiet" role="status" aria-live="polite"></p>
+      </section>
+
       <section aria-labelledby="build-heading">
-        <p class="eyebrow">唯一写操作</p>
-        <h2 id="build-heading">构建全新快照</h2>
-        <p>
-          选择 1 个或多个 Markdown/PDF。每次成功构建都会新增快照，旧快照不会被覆盖。
-        </p>
-        <label for="source-files">选择本机文件</label>
-        <input
-          id="source-files"
-          type="file"
-          accept=".md,.markdown,.pdf,text/markdown,application/pdf"
-          multiple
-        >
+        <p class="eyebrow">明确写操作 · 全有或全无</p>
+        <h2 id="build-heading">2. 导入文件并建立完整快照</h2>
+        <fieldset>
+          <legend>明确选择建立方式</legend>
+          <label class="radio-label">
+            <input id="build-blank" type="radio" name="build-mode" value="blank" checked>
+            从空白建立（所选文件就是完整内容）
+          </label>
+          <label class="radio-label">
+            <input id="build-inherit" type="radio" name="build-mode" value="inherit">
+            继承一个完整旧快照，再新增文件
+          </label>
+        </fieldset>
+        <label for="base-snapshot-select">基础快照</label>
+        <select id="base-snapshot-select" disabled></select>
+
+        <div id="drop-zone" class="drop-zone">
+          <strong>把 Markdown/PDF 拖到这里</strong>
+          <span>或使用普通文件选择器</span>
+          <label class="file-picker" for="source-files">选择本机文件</label>
+          <input
+            id="source-files"
+            class="visually-hidden"
+            type="file"
+            accept=".md,.markdown,.pdf,text/markdown,application/pdf"
+            multiple
+          >
+        </div>
         <p id="upload-limits" class="hint"></p>
+        <p class="hint">逐文件阶段：待提交 → 本机接收 / 构建中 → 已进入成功快照；任一失败则整批“失败、未发布”。</p>
         <ul id="selected-files" class="file-list" aria-live="polite"></ul>
-        <button id="build-button" type="button" disabled>明确构建一个全新快照</button>
+        <button id="build-button" type="button" disabled>明确构建完整快照</button>
         <p id="build-status" class="notice quiet" role="status" aria-live="polite"></p>
+        <div id="build-summary" class="summary" hidden></div>
       </section>
 
       <section aria-labelledby="snapshots-heading">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">只读</p>
-            <h2 id="snapshots-heading">快照列表与核验</h2>
+            <p class="eyebrow">只读列表 · 明确激活</p>
+            <h2 id="snapshots-heading">3. 快照、实时核验与激活</h2>
           </div>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>快照</th>
-                <th>核验</th>
-                <th>文档 / 片段</th>
+                <th>快照 / 指针</th>
+                <th>实时核验</th>
+                <th>完整成员</th>
+                <th>差异 / 对象复用</th>
                 <th>操作</th>
               </tr>
             </thead>
             <tbody id="snapshot-rows"></tbody>
           </table>
         </div>
-        <p id="snapshot-empty" class="hint" hidden>还没有可列出的快照。</p>
+        <p id="snapshot-empty" class="hint" hidden>所选资料库还没有成功快照。</p>
       </section>
 
       <section aria-labelledby="search-heading">
-        <p class="eyebrow">只读 · 本地 BM25</p>
-        <h2 id="search-heading">搜索冻结快照</h2>
-        <label for="snapshot-select">选择已核验快照</label>
+        <p class="eyebrow">只读 · 离线本地 BM25</p>
+        <h2 id="search-heading">4. 在明确快照中搜索</h2>
+        <label for="snapshot-select">明确选择已核验快照</label>
         <select id="snapshot-select"></select>
         <label for="query">问题或关键词</label>
         <input id="query" type="search" maxlength="400" autocomplete="off">
         <p class="hint">连续中文召回有限；没有结果时，可尝试在关键词之间加入空格。</p>
-        <button id="search-button" type="button" disabled>本地搜索</button>
+        <button id="search-button" type="button" disabled>在所选资料库和快照中本地搜索</button>
         <p id="search-status" class="notice quiet" role="status" aria-live="polite"></p>
         <div id="search-results" class="results"></div>
       </section>

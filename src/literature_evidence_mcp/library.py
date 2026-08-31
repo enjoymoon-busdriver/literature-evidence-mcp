@@ -17,7 +17,7 @@ from .catalog import (
 )
 from .errors import ImportPolicyError, LiteratureEvidenceError, SnapshotError
 from .retrieval import search_snapshot
-from .snapshot import build_snapshot, verify_snapshot
+from .snapshot import _load_manifest, build_snapshot, verify_snapshot
 
 
 _SNAPSHOT_ID = SNAPSHOT_ID_PATTERN
@@ -210,6 +210,25 @@ class FixedLibrary:
             }
         )
         return public
+
+    def snapshot_members(self, snapshot_id: str) -> list[dict[str, Any]]:
+        """Return a verified, path-free projection of one snapshot's members."""
+        snapshot, record, _catalog = self._published_snapshot(snapshot_id)
+        self._catalog_bound_status(verify_snapshot(snapshot), record)
+        manifest, manifest_sha256 = _load_manifest(snapshot)
+        if manifest_sha256 != record["manifest_sha256"]:
+            raise SnapshotError("读取期间快照 manifest 发生变化。")
+        return [
+            {
+                "document_id": source["document_id"],
+                "source_name": source["source_name"],
+                "title": source["title"],
+                "media_type": source["media_type"],
+                "byte_size": source["byte_size"],
+                "chunk_count": source["chunk_count"],
+            }
+            for source in manifest["sources"]
+        ]
 
     def search(
         self,

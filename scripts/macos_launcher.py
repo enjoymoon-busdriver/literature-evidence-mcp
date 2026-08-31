@@ -49,7 +49,7 @@ class LauncherPaths(NamedTuple):
     project_root: Path
     venv: Path
     venv_python: Path
-    library: Path
+    application_root: Path
     marker: Path
 
 
@@ -153,18 +153,17 @@ def resolve_paths(project_root: Path, *, home: Optional[Path] = None) -> Launche
     root = project_root.expanduser().resolve()
     user_home = (home if home is not None else Path.home()).expanduser().resolve()
     venv = root / ".venv"
-    library = (
+    application_root = (
         user_home
         / "Library"
         / "Application Support"
         / "literature-evidence-mcp"
-        / "library"
     )
     return LauncherPaths(
         project_root=root,
         venv=venv,
         venv_python=venv / "bin" / "python",
-        library=library,
+        application_root=application_root,
         marker=venv / MARKER_NAME,
     )
 
@@ -686,15 +685,15 @@ def prepare_environment(
     return True
 
 
-def ensure_library(path: Path) -> None:
+def ensure_application_root(path: Path) -> None:
     if path.is_symlink():
-        raise LauncherError("默认资料库目录不能是符号链接；未写入该位置。")
+        raise LauncherError("应用根目录不能是符号链接；未写入该位置。")
     try:
         path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        raise LauncherError("无法创建默认资料库目录，请检查用户目录写入权限。") from exc
+        raise LauncherError("无法创建应用根目录，请检查用户目录写入权限。") from exc
     if not path.is_dir():
-        raise LauncherError("默认资料库路径不是目录；请移走同名文件后重试。")
+        raise LauncherError("应用根路径不是目录；请移走同名文件后重试。")
 
 
 def _port(value: str) -> int:
@@ -735,7 +734,7 @@ def _parser() -> argparse.ArgumentParser:
 def _print_paths(paths: LauncherPaths) -> None:
     print(f"项目目录：{paths.project_root}")
     print(f"受控虚拟环境：{paths.venv}")
-    print(f"默认资料库：{paths.library}")
+    print(f"多资料库应用根：{paths.application_root}")
 
 
 def run(argv: Optional[Sequence[str]] = None) -> int:
@@ -755,21 +754,21 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     prepare_environment(paths)
-    ensure_library(paths.library)
+    ensure_application_root(paths.application_root)
     if args.prepare_only:
-        print("环境和默认资料库已准备；按要求没有启动管理页。")
+        print("环境和多资料库应用根已准备；按要求没有启动管理页。")
         _print_paths(paths)
         return 0
 
-    print(f"默认资料库：{paths.library}")
+    print(f"多资料库应用根：{paths.application_root}")
     command = [
         os.fspath(paths.venv_python),
         "-I",
         "-m",
         "literature_evidence_mcp",
         "serve",
-        "--library",
-        os.fspath(paths.library),
+        "--application-root",
+        os.fspath(paths.application_root),
         "--port",
         str(args.port),
     ]

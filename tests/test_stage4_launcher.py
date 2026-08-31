@@ -148,9 +148,8 @@ class StageFourPreflightTests(unittest.TestCase):
         self.assertEqual(paths.venv, project.resolve() / ".venv")
         self.assertEqual(paths.venv_python, project.resolve() / ".venv/bin/python")
         self.assertEqual(
-            paths.library,
-            home.resolve()
-            / "Library/Application Support/literature-evidence-mcp/library",
+            paths.application_root,
+            home.resolve() / "Library/Application Support/literature-evidence-mcp",
         )
 
     def test_finder_command_locates_project_with_spaces_from_unrelated_cwd(self) -> None:
@@ -687,15 +686,15 @@ class StageFourEnvironmentTests(unittest.TestCase):
                 {"format": 1},
             )
 
-    def test_library_creation_is_bounded_to_isolated_home(self) -> None:
+    def test_application_root_creation_is_bounded_to_isolated_home(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             home = root / "home"
             project = root / "project"
             project.mkdir()
             paths = launcher.resolve_paths(project, home=home)
-            launcher.ensure_library(paths.library)
-            self.assertTrue(paths.library.is_dir())
+            launcher.ensure_application_root(paths.application_root)
+            self.assertTrue(paths.application_root.is_dir())
             self.assertEqual(
                 sorted(path.name for path in home.iterdir()),
                 ["Library"],
@@ -798,8 +797,8 @@ class StageFourBrowserAndLifecycleTests(unittest.TestCase):
                 cli_main(
                     [
                         "serve",
-                        "--library",
-                        "/tmp/fixed-library",
+                        "--application-root",
+                        "/tmp/fixed-application",
                         "--port",
                         "18765",
                         "--open-browser",
@@ -808,7 +807,7 @@ class StageFourBrowserAndLifecycleTests(unittest.TestCase):
                 0,
             )
         mocked.assert_called_once_with(
-            Path("/tmp/fixed-library"), port=18765, open_browser=True
+            Path("/tmp/fixed-application"), port=18765, open_browser=True
         )
 
     @unittest.skipUnless(
@@ -955,7 +954,7 @@ class StageFourBrowserAndLifecycleTests(unittest.TestCase):
                 rebound.bind(("127.0.0.1", port))
             finally:
                 rebound.close()
-            self.assertTrue(paths.library.is_dir())
+            self.assertTrue(paths.application_root.is_dir())
             self.assertFalse((home / ".codex").exists())
             self.assertFalse((home / ".claude").exists())
 

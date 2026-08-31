@@ -64,7 +64,12 @@ def _parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser(
         "serve", help="在 127.0.0.1 启动本机管理页，按 Ctrl+C 停止。"
     )
-    serve.add_argument("--library", required=True, type=Path, help="固定本地资料库目录。")
+    serve.add_argument(
+        "--application-root",
+        required=True,
+        type=Path,
+        help="固定多资料库应用根目录。",
+    )
     serve.add_argument(
         "--port",
         type=int,
@@ -220,7 +225,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .web import serve_local
 
             serve_local(
-                args.library,
+                args.application_root,
                 port=args.port,
                 open_browser=args.open_browser,
             )

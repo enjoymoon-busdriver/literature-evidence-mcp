@@ -2,9 +2,9 @@
 
 一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 写入资料库自己的内容寻址对象区，生成完整冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
 
-项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–3；下一轮阶段 4–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
+项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–5；下一轮阶段 6–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
 
-## 当前已实现：历史阶段一至阶段四与产品化阶段 1–3
+## 当前已实现：历史阶段一至阶段四与产品化阶段 1–5
 
 - 显式导入 UTF-8 Markdown 和带文本层 PDF。
 - 每次 `build` 都新建快照；不覆盖或修改旧快照。
@@ -16,8 +16,8 @@
 - 本地 BM25 预览严格返回真实空结果：`found=false, results=[]`。
 - 搜索前重新核验快照，并用 SQLite `mode=ro&immutable=1`、`query_only` 和 authorizer 保持只读。
 - 演示资料完全合成，来源记录在 `demo/provenance.json`。
-- 固定资料库的 `127.0.0.1` Starlette 管理页：状态、显式选择文件并构建、快照列表/核验和本地搜索。
-- HTTP 只接收受控 `snapshot_id`，不接收 library、快照、源文件或其他任意本机路径。
+- 固定应用根的 `127.0.0.1` Starlette 管理页：创建/切换资料库、拖放或选择文件、空白/继承构建、逐文件状态、差异/复用统计、快照核验/激活和本地搜索。
+- HTTP 内容动作只接收受控 `library_id + snapshot_id`，构建还必须明确选择 `blank` 或严格 `base_snapshot_id` 的 `inherit`；不接收资料库、快照、源文件或其他任意本机路径。
 - 严格 Host/Origin、随机签名会话和 CSRF 防护；没有 CORS，静态 HTML/CSS/JS 全部随包安装。
 - 上传文件先进入一次性受控临时目录，无论构建成功或失败都清理；每次构建仍只新增快照。
 - 每个资料库根持久保存独立 `snapshot-catalog.json`，把每个成功 `snapshot_id` 绑定到发布时的 manifest 哈希，并分别记录“当前快照”和“上次成功快照”。首次成功同时成为二者；后续成功只推进上次成功，当前只能由本地用户显式激活。
@@ -31,13 +31,13 @@
 - `search_documents` 与 `find_in_document` 只使用现有 SQLite FTS5/BM25，真实无命中返回 `found=false, results=[]`，不会强行补 top-k。
 - Finder 可双击的 [`启动文献证据管理页.command`](./启动文献证据管理页.command)：从自身位置确定完整项目，路径含空格也可使用。
 - 首次运行先核对 macOS、arm64、Python 3.11+、SQLite `serialize/deserialize` 和 FTS5，再在项目 `.venv/` 中做非 editable 安装。
-- 双击入口使用稳定的用户资料库目录，端口绑定成功后才打开默认浏览器；终端前台运行，`Ctrl+C` 即停止。
+- 双击入口使用稳定的用户应用根，端口绑定成功后才打开默认浏览器；终端前台运行，`Ctrl+C` 即停止。
 - 固定应用根中的多资料库注册表：每个库使用随机、稳定、与名称和路径无关的 `library_id`，物理数据位于相互隔离的 `libraries/<library_id>/`。
 - 本地 `libraries` CLI 可显式创建、列出、选择、重命名和修改描述；允许同名显示名称，重命名、修改描述或重启不会改变 ID。
 
 ## 读写边界
 
-`build` 是用户主动执行的本地写操作：CLI 读取用户逐个列出的源文件；管理页只接收浏览器明确选择的文件字节。二者都只在固定 library 中新增快照，不修改源文件或旧快照。`snapshots activate` 只接受同库、已成功发布且重新核验通过的快照。`libraries create/select/rename/describe` 也是用户明确执行的本地注册表写操作；`libraries list` 与 `snapshots list` 只读。
+`build` 是用户主动执行的本地写操作：CLI 读取用户逐个列出的源文件；管理页只接收浏览器明确选择的文件字节，并在每次构建中显式携带目标 `library_id`。二者都只在目标 library 中新增快照，不修改源文件或旧快照。`snapshots activate` 只接受同库、已成功发布且重新核验通过的快照。管理页中的 create/select/build/activate 以及 CLI 的写命令都要求明确动作；列表、状态、核验和搜索保持只读。
 
 `status`、`list`、`verify`、`search` 与八个 MCP 工具是只读操作：它们不会创建 library、重建数据库、写回快照或创建 SQLite sidecar。MCP 不暴露导入、重建、激活、删除、监控、迁移或任意文件读取能力。完整边界见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
 
@@ -55,14 +55,14 @@
 长期运行与资料数据使用以下明确目录：
 
 - `<完整项目>/.venv/`：安装当前本地项目和免费开源依赖的受控虚拟环境；已被 `.gitignore` 排除。
-- `~/Library/Application Support/literature-evidence-mcp/library/`：默认用户资料库；位于项目外，不会被提交 Git。第一次成功准备时建立目录，只有用户在管理页明确选文件并点击构建后，才会在其中新增快照。
-- `~/Library/Application Support/literature-evidence-mcp/registry.json` 与同级 `libraries/<library_id>/`：产品化阶段 1–3 的持久化注册表和物理隔离多库。每库根另有 `snapshot-catalog.json`、目录册写锁、独立 `objects/` 和 `snapshots/`；全局注册表不保存任意路径。现有 `.command` 与 HTTP 仍是显式单库入口；MCP 固定应用根并在每次内容调用中要求两级 ID，不采用注册表中的所选库或快照指针。
+- `~/Library/Application Support/literature-evidence-mcp/`：管理页、MCP 和注册表共同使用的固定应用根；位于项目外，不会被提交 Git。
+- 应用根内的 `registry.json` 与 `libraries/<library_id>/`：持久化注册表和物理隔离多库。每库根另有 `snapshot-catalog.json`、目录册写锁、独立 `objects/` 和 `snapshots/`；全局注册表不保存任意路径。管理页和 MCP 的每次内容动作都要求两级 ID，不采用注册表中的 selected、current 或 last 作为隐式内容目标。
 
 预检和创建 `.venv` 本身只是本机操作。首次安装可能访问默认的 [PyPI](https://pypi.org/) 软件包索引，下载 PEP 517 构建所需的 `setuptools` 以及项目声明的免费开源直接/传递依赖。为防止安装位置被外部配置改到 `.venv` 之外，入口会忽略用户的 `PIP_*`、`pip.conf`、`PYTHONPATH`、`PYTHONHOME` 和当前激活的虚拟环境，要求 `.venv` 明确禁用系统 site-packages，并把安装前缀固定为项目 `.venv`；因此不会使用用户配置的私有索引、其中的凭据或项目外 Python 包。这些对外请求只用于依赖解析和软件包下载；不发送文献或资料库内容，不主动请求 Keychain（钥匙串）凭据，不下载模型，不调用云模型或付费 API。pip 缓存已禁用；pip 可能对暂时网络失败做有限自动重试，不会由启动器另加循环或无限重试。本地构建可能在项目中生成已被 `.gitignore` 排除的 `build/` 和 `src/literature_evidence_mcp.egg-info/`；它们是包构建产物，不含文献或资料库。当本地项目内容没变且环境完整时，后续双击不再运行 pip、不检查更新；管理页只监听 `127.0.0.1`。
 
 ## 管理页与 MCP 的区别
 
-双击入口只启动本机管理页。管理页用于用户明确选择 PDF/Markdown、新增冻结快照、核验和本地搜索；“构建全新快照”是明确写操作。MCP 则是给支持本地 stdio（标准输入/输出）的 MCP host 调用的八个只读工具。双击入口不会自动启动 MCP，也不会修改任何 Codex、ChatGPT 或 Claude 配置。
+双击入口只启动本机管理页。管理页用于用户明确创建/切换资料库、选择 PDF/Markdown、从空白或明确基础快照新增冻结快照、核验/激活和本地搜索；create/select/build/activate 都是明确写操作。MCP 则是给支持本地 stdio（标准输入/输出）的 MCP host 调用的八个只读工具。双击入口不会自动启动 MCP，也不会修改任何 Codex、ChatGPT 或 Claude 配置。
 
 需要 MCP 时，由用户在支持 stdio command/args 的 host 中手工设置下列等价命令；它固定应用注册表根，没有 host、port、URL 或其他 transport 参数：
 
@@ -112,12 +112,14 @@ literature-evidence libraries describe <library_id> "新描述"
 literature-evidence libraries select <library_id>
 ```
 
-创建结果和列表会返回本地 `library_root`，可继续显式传给 `build --library` 或 `serve --library`。阶段 1 的资料库选择只持久化本地产品状态；HTTP/MCP 都不会隐式采用它。
+创建结果和 CLI 列表会返回本地 `library_root`，可继续显式传给核心 `build --library`。注册表的资料库选择只持久化本地产品状态；HTTP/MCP 的内容动作都不会隐式采用它。
 
-启动管理页（这条命令固定 library 和端口；没有 `--host` 参数）：
+启动管理页（这条命令固定 application root 和端口；没有 `--host` 参数）：
 
 ```bash
-literature-evidence serve --library ./local-library --port 8765
+literature-evidence serve \
+  --application-root "$HOME/Library/Application Support/literature-evidence-mcp" \
+  --port 8765
 ```
 
 浏览器打开 `http://127.0.0.1:8765/`。页面里的“上传”只把文件发送到这个本机回环地址，不是云上传。按 Ctrl+C 停止，端口随后释放。
@@ -136,7 +138,7 @@ LITERATURE_EVIDENCE_PYTHON=/absolute/path/to/python3.12 \
   ./启动文献证据管理页.command --preflight-only
 ```
 
-`--preflight-only` 只读，不创建文件。自动验收还可用 `--prepare-only` 只准备环境和默认资料库，或用 `--no-browser` 启动服务但不打开浏览器；普通 Finder 双击不需要这些参数。
+`--preflight-only` 只读，不创建文件。自动验收还可用 `--prepare-only` 只准备环境和空的多资料库应用根，或用 `--no-browser` 启动服务但不打开浏览器；普通 Finder 双击不需要这些参数。
 
 也可以继续使用阶段一 CLI。用合成 Markdown 建立新快照（这一步会在 `local-library/` 新增文件）：
 
@@ -209,9 +211,9 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 1. **阶段一（已完成）**：导入、冻结快照、哈希/schema/数量核验、SQLite BM25 与 CLI 预览。
 2. **阶段二（已完成）**：本机 `127.0.0.1` Starlette 静态管理页；写操作只能由页面中的明确按钮触发。
 3. **阶段三（已完成）**：八类 closed-world stdio 只读 MCP 能力；`search_documents` 与 `find_in_document` 只走本地 BM25，不含 combo、API Key 或 Tunnel。
-4. **阶段四（已完成）**：macOS Apple Silicon 开发版 `.command` 入口、首次预检/受控安装、默认用户资料库和前台管理页启动。自包含、签名/公证 App、DMG 或 pkg 仍属范围外。
+4. **阶段四（已完成）**：macOS Apple Silicon 开发版 `.command` 入口、首次预检/受控安装、标准用户应用根和前台管理页启动。自包含、签名/公证 App、DMG 或 pkg 仍属范围外。
 
-下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1 已实现多资料库注册表与本地管理 CLI，阶段 2 已实现快照生命周期和 AI 双级发现/核验，阶段 3 已实现库内内容寻址增量存储，阶段 4–9 尚未实现。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
+下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1–5 已依次实现多资料库核心、双级快照生命周期、库内对象复用、离线同配置向量复用以及小白多资料库导入界面，阶段 6–9 尚未实现。阶段 4 的向量能力没有进入管理页或 BM25/MCP 用户流程。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
 
 OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完整聊天界面、自动删除/垃圾回收、App/DMG 打包、签名、公证和发布不在阶段 0–9 范围内。
 
@@ -223,7 +225,8 @@ OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完�
 - `get_document_toc` 的 Markdown 标题与 PDF 页码导航来自现有 chunk 索引，不等同于作者提供的正式目录；`section_id` 只对生成它的资料库、快照与文档有效。
 - TOC 当前一次最多返回前 100 节且没有翻页参数；章节读取一次最多返回该节开头 1200 字符且没有续读游标。`truncated=true` 只诚实标记截断，不代表可由本工具继续翻页。
 - MCP 成功结果当前用单个 JSON `TextContent` 返回，没有另行声明 output schema。
-- 产品化阶段 2 不迁移目录册出现前的旧快照；目录册缺失而检测到既有快照时会明确停止，既不改写也不覆盖。管理页切库仍属于阶段 5。
+- 产品化阶段 2 不迁移目录册出现前的旧快照；目录册缺失而检测到既有快照时会明确停止，既不改写也不覆盖。
+- 管理页阶段 5 暂不暴露替换/移除控件；核心和 CLI 仍可在明确 `base_snapshot_id` 下使用现有替换/移除能力。管理页只支持从空白建立，或继承完整基础快照后新增文件。
 - 产品化阶段 3 不迁移阶段 2 的快照内 `sources/` 布局；对象库缺失、对象损坏或摘要错配都会明确失败，不静默重建。自动删除和 GC 仍不存在。
 - pypdf 能提取文本不等于排版、全文或公式已经人工核验。
 - 无文本层 PDF 会明确拒绝，当前不会静默 OCR。

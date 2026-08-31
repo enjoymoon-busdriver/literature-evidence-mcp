@@ -26,14 +26,26 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .errors import ImportPolicyError, SearchInputError, SnapshotError
+from .errors import (
+    ImportPolicyError,
+    LibraryRegistryError,
+    LiteratureEvidenceError,
+    SearchInputError,
+    SnapshotError,
+)
+from .ingest import prepare_document
 from .library import FixedLibrary
+from .registry import LibraryRegistry
 
 
 LOOPBACK_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 SESSION_COOKIE = "literature_evidence_session"
-BUILD_INTENT = "create-new-snapshot"
+BUILD_INTENT = "build-snapshot"
+CREATE_LIBRARY_INTENT = "create-library"
+SELECT_LIBRARY_INTENT = "select-library"
+ACTIVATE_SNAPSHOT_INTENT = "activate-snapshot"
+ACTION_INTENT_HEADER = "x-action-intent"
 UPLOAD_TEMP_PREFIX = "literature-evidence-upload-"
 _MIB = 1024 * 1024
 _ALLOWED_SUFFIXES = {".md", ".markdown", ".pdf"}
@@ -55,19 +67,33 @@ DEFAULT_UPLOAD_LIMITS = UploadLimits()
 
 
 class RequestBoundaryError(RuntimeError):
-    def __init__(self, status_code: int, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
+        self.details = details
 
 
 class _RequestBodyTooLarge(Exception):
     pass
 
 
-def _error_response(status_code: int, message: str) -> JSONResponse:
+def _error_response(
+    status_code: int,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> JSONResponse:
+    payload: dict[str, Any] = {"ok": False, "error": message}
+    if details:
+        payload.update(details)
     return JSONResponse(
-        {"ok": False, "error": message},
+        payload,
         status_code=status_code,
     )
 
@@ -371,6 +397,42 @@ def _validated_filename(filename: str | None, limits: UploadLimits) -> str:
     return filename
 
 
+def _safe_upload_name(filename: object) -> str:
+    display_name = "所选文件"
+    if isinstance(filename, str):
+        candidate = filename.replace("\\", "/").rsplit("/", 1)[-1]
+        if candidate and not any(
+            unicodedata.category(character).startswith("C")
+            for character in candidate
+        ):
+            display_name = candidate[:240]
+    return display_name
+
+
+def _file_failure_details(
+    filenames: list[object],
+    failures: dict[int, str],
+    *,
+    not_published_error: str = "同批存在失败文件，整批没有发布。",
+) -> dict[str, Any]:
+    return {
+        "published": False,
+        "files": [
+            {
+                "name": _safe_upload_name(filename),
+                "state": "failed" if index in failures else "not_published",
+                "stage": (
+                    "失败、未发布"
+                    if index in failures
+                    else "未发布（同批文件失败）"
+                ),
+                "error": failures.get(index, not_published_error),
+            }
+            for index, filename in enumerate(filenames)
+        ],
+    }
+
+
 async def _bounded_json(request: Request, maximum: int) -> dict[str, Any]:
     content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type != "application/json":
@@ -381,7 +443,7 @@ async def _bounded_json(request: Request, maximum: int) -> dict[str, Any]:
         if len(payload) > maximum:
             raise RequestBoundaryError(
                 413,
-                f"搜索参数超过 {_size_label(maximum)} 上限。",
+                f"JSON 参数超过 {_size_label(maximum)} 上限。",
             )
     try:
         value = json.loads(bytes(payload).decode("utf-8"))
@@ -392,6 +454,130 @@ async def _bounded_json(request: Request, maximum: int) -> dict[str, Any]:
     return value
 
 
+def _require_intent(request: Request, expected: str) -> None:
+    if _single_header(request, ACTION_INTENT_HEADER) != expected:
+        raise RequestBoundaryError(400, "缺少与当前按钮一致的明确操作意图。")
+
+
+def _expected_error_status(message: str) -> int:
+    if "正在进行" in message:
+        return 409
+    if "找不到" in message or "不存在" in message or "尚无" in message:
+        return 404
+    return 400
+
+
+def _fixed_library(registry: LibraryRegistry, library_id: str) -> FixedLibrary:
+    return FixedLibrary(registry.library_path(library_id))
+
+
+def _public_library(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    library = FixedLibrary(Path(record["library_root"]))
+    status = library.catalog_status()
+    return {
+        "library_id": record["library_id"],
+        "name": record["name"],
+        "description": record["description"],
+        "selected": record["selected"],
+        "snapshot_count": status["snapshot_count"],
+        "current_snapshot_id": status["current_snapshot_id"],
+        "last_successful_snapshot_id": status["last_successful_snapshot_id"],
+    }
+
+
+def _member_difference(
+    members: list[dict[str, Any]],
+    base_members: list[dict[str, Any]],
+) -> dict[str, Any]:
+    current_by_id = {item["document_id"]: item for item in members}
+    base_by_id = {item["document_id"]: item for item in base_members}
+    inherited_ids = set(current_by_id) & set(base_by_id)
+    inherited = [current_by_id[item] for item in sorted(inherited_ids)]
+    unmatched_current = {
+        item: value for item, value in current_by_id.items() if item not in inherited_ids
+    }
+    unmatched_base = {
+        item: value for item, value in base_by_id.items() if item not in inherited_ids
+    }
+
+    current_names: dict[str, list[str]] = {}
+    base_names: dict[str, list[str]] = {}
+    for document_id, item in unmatched_current.items():
+        current_names.setdefault(item["source_name"], []).append(document_id)
+    for document_id, item in unmatched_base.items():
+        base_names.setdefault(item["source_name"], []).append(document_id)
+
+    replaced: list[dict[str, str]] = []
+    replaced_current: set[str] = set()
+    replaced_base: set[str] = set()
+    for source_name in sorted(set(current_names) & set(base_names)):
+        current_ids = current_names[source_name]
+        base_ids = base_names[source_name]
+        if len(current_ids) == 1 and len(base_ids) == 1:
+            replaced_current.add(current_ids[0])
+            replaced_base.add(base_ids[0])
+            replaced.append(
+                {
+                    "source_name": source_name,
+                    "from_document_id": base_ids[0],
+                    "to_document_id": current_ids[0],
+                }
+            )
+
+    added = [
+        item
+        for document_id, item in sorted(unmatched_current.items())
+        if document_id not in replaced_current
+    ]
+    removed = [
+        item
+        for document_id, item in sorted(unmatched_base.items())
+        if document_id not in replaced_base
+    ]
+    return {
+        "counts": {
+            "added": len(added),
+            "inherited": len(inherited),
+            "replaced": len(replaced),
+            "removed": len(removed),
+        },
+        "added": added,
+        "inherited": inherited,
+        "replaced": replaced,
+        "removed": removed,
+    }
+
+
+def _snapshot_view(
+    library: FixedLibrary,
+    status: dict[str, Any],
+) -> dict[str, Any]:
+    if not status.get("verified"):
+        return {**status, "members": [], "difference": None}
+    members = library.snapshot_members(status["snapshot_id"])
+    base_snapshot_id = status.get("base_snapshot_id")
+    try:
+        base_members = (
+            []
+            if base_snapshot_id is None
+            else library.snapshot_members(base_snapshot_id)
+        )
+    except LiteratureEvidenceError:
+        return {
+            **status,
+            "members": members,
+            "difference": None,
+            "difference_error": "基础快照未通过核验，无法计算差异。",
+        }
+    return {
+        **status,
+        "members": members,
+        "difference": _member_difference(members, base_members),
+    }
+
+
 async def _copy_uploads_and_build(
     request: Request,
     library: FixedLibrary,
@@ -400,41 +586,135 @@ async def _copy_uploads_and_build(
     try:
         form_context = request.form(
             max_files=limits.max_files,
-            max_fields=0,
+            max_fields=2,
             max_part_size=1024,
         )
         async with form_context as form:
             items = form.multi_items()
             if not items:
-                raise RequestBoundaryError(400, "请至少选择一个 Markdown 或 PDF 文件。")
-            uploads: list[tuple[str, UploadFile]] = []
-            seen_names: set[str] = set()
-            declared_total = 0
+                raise RequestBoundaryError(400, "构建请求不能为空。")
+            raw_uploads: list[tuple[str, UploadFile]] = []
+            fields: dict[str, str] = {}
+            parameter_error: str | None = None
             for field_name, item in items:
-                if field_name != "files" or not isinstance(item, UploadFile):
-                    raise RequestBoundaryError(400, "构建请求只能包含 files 文件字段。")
-                filename = _validated_filename(item.filename, limits)
+                if not isinstance(item, UploadFile):
+                    if field_name not in {"build_mode", "base_snapshot_id"}:
+                        parameter_error = "构建请求包含未允许的字段。"
+                    elif field_name in fields or not isinstance(item, str):
+                        parameter_error = "构建模式字段不能重复。"
+                    else:
+                        fields[field_name] = item
+                    continue
+                raw_uploads.append((field_name, item))
+
+            upload_names = [item.filename for _field_name, item in raw_uploads]
+            if parameter_error is not None:
+                raise RequestBoundaryError(
+                    400,
+                    parameter_error,
+                    details=_file_failure_details(
+                        upload_names,
+                        {},
+                        not_published_error=parameter_error,
+                    ),
+                )
+            uploads: list[tuple[int, str, UploadFile]] = []
+            validation_errors: dict[int, str] = {}
+            validation_statuses: dict[int, int] = {}
+            seen_names: dict[str, int] = {}
+            declared_total = 0
+            for index, (field_name, item) in enumerate(raw_uploads):
+                if field_name != "files":
+                    validation_errors[index] = (
+                        "构建请求只能在 files 字段上传文件。"
+                    )
+                    validation_statuses[index] = 400
+                try:
+                    filename = _validated_filename(item.filename, limits)
+                except RequestBoundaryError as exc:
+                    validation_errors[index] = exc.message
+                    validation_statuses[index] = exc.status_code
+                    continue
                 collision_key = unicodedata.normalize("NFC", filename).casefold()
                 if collision_key in seen_names:
-                    raise RequestBoundaryError(400, "一次构建中不能包含重名文件。")
-                seen_names.add(collision_key)
+                    message = "一次构建中不能包含重名文件。"
+                    validation_errors[seen_names[collision_key]] = message
+                    validation_errors[index] = message
+                    validation_statuses[seen_names[collision_key]] = 400
+                    validation_statuses[index] = 400
+                else:
+                    seen_names[collision_key] = index
                 if item.size is not None:
                     if item.size > limits.max_file_bytes:
-                        raise RequestBoundaryError(
-                            413,
-                            f"单个文件超过 {_size_label(limits.max_file_bytes)} 上限。",
+                        message = (
+                            f"单个文件超过 {_size_label(limits.max_file_bytes)} 上限。"
                         )
+                        validation_errors[index] = message
+                        validation_statuses[index] = 413
                     declared_total += item.size
-                uploads.append((filename, item))
+                uploads.append((index, filename, item))
+            if validation_errors:
+                status_code = 413 if 413 in validation_statuses.values() else 400
+                message = next(iter(validation_errors.values()))
+                raise RequestBoundaryError(
+                    status_code,
+                    message,
+                    details=_file_failure_details(upload_names, validation_errors),
+                )
+            build_mode = fields.get("build_mode")
+            base_snapshot_id = fields.get("base_snapshot_id")
+            if build_mode not in {"blank", "inherit"}:
+                message = "必须明确选择从空白建立或继承基础快照。"
+                raise RequestBoundaryError(
+                    400,
+                    message,
+                    details=_file_failure_details(
+                        upload_names,
+                        {},
+                        not_published_error=message,
+                    ),
+                )
+            if build_mode == "blank" and base_snapshot_id is not None:
+                message = "从空白建立时不能提供 base_snapshot_id。"
+                raise RequestBoundaryError(
+                    400,
+                    message,
+                    details=_file_failure_details(
+                        upload_names,
+                        {},
+                        not_published_error=message,
+                    ),
+                )
+            if build_mode == "inherit" and not base_snapshot_id:
+                message = "继承建立必须明确提供 base_snapshot_id。"
+                raise RequestBoundaryError(
+                    400,
+                    message,
+                    details=_file_failure_details(
+                        upload_names,
+                        {},
+                        not_published_error=message,
+                    ),
+                )
+            if not uploads:
+                raise RequestBoundaryError(400, "请至少选择一个 Markdown 或 PDF 文件。")
             if len(uploads) > limits.max_files:
                 raise RequestBoundaryError(
                     413,
                     f"一次最多选择 {limits.max_files} 个文件。",
                 )
             if declared_total > limits.max_total_bytes:
+                message = (
+                    f"所选文件合计超过 {_size_label(limits.max_total_bytes)} 上限。"
+                )
                 raise RequestBoundaryError(
                     413,
-                    f"所选文件合计超过 {_size_label(limits.max_total_bytes)} 上限。",
+                    message,
+                    details=_file_failure_details(
+                        upload_names,
+                        {},
+                        not_published_error=message,
+                    ),
                 )
 
             with tempfile.TemporaryDirectory(prefix=UPLOAD_TEMP_PREFIX) as raw:
@@ -442,7 +722,7 @@ async def _copy_uploads_and_build(
                 os.chmod(temporary, 0o700)
                 controlled_sources: list[Path] = []
                 total_bytes = 0
-                for filename, upload in uploads:
+                for upload_index, filename, upload in uploads:
                     await upload.seek(0)
                     target = temporary / filename
                     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -459,14 +739,31 @@ async def _copy_uploads_and_build(
                                 file_bytes += len(block)
                                 total_bytes += len(block)
                                 if file_bytes > limits.max_file_bytes:
+                                    message = (
+                                        "单个文件超过 "
+                                        f"{_size_label(limits.max_file_bytes)} 上限。"
+                                    )
                                     raise RequestBoundaryError(
                                         413,
-                                        f"单个文件超过 {_size_label(limits.max_file_bytes)} 上限。",
+                                        message,
+                                        details=_file_failure_details(
+                                            upload_names,
+                                            {upload_index: message},
+                                        ),
                                     )
                                 if total_bytes > limits.max_total_bytes:
+                                    message = (
+                                        "所选文件合计超过 "
+                                        f"{_size_label(limits.max_total_bytes)} 上限。"
+                                    )
                                     raise RequestBoundaryError(
                                         413,
-                                        f"所选文件合计超过 {_size_label(limits.max_total_bytes)} 上限。",
+                                        message,
+                                        details=_file_failure_details(
+                                            upload_names,
+                                            {},
+                                            not_published_error=message,
+                                        ),
                                     )
                                 handle.write(block)
                             handle.flush()
@@ -478,9 +775,124 @@ async def _copy_uploads_and_build(
                     if stat.S_ISLNK(source_status.st_mode) or not stat.S_ISREG(
                         source_status.st_mode
                     ):
-                        raise RequestBoundaryError(400, "受控上传文件状态无效。")
+                        message = "受控上传文件状态无效。"
+                        raise RequestBoundaryError(
+                            400,
+                            message,
+                            details=_file_failure_details(
+                                upload_names,
+                                {upload_index: message},
+                            ),
+                        )
                     controlled_sources.append(target)
-                return await run_in_threadpool(library.build, controlled_sources)
+
+                preflight_errors: dict[str, str] = {}
+                prepared_members: list[dict[str, Any]] = []
+                for filename, target in zip(
+                    (item[1] for item in uploads),
+                    controlled_sources,
+                    strict=True,
+                ):
+                    try:
+                        document = await run_in_threadpool(prepare_document, target)
+                    except ImportPolicyError as exc:
+                        preflight_errors[filename] = str(exc)
+                    else:
+                        prepared_members.append(
+                            {
+                                "document_id": document.document_id,
+                                "source_name": document.source_name,
+                                "title": document.title,
+                                "media_type": document.media_type,
+                                "byte_size": document.byte_size,
+                                "chunk_count": len(document.chunks),
+                            }
+                        )
+                if preflight_errors:
+                    file_results = [
+                        {
+                            "name": filename,
+                            "state": (
+                                "failed"
+                                if filename in preflight_errors
+                                else "not_published"
+                            ),
+                            "stage": (
+                                "失败、未发布"
+                                if filename in preflight_errors
+                                else "未发布（同批文件失败）"
+                            ),
+                            "error": preflight_errors.get(
+                                filename,
+                                "同批存在失败文件，整批没有发布。",
+                            ),
+                        }
+                        for _index, filename, _upload in uploads
+                    ]
+                    raise RequestBoundaryError(
+                        422,
+                        "至少一个文件解析失败，整批未发布。",
+                        details={"published": False, "files": file_results},
+                    )
+
+                try:
+                    base_members = (
+                        []
+                        if base_snapshot_id is None
+                        else await run_in_threadpool(
+                            library.snapshot_members,
+                            base_snapshot_id,
+                        )
+                    )
+                    result = await run_in_threadpool(
+                        library.build,
+                        controlled_sources,
+                        base_snapshot_id=base_snapshot_id,
+                    )
+                except LiteratureEvidenceError as exc:
+                    status_code = _expected_error_status(str(exc))
+                    message = (
+                        "快照构建或基础快照核验失败。"
+                        if isinstance(exc, SnapshotError) and status_code != 409
+                        else str(exc)
+                    )
+                    raise RequestBoundaryError(
+                        status_code,
+                        f"{message} 整批未发布。",
+                        details={
+                            "published": False,
+                            "files": [
+                                {
+                                    "name": filename,
+                                    "state": "failed",
+                                    "stage": "失败、未发布",
+                                    "error": message,
+                                }
+                                for _index, filename, _upload in uploads
+                            ],
+                        },
+                    ) from exc
+                return {
+                    **result,
+                    "published": True,
+                    "members": sorted(
+                        [*base_members, *prepared_members],
+                        key=lambda item: item["document_id"],
+                    ),
+                    "difference": _member_difference(
+                        [*base_members, *prepared_members],
+                        base_members,
+                    ),
+                    "files": [
+                        {
+                            "name": filename,
+                            "state": "published",
+                            "stage": "已进入成功快照",
+                            "error": None,
+                        }
+                        for _index, filename, _upload in uploads
+                    ],
+                }
     except RequestBoundaryError:
         raise
     except MultipartParseError:
@@ -502,7 +914,7 @@ async def _copy_uploads_and_build(
 
 
 def create_app(
-    library_path: Path,
+    application_root: Path,
     *,
     port: int = DEFAULT_PORT,
     upload_limits: UploadLimits = DEFAULT_UPLOAD_LIMITS,
@@ -520,7 +932,7 @@ def create_app(
     ):
         raise ImportPolicyError("上传资源上限配置无效。")
 
-    library = FixedLibrary(library_path)
+    registry = LibraryRegistry(application_root)
     sessions = SessionTokens()
     build_lock = threading.Lock()
     authority = f"{LOOPBACK_HOST}:{port}"
@@ -549,17 +961,15 @@ def create_app(
             assert session_id is not None
         else:
             csrf_token = sessions.csrf_for(session_id)
-        library_status = await run_in_threadpool(library.status)
+        library_records = await run_in_threadpool(registry.list_libraries)
         payload = {
             "service": "ready",
             "binding": "127.0.0.1",
-            "library": {
-                "available": library_status.get("ready", False),
-                "snapshot_candidates": library_status.get("snapshot_count", 0),
-                "error": library_status.get("error"),
-            },
+            "local_only": True,
+            "offline_default": "bm25",
+            "library_count": len(library_records),
             "readonly_actions": ["status", "list", "verify", "search"],
-            "write_actions": ["build"],
+            "write_actions": ["create", "select", "build", "activate"],
             "upload_limits": {
                 "max_files": upload_limits.max_files,
                 "max_file_bytes": upload_limits.max_file_bytes,
@@ -579,65 +989,118 @@ def create_app(
             )
         return response
 
-    async def snapshots(_request: Request) -> Response:
-        try:
-            values = await run_in_threadpool(library.list_snapshots)
-        except SnapshotError as exc:
-            raise RequestBoundaryError(400, str(exc)) from exc
-        return JSONResponse({"snapshots": values})
+    async def libraries(_request: Request) -> Response:
+        records = await run_in_threadpool(registry.list_libraries)
+        values = [
+            await run_in_threadpool(_public_library, record)
+            for record in records
+        ]
+        return JSONResponse({"libraries": values})
+
+    async def create_library(request: Request) -> Response:
+        _require_intent(request, CREATE_LIBRARY_INTENT)
+        body = await _bounded_json(request, upload_limits.max_json_bytes)
+        if set(body) - {"name", "description"}:
+            raise RequestBoundaryError(400, "创建资料库请求包含未允许的参数。")
+        if "name" not in body:
+            raise RequestBoundaryError(400, "创建资料库请求缺少名称。")
+        record = await run_in_threadpool(
+            registry.create,
+            body["name"],
+            description=body.get("description", ""),
+        )
+        public = await run_in_threadpool(_public_library, record)
+        return JSONResponse({"library": public}, status_code=201)
+
+    async def select_library(request: Request) -> Response:
+        _require_intent(request, SELECT_LIBRARY_INTENT)
+        record = await run_in_threadpool(
+            registry.select,
+            request.path_params["library_id"],
+        )
+        public = await run_in_threadpool(_public_library, record)
+        return JSONResponse({"library": public})
+
+    async def snapshots(request: Request) -> Response:
+        library_id = request.path_params["library_id"]
+        library = await run_in_threadpool(_fixed_library, registry, library_id)
+        status = await run_in_threadpool(library.catalog_status)
+        values = await run_in_threadpool(library.list_snapshots)
+        views = [
+            await run_in_threadpool(_snapshot_view, library, item)
+            for item in values
+        ]
+        return JSONResponse(
+            {
+                "library_id": library_id,
+                "current_snapshot_id": status["current_snapshot_id"],
+                "last_successful_snapshot_id": status[
+                    "last_successful_snapshot_id"
+                ],
+                "snapshots": views,
+            }
+        )
 
     async def verify(request: Request) -> Response:
+        library_id = request.path_params["library_id"]
         snapshot_id = request.path_params["snapshot_id"]
-        try:
-            result = await run_in_threadpool(library.verify, snapshot_id)
-        except SnapshotError as exc:
-            status_code = 404 if "找不到" in str(exc) or "尚无" in str(exc) else 400
-            raise RequestBoundaryError(status_code, str(exc)) from exc
-        return JSONResponse(result)
+        library = await run_in_threadpool(_fixed_library, registry, library_id)
+        result = await run_in_threadpool(library.verify, snapshot_id)
+        view = await run_in_threadpool(_snapshot_view, library, result)
+        return JSONResponse({"library_id": library_id, **view})
+
+    async def activate(request: Request) -> Response:
+        _require_intent(request, ACTIVATE_SNAPSHOT_INTENT)
+        library_id = request.path_params["library_id"]
+        snapshot_id = request.path_params["snapshot_id"]
+        library = await run_in_threadpool(_fixed_library, registry, library_id)
+        result = await run_in_threadpool(library.activate, snapshot_id)
+        return JSONResponse({"library_id": library_id, **result})
 
     async def search(request: Request) -> Response:
+        library_id = request.path_params["library_id"]
         body = await _bounded_json(request, upload_limits.max_json_bytes)
         allowed = {"snapshot_id", "query", "top_k", "excerpt_chars"}
         if set(body) - allowed:
             raise RequestBoundaryError(400, "搜索请求包含未允许的参数。")
         if "snapshot_id" not in body or "query" not in body:
             raise RequestBoundaryError(400, "搜索请求缺少 snapshot_id 或 query。")
-        try:
-            result = await run_in_threadpool(
-                library.search,
-                body["snapshot_id"],
-                body["query"],
-                top_k=body.get("top_k", 5),
-                excerpt_chars=body.get("excerpt_chars", 1000),
-            )
-        except SnapshotError as exc:
-            status_code = 404 if "找不到" in str(exc) or "尚无" in str(exc) else 400
-            raise RequestBoundaryError(status_code, str(exc)) from exc
-        return JSONResponse(result)
+        library = await run_in_threadpool(_fixed_library, registry, library_id)
+        result = await run_in_threadpool(
+            library.search,
+            body["snapshot_id"],
+            body["query"],
+            top_k=body.get("top_k", 5),
+            excerpt_chars=body.get("excerpt_chars", 1000),
+        )
+        return JSONResponse({"library_id": library_id, **result})
 
     async def build(request: Request) -> Response:
-        intent = _single_header(request, "x-build-intent")
-        if intent != BUILD_INTENT:
-            raise RequestBoundaryError(
-                400,
-                "只有明确点击“构建全新快照”后才能执行 build。",
-            )
+        _require_intent(request, BUILD_INTENT)
+        library_id = request.path_params["library_id"]
         content_type = request.headers.get("content-type", "").lower()
         if not content_type.startswith("multipart/form-data;"):
             raise RequestBoundaryError(415, "build 只接受浏览器 multipart 文件选择。")
         if not build_lock.acquire(blocking=False):
-            raise RequestBoundaryError(409, "已有构建正在进行，请等待完成。")
+            raise RequestBoundaryError(409, "已有构建正在进行；本次未重试、未发布。")
         try:
+            library = await run_in_threadpool(_fixed_library, registry, library_id)
             result = await _copy_uploads_and_build(request, library, upload_limits)
         finally:
             build_lock.release()
-        return JSONResponse(result, status_code=201)
+        return JSONResponse(
+            {
+                "library_id": library_id,
+                **result,
+            },
+            status_code=201,
+        )
 
     async def request_boundary_handler(
         _request: Request, exc: Exception
     ) -> JSONResponse:
         assert isinstance(exc, RequestBoundaryError)
-        return _error_response(exc.status_code, exc.message)
+        return _error_response(exc.status_code, exc.message, exc.details)
 
     async def import_error_handler(_request: Request, exc: Exception) -> JSONResponse:
         assert isinstance(exc, ImportPolicyError)
@@ -651,7 +1114,13 @@ def create_app(
         _request: Request, exc: Exception
     ) -> JSONResponse:
         assert isinstance(exc, SnapshotError)
-        return _error_response(400, "快照构建前核验失败，未发布半成品。")
+        return _error_response(_expected_error_status(str(exc)), str(exc))
+
+    async def registry_error_handler(
+        _request: Request, exc: Exception
+    ) -> JSONResponse:
+        assert isinstance(exc, LibraryRegistryError)
+        return _error_response(_expected_error_status(str(exc)), str(exc))
 
     async def http_error_handler(_request: Request, exc: Exception) -> JSONResponse:
         assert isinstance(exc, HTTPException)
@@ -673,14 +1142,38 @@ def create_app(
         Route("/static/styles.css", styles, methods=["GET"]),
         Route("/static/app.js", script, methods=["GET"]),
         Route("/api/status", status, methods=["GET"]),
-        Route("/api/snapshots", snapshots, methods=["GET"]),
+        Route("/api/libraries", libraries, methods=["GET"]),
+        Route("/api/libraries", create_library, methods=["POST"]),
         Route(
-            "/api/snapshots/{snapshot_id:str}/verify",
+            "/api/libraries/{library_id:str}/select",
+            select_library,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/libraries/{library_id:str}/snapshots",
+            snapshots,
+            methods=["GET"],
+        ),
+        Route(
+            "/api/libraries/{library_id:str}/snapshots/{snapshot_id:str}/verify",
             verify,
             methods=["GET"],
         ),
-        Route("/api/search", search, methods=["POST"]),
-        Route("/api/build", build, methods=["POST"]),
+        Route(
+            "/api/libraries/{library_id:str}/snapshots/{snapshot_id:str}/activate",
+            activate,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/libraries/{library_id:str}/search",
+            search,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/libraries/{library_id:str}/build",
+            build,
+            methods=["POST"],
+        ),
     ]
     middleware = [
         Middleware(
@@ -701,13 +1194,14 @@ def create_app(
             ImportPolicyError: import_error_handler,
             SearchInputError: search_error_handler,
             SnapshotError: snapshot_error_handler,
+            LibraryRegistryError: registry_error_handler,
             HTTPException: http_error_handler,
         },
     )
 
 
 def serve_local(
-    library_path: Path,
+    application_root: Path,
     *,
     port: int = DEFAULT_PORT,
     open_browser: bool = False,
@@ -716,7 +1210,7 @@ def serve_local(
     """Run one foreground Uvicorn process bound only to IPv4 loopback."""
     import uvicorn
 
-    app = create_app(library_path, port=port)
+    app = create_app(application_root, port=port)
     url = f"http://{LOOPBACK_HOST}:{port}/"
     config = uvicorn.Config(
         app,
@@ -758,9 +1252,13 @@ def serve_local(
 
 
 __all__ = [
+    "ACTION_INTENT_HEADER",
+    "ACTIVATE_SNAPSHOT_INTENT",
     "BUILD_INTENT",
+    "CREATE_LIBRARY_INTENT",
     "DEFAULT_PORT",
     "DEFAULT_UPLOAD_LIMITS",
+    "SELECT_LIBRARY_INTENT",
     "SESSION_COOKIE",
     "UploadLimits",
     "create_app",
