@@ -11,6 +11,12 @@ from .library import FixedLibrary
 from .registry import LibraryRegistry, default_application_root
 from .retrieval import search_snapshot
 from .snapshot import build_snapshot, verify_snapshot
+from .vectors import (
+    OfflineDeterministicFakeEmbedder,
+    build_vectors,
+    offline_fake_profile,
+    verify_vectors,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -109,6 +115,27 @@ def _parser() -> argparse.ArgumentParser:
     )
     activate.add_argument("--library", required=True, type=Path)
     activate.add_argument("snapshot_id")
+
+    build_vector_artifact = subparsers.add_parser(
+        "build-vectors",
+        help="只用内置 offline deterministic fake 建立完整向量映射。",
+    )
+    build_vector_artifact.add_argument("--library", required=True, type=Path)
+    build_vector_artifact.add_argument("--snapshot-id", required=True)
+    build_vector_artifact.add_argument("--dimensions", type=int, default=8)
+    build_vector_artifact.add_argument("--input-role", default="document")
+    build_vector_artifact.add_argument(
+        "--instruction",
+        default="Represent the exact evidence chunk for offline deterministic testing.",
+    )
+
+    verify_vector_artifact = subparsers.add_parser(
+        "verify-vectors",
+        help="本地核验固定 snapshot/profile 的 offline/simulated 向量映射。",
+    )
+    verify_vector_artifact.add_argument("--library", required=True, type=Path)
+    verify_vector_artifact.add_argument("--snapshot-id", required=True)
+    verify_vector_artifact.add_argument("--profile-id", required=True)
     return parser
 
 
@@ -172,6 +199,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             else:
                 result = library.activate(args.snapshot_id)
+        elif args.command == "build-vectors":
+            result = build_vectors(
+                args.library,
+                args.snapshot_id,
+                offline_fake_profile(
+                    dimensions=args.dimensions,
+                    input_role=args.input_role,
+                    instruction=args.instruction,
+                ),
+                OfflineDeterministicFakeEmbedder(),
+            )
+        elif args.command == "verify-vectors":
+            result = verify_vectors(
+                args.library,
+                args.snapshot_id,
+                args.profile_id,
+            )
         else:
             from .web import serve_local
 

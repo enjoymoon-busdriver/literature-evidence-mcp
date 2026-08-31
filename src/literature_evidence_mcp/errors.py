@@ -16,3 +16,7 @@ class SearchInputError(LiteratureEvidenceError):
 
 class LibraryRegistryError(LiteratureEvidenceError):
     """The local multi-library registry is invalid or cannot be updated safely."""
+
+
+class VectorError(SnapshotError):
+    """A derived vector object or complete snapshot mapping is invalid."""
