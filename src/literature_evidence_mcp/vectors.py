@@ -160,7 +160,7 @@ def validate_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
     config = preprocessing["config"]
     if not isinstance(config, Mapping):
         raise VectorError("preprocessing.config 必须是 JSON 对象。")
-    config = dict(config)
+    config = json.loads(_canonical_json(dict(config)).decode("utf-8"))
     _reject_credentials(config)
 
     validated = {

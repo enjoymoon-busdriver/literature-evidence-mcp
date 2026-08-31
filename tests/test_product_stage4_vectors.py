@@ -303,14 +303,23 @@ class ProductStageFourVectorTests(unittest.TestCase):
         nested_credential = copy.deepcopy(base)
         nested_credential["preprocessing"]["config"]["access_token"] = "not-allowed"
         invalid_profiles.append(nested_credential)
+        tuple_nested_credential = copy.deepcopy(base)
+        tuple_nested_credential["preprocessing"]["config"]["nested"] = (
+            {"api_key": "not-allowed"},
+        )
+        invalid_profiles.append(tuple_nested_credential)
         real_provider_label = copy.deepcopy(base)
         real_provider_label["provider"] = "real-provider-name"
         invalid_profiles.append(real_provider_label)
+        vectors_before = _tree_hashes(library_root / "derived" / "vectors")
         for invalid in invalid_profiles:
             fake = OfflineDeterministicFakeEmbedder()
             with self.assertRaises(VectorError):
                 build_vectors(library_root, snapshot["snapshot_id"], invalid, fake)
             self.assertEqual(fake.calls, [])
+            self.assertEqual(
+                vectors_before, _tree_hashes(library_root / "derived" / "vectors")
+            )
 
     def test_duplicate_text_reuses_one_object_with_complete_mapping(self) -> None:
         library_root = self.root / "duplicate-library"
