@@ -2,9 +2,9 @@
 
 一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 复制进新的冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
 
-项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同和阶段 1 多资料库核心；下一轮阶段 2–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
+项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–2；下一轮阶段 3–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
 
-## 当前已实现：历史阶段一至阶段四与产品化阶段 1
+## 当前已实现：历史阶段一至阶段四与产品化阶段 1–2
 
 - 显式导入 UTF-8 Markdown 和带文本层 PDF。
 - 每次 `build` 都新建快照；不覆盖或修改旧快照。
@@ -19,8 +19,11 @@
 - HTTP 只接收受控 `snapshot_id`，不接收 library、快照、源文件或其他任意本机路径。
 - 严格 Host/Origin、随机签名会话和 CSRF 防护；没有 CORS，静态 HTML/CSS/JS 全部随包安装。
 - 上传文件先进入一次性受控临时目录，无论构建成功或失败都清理；每次构建仍只新增快照。
-- 一个独立的 `literature-evidence-mcp` 命令通过本地标准输入/输出（stdio）暴露恰好八个 closed-world 只读工具；closed-world 表示只读取启动时固定的 library 中、调用明确指定的快照。
-- MCP 工具只接受受控 `snapshot_id`、`document_id`、`chunk_id`、`section_id`、查询和数量上限，不接受 library、快照、SQLite 或源文件路径，也不接受任意 URI。
+- 每个资料库根持久保存独立 `snapshot-catalog.json`，把每个成功 `snapshot_id` 绑定到发布时的 manifest 哈希，并分别记录“当前快照”和“上次成功快照”。首次成功同时成为二者；后续成功只推进上次成功，当前只能由本地用户显式激活。
+- 从明确 `base_snapshot_id` 构建时可继承完整成员，并显式新增、替换或移除文件；新快照仍物理保存完整冻结副本，本阶段不声称节省存储。
+- 一个独立的 `literature-evidence-mcp` 命令通过本地标准输入/输出（stdio）暴露恰好八个 closed-world 只读工具；服务固定应用注册表，而不是固定或暗选一个资料库。
+- 七个内容工具都必须提供受控 `library_id + snapshot_id`，再提供适用的 `document_id`、`chunk_id`、`section_id`、查询和数量上限；工具不接受资料库、快照、SQLite 或源文件路径，也不接受任意 URI。
+- 第八个 `retrieval_status` 无 ID 时列库、只给 `library_id` 时列该库成功快照、同时给两级 ID 时核验具体快照；只给 `snapshot_id` 明确拒绝。
 - 每次 MCP 内容调用都重新执行现有快照哈希、schema、数量和语义核验，再在 `query_only` 内存 SQLite 镜像上安装只读 authorizer；不会写缓存、日志或 SQLite sidecar。
 - `search_documents` 与 `find_in_document` 只使用现有 SQLite FTS5/BM25，真实无命中返回 `found=false, results=[]`，不会强行补 top-k。
 - Finder 可双击的 [`启动文献证据管理页.command`](./启动文献证据管理页.command)：从自身位置确定完整项目，路径含空格也可使用。
@@ -31,7 +34,7 @@
 
 ## 读写边界
 
-`build` 是用户主动执行的本地写操作：CLI 读取用户逐个列出的源文件；管理页只接收浏览器明确选择的文件字节。二者都只在固定 library 中新增快照，不修改源文件或旧快照。`libraries create/select/rename/describe` 也是用户明确执行的本地注册表写操作；`libraries list` 只读，空状态下不会创建应用目录。
+`build` 是用户主动执行的本地写操作：CLI 读取用户逐个列出的源文件；管理页只接收浏览器明确选择的文件字节。二者都只在固定 library 中新增快照，不修改源文件或旧快照。`snapshots activate` 只接受同库、已成功发布且重新核验通过的快照。`libraries create/select/rename/describe` 也是用户明确执行的本地注册表写操作；`libraries list` 与 `snapshots list` 只读。
 
 `status`、`list`、`verify`、`search` 与八个 MCP 工具是只读操作：它们不会创建 library、重建数据库、写回快照或创建 SQLite sidecar。MCP 不暴露导入、重建、激活、删除、监控、迁移或任意文件读取能力。完整边界见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
 
@@ -50,7 +53,7 @@
 
 - `<完整项目>/.venv/`：安装当前本地项目和免费开源依赖的受控虚拟环境；已被 `.gitignore` 排除。
 - `~/Library/Application Support/literature-evidence-mcp/library/`：默认用户资料库；位于项目外，不会被提交 Git。第一次成功准备时建立目录，只有用户在管理页明确选文件并点击构建后，才会在其中新增快照。
-- `~/Library/Application Support/literature-evidence-mcp/registry.json` 与同级 `libraries/<library_id>/`：产品化阶段 1 的持久化注册表和物理隔离多库。注册表不保存任意路径；名称和描述不参与目录派生。现有 `.command`、HTTP 和 MCP 的单库入口保持兼容，不会暗中采用注册表中的所选库。
+- `~/Library/Application Support/literature-evidence-mcp/registry.json` 与同级 `libraries/<library_id>/`：产品化阶段 1–2 的持久化注册表和物理隔离多库。每库根另有 `snapshot-catalog.json`、目录册写锁和独立 `snapshots/`；全局注册表不保存任意路径。现有 `.command` 与 HTTP 仍是显式单库入口；MCP 固定应用根并在每次内容调用中要求两级 ID，不采用注册表中的所选库或快照指针。
 
 预检和创建 `.venv` 本身只是本机操作。首次安装可能访问默认的 [PyPI](https://pypi.org/) 软件包索引，下载 PEP 517 构建所需的 `setuptools` 以及项目声明的免费开源直接/传递依赖。为防止安装位置被外部配置改到 `.venv` 之外，入口会忽略用户的 `PIP_*`、`pip.conf`、`PYTHONPATH`、`PYTHONHOME` 和当前激活的虚拟环境，要求 `.venv` 明确禁用系统 site-packages，并把安装前缀固定为项目 `.venv`；因此不会使用用户配置的私有索引、其中的凭据或项目外 Python 包。这些对外请求只用于依赖解析和软件包下载；不发送文献或资料库内容，不主动请求 Keychain（钥匙串）凭据，不下载模型，不调用云模型或付费 API。pip 缓存已禁用；pip 可能对暂时网络失败做有限自动重试，不会由启动器另加循环或无限重试。本地构建可能在项目中生成已被 `.gitignore` 排除的 `build/` 和 `src/literature_evidence_mcp.egg-info/`；它们是包构建产物，不含文献或资料库。当本地项目内容没变且环境完整时，后续双击不再运行 pip、不检查更新；管理页只监听 `127.0.0.1`。
 
@@ -58,33 +61,33 @@
 
 双击入口只启动本机管理页。管理页用于用户明确选择 PDF/Markdown、新增冻结快照、核验和本地搜索；“构建全新快照”是明确写操作。MCP 则是给支持本地 stdio（标准输入/输出）的 MCP host 调用的八个只读工具。双击入口不会自动启动 MCP，也不会修改任何 Codex、ChatGPT 或 Claude 配置。
 
-需要 MCP 时，由用户在支持 stdio command/args 的 host 中手工设置下列等价命令；它只固定 library，没有 host、port、URL 或其他 transport 参数：
+需要 MCP 时，由用户在支持 stdio command/args 的 host 中手工设置下列等价命令；它固定应用注册表根，没有 host、port、URL 或其他 transport 参数：
 
 ```bash
 "<完整项目>/.venv/bin/python" -m literature_evidence_mcp.mcp_server \
-  --library "$HOME/Library/Application Support/literature-evidence-mcp/library"
+  --application-root "$HOME/Library/Application Support/literature-evidence-mcp"
 ```
 
-`literature-evidence-mcp --library <library>` 这个原有 console command 仍保留。上面用 `python -m` 写法，是为了让虚拟环境的项目路径含空格时也能稳定启动。MCP 会在前台等待 host 通过 stdin/stdout 发送协议消息，所以直接运行时没有普通交互提示。stdout 只用于 MCP 协议；可操作启动错误写入 stderr，且不回显内部路径或 traceback。host 每次调用都必须提供目标 `snapshot_id`，服务不会暗中选择“最新”或“当前”快照。
+等价 console command 是 `literature-evidence-mcp --application-root <application-root>`；省略参数时使用当前用户的标准 Application Support 目录。上面用 `python -m` 写法，是为了让虚拟环境的项目路径含空格时也能稳定启动。MCP 会在前台等待 host 通过 stdin/stdout 发送协议消息，所以直接运行时没有普通交互提示。stdout 只用于 MCP 协议；可操作启动错误写入 stderr，且不回显内部路径或 traceback。七个内容工具每次都必须显式提供目标 `library_id` 与 `snapshot_id`，服务不会暗中选择注册表 selected、当前或最新快照。
 
 只安装 wheel 不会得到 Finder `.command`；这个双击入口属于完整源码项目的开发版外层。wheel 仍包含两个正式 Python CLI 入口和管理页静态资源。
 
 ### 八个 MCP 工具
 
-所有 ID 都必须属于同一个调用指定的快照；错误类型、多余参数、超限、重复批量 ID 或跨文档/跨快照错配会返回 `isError=true`。成功结果是一个 JSON 对象，编码在单个 MCP `TextContent` 中。
+所有下级 ID 都必须属于同一个调用指定的 `(library_id, snapshot_id)`；错误类型、多余参数、超限、重复批量 ID 或跨库/跨快照/跨文档错配会返回 `isError=true`。成功结果是一个 JSON 对象，编码在单个 MCP `TextContent` 中。
 
 | 工具 | 参数 | 成功返回语义 |
 |---|---|---|
-| `search_documents` | `snapshot_id`；`query` 1–400 字符；`top_k` 1–10（默认 5）；`excerpt_chars` 1–1200（默认 1000） | `found`、`results`、`snapshot_id`、`retrieval_mode="bm25"`；每项含文档/资产/块 ID、标题、来源名、anchor、核验状态、score 和有界摘录 |
-| `get_excerpt` | `snapshot_id`、`document_id`、`chunk_id`；`max_chars` 1–1200（默认 600） | 一个 `result` 及 `truncated`；先核验块确属该文档和快照 |
-| `get_multiple_excerpts` | `snapshot_id`、`document_id`；1–5 个唯一 `chunk_ids`；`per_item_chars` 1–1200（默认 600） | 按请求 ID 顺序返回全部 `results`，每项含 `truncated`；任一 ID 缺失或错配时整次拒绝，不返回部分结果 |
-| `get_document_metadata` | `snapshot_id`、`document_id` | 白名单化的文档元数据和资产 ID/提取状态/页数/chunk 数；不返回路径或内部 SHA |
-| `get_document_toc` | `snapshot_id`、`document_id`；`max_items` 1–100（默认 100） | `items`、`truncated`；Markdown 按已索引标题路径、PDF 按页码派生导航，并明确不宣称是作者目录 |
-| `read_document_section` | `snapshot_id`、`document_id`、由 TOC 返回的 `section_id`；`max_chars` 1–1200（默认 1200） | 章节描述、证据 `results`、`returned_chars` 和 `truncated`；所有摘录合计不超过上限 |
-| `find_in_document` | `snapshot_id`、`document_id`、`query` 1–400；`top_k` 1–10（默认 5）；`excerpt_chars` 1–1200（默认 600） | 只在该文档内执行同一 FTS5/BM25 排序；返回真实命中或 `found=false, results=[]` |
-| `retrieval_status` | `snapshot_id` | 重新核验后的 path-free 快照哈希、schema 版本、数量、SDK/服务版本、只读/closed-world 状态、未逐个核验的快照候选数和已知限制 |
+| `search_documents` | `library_id`、`snapshot_id`；`query` 1–400 字符；`top_k` 1–10（默认 5）；`excerpt_chars` 1–1200（默认 1000） | `found`、`results`、两级 ID、`retrieval_mode="bm25"`；每项含文档/资产/块 ID、标题、来源名、anchor、核验状态、score 和有界摘录 |
+| `get_excerpt` | `library_id`、`snapshot_id`、`document_id`、`chunk_id`；`max_chars` 1–1200（默认 600） | 一个 `result` 及 `truncated`；先核验块确属该库、快照和文档 |
+| `get_multiple_excerpts` | `library_id`、`snapshot_id`、`document_id`；1–5 个唯一 `chunk_ids`；`per_item_chars` 1–1200（默认 600） | 按请求 ID 顺序返回全部 `results`，每项含 `truncated`；任一 ID 缺失或错配时整次拒绝，不返回部分结果 |
+| `get_document_metadata` | `library_id`、`snapshot_id`、`document_id` | 白名单化的文档元数据和资产 ID/提取状态/页数/chunk 数；不返回路径或内部 SHA |
+| `get_document_toc` | `library_id`、`snapshot_id`、`document_id`；`max_items` 1–100（默认 100） | `items`、`truncated`；Markdown 按已索引标题路径、PDF 按页码派生导航，并明确不宣称是作者目录 |
+| `read_document_section` | `library_id`、`snapshot_id`、`document_id`、由 TOC 返回的 `section_id`；`max_chars` 1–1200（默认 1200） | 章节描述、证据 `results`、`returned_chars` 和 `truncated`；所有摘录合计不超过上限 |
+| `find_in_document` | `library_id`、`snapshot_id`、`document_id`、`query` 1–400；`top_k` 1–10（默认 5）；`excerpt_chars` 1–1200（默认 600） | 只在该文档内执行同一 FTS5/BM25 排序；返回真实命中或 `found=false, results=[]` |
+| `retrieval_status` | 可选 `library_id`、`snapshot_id`，但禁止只给 `snapshot_id` | 无 ID 列库；仅库 ID 列成功快照及 current/last；两级 ID 重新核验具体快照并返回 path-free 身份、数量和状态 |
 
-工具 annotations 均为 `readOnlyHint=true`、`destructiveHint=false`、`openWorldHint=false`。这些 annotations 是给客户端的提示；真正的只读边界来自固定 library、严格逻辑 ID、完整快照核验、只读内存 SQLite、authorizer 和输出白名单。
+工具 annotations 均为 `readOnlyHint=true`、`destructiveHint=false`、`openWorldHint=false`。这些 annotations 是给客户端的提示；真正的只读边界来自固定应用注册表、两级目录册归属、完整快照核验、只读内存 SQLite、authorizer 和输出白名单。
 
 ## 命令行与贡献者用法
 
@@ -106,7 +109,7 @@ literature-evidence libraries describe <library_id> "新描述"
 literature-evidence libraries select <library_id>
 ```
 
-创建结果和列表会返回本地 `library_root`，可继续显式传给现有 `build --library`、`serve --library` 或只读 MCP `--library`。阶段 1 的选择只持久化本地产品状态；HTTP/MCP 不会隐式选择当前库，MCP schema 仍是原有单库八工具合同。
+创建结果和列表会返回本地 `library_root`，可继续显式传给 `build --library` 或 `serve --library`。阶段 1 的资料库选择只持久化本地产品状态；HTTP/MCP 都不会隐式采用它。
 
 启动管理页（这条命令固定 library 和端口；没有 `--host` 参数）：
 
@@ -138,6 +141,13 @@ LITERATURE_EVIDENCE_PYTHON=/absolute/path/to/python3.12 \
 literature-evidence build \
   --library ./local-library \
   ./demo/synthetic-evidence.md
+```
+
+从明确基础快照继承完整成员并新增、替换或移除文件时，使用 `--base-snapshot-id`、`--replace <document_id> <file>` 与 `--remove-document-id <document_id>`。后续成功构建不会自动切换当前快照；显式查看或激活使用：
+
+```bash
+literature-evidence snapshots list --library ./local-library
+literature-evidence snapshots activate --library ./local-library <snapshot_id>
 ```
 
 命令会输出一段 JSON；其中 `snapshot_path` 字段是新快照的绝对路径。下面两步只读，把 `<snapshot-path>` 换成该字段的值：
@@ -176,12 +186,15 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 ## 快照结构
 
 ```text
-<library>/snapshots/<snapshot-id>/
-├── manifest.json
-├── schema.sql
-├── evidence.sqlite
-└── sources/
-    └── <content-derived-document-id>.md-or-pdf
+<library>/
+├── snapshot-catalog.json
+├── .snapshot-catalog.lock
+└── snapshots/<snapshot-id>/
+    ├── manifest.json
+    ├── schema.sql
+    ├── evidence.sqlite
+    └── sources/
+        └── <content-derived-document-id>.md-or-pdf
 ```
 
 快照不会保存原始绝对路径，只保留源文件名和冻结副本。在相同项目、Python、SQLite 与 pypdf 版本下，相同输入再次构建会得到新的 snapshot ID 和目录，但 corpus hash、数据库内容、排序与搜索结果应保持一致；manifest 会记录这些版本，避免跨版本作不恰当比较。
@@ -193,7 +206,7 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 3. **阶段三（已完成）**：八类 closed-world stdio 只读 MCP 能力；`search_documents` 与 `find_in_document` 只走本地 BM25，不含 combo、API Key 或 Tunnel。
 4. **阶段四（已完成）**：macOS Apple Silicon 开发版 `.command` 入口、首次预检/受控安装、默认用户资料库和前台管理页启动。自包含、签名/公证 App、DMG 或 pkg 仍属范围外。
 
-下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1 已实现多资料库注册表与本地管理 CLI，阶段 2–9 尚未实现。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
+下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1 已实现多资料库注册表与本地管理 CLI，阶段 2 已实现快照生命周期和 AI 双级发现/核验，阶段 3–9 尚未实现。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
 
 OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完整聊天界面、自动删除/垃圾回收、App/DMG 打包、签名、公证和发布不在阶段 0–9 范围内。
 
@@ -202,10 +215,10 @@ OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完�
 - SQLite `unicode61` 没有专门中文分词；连续无空格中文的词法召回可能较低。
 - 管理页在连续中文空结果时只提示尝试加入空格，不会静默改写查询或改变 tokenizer。
 - MCP 每次工具调用都重新核验快照并建立只读内存 SQLite 镜像；这是明确的完整性边界，也意味着大快照上的单次调用会有额外本地读取开销。当前不添加缓存。
-- `get_document_toc` 的 Markdown 标题与 PDF 页码导航来自现有 chunk 索引，不等同于作者提供的正式目录；`section_id` 只对生成它的快照与文档有效。
+- `get_document_toc` 的 Markdown 标题与 PDF 页码导航来自现有 chunk 索引，不等同于作者提供的正式目录；`section_id` 只对生成它的资料库、快照与文档有效。
 - TOC 当前一次最多返回前 100 节且没有翻页参数；章节读取一次最多返回该节开头 1200 字符且没有续读游标。`truncated=true` 只诚实标记截断，不代表可由本工具继续翻页。
 - MCP 成功结果当前用单个 JSON `TextContent` 返回，没有另行声明 output schema。
-- 产品化阶段 1 只保存多资料库选择；管理页切库以及 MCP 的 `library_id + snapshot_id` 双级 schema 属于后续阶段，当前不会隐式使用所选库。
+- 产品化阶段 2 不迁移目录册出现前的旧快照；目录册缺失而检测到既有快照时会明确停止，既不改写也不覆盖。管理页切库仍属于阶段 5。
 - pypdf 能提取文本不等于排版、全文或公式已经人工核验。
 - 无文本层 PDF 会明确拒绝，当前不会静默 OCR。
 - 一个导入文件暂视为一个文档；多资产合并和人工元数据编辑留待后续。

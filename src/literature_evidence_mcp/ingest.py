@@ -264,20 +264,30 @@ def _pdf_chunks(payload: bytes, fallback_title: str) -> tuple[
     return title, tuple(staged), len(page_texts), sum(len(item.text) for item in staged)
 
 
-def prepare_document(source: Path) -> PreparedDocument:
+def prepare_document(source: Path, *, source_name: str | None = None) -> PreparedDocument:
     path = Path(source).expanduser()
-    suffix = path.suffix.lower()
+    if source_name is None:
+        source_name = path.name
+    if (
+        not isinstance(source_name, str)
+        or not source_name
+        or Path(source_name).name != source_name
+        or "/" in source_name
+        or "\\" in source_name
+        or "\x00" in source_name
+    ):
+        raise ImportPolicyError("冻结源文件名无效。")
+    suffix = Path(source_name).suffix.lower()
     if suffix not in _SUPPORTED_SUFFIXES:
         raise ImportPolicyError(
             f"暂不支持 {path.suffix or '无扩展名'}；v0.1 仅接受 Markdown 和 PDF。"
         )
     payload, source_sha256 = _read_regular_file_once(path)
-    source_name = path.name
     identity_seed = f"{source_name}\0{source_sha256}".encode("utf-8")
     identity = hashlib.sha256(identity_seed).hexdigest()[:24]
     document_id = "doc_" + identity
     asset_id = "asset_" + identity
-    fallback_title = _clean_title(path.stem, "Untitled document")
+    fallback_title = _clean_title(Path(source_name).stem, "Untitled document")
 
     if suffix in {".md", ".markdown"}:
         try:

@@ -148,6 +148,7 @@ def search_snapshot(
     *,
     top_k: int = 5,
     excerpt_chars: int = 1000,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Verify a snapshot, then perform a bounded, local, read-only BM25 search."""
     query = _validated_query(query)
@@ -156,6 +157,12 @@ def search_snapshot(
         excerpt_chars, name="excerpt_chars", maximum=1200
     )
     status, database = _open_verified_snapshot(snapshot)
+    if (
+        expected_manifest_sha256 is not None
+        and status["manifest_sha256"] != expected_manifest_sha256
+    ):
+        database.close()
+        raise SnapshotError("快照内容与目录册绑定不一致。")
     expression = _fts_expression(query)
     if expression is None:
         database.close()

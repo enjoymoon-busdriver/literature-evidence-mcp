@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .errors import LiteratureEvidenceError
+from .errors import ImportPolicyError, LiteratureEvidenceError
+from .library import FixedLibrary
 from .registry import LibraryRegistry, default_application_root
 from .retrieval import search_snapshot
 from .snapshot import build_snapshot, verify_snapshot
@@ -23,7 +24,25 @@ def _parser() -> argparse.ArgumentParser:
         "build", help="显式导入 Markdown/PDF，并建立一个全新的冻结快照。"
     )
     build.add_argument("--library", required=True, type=Path, help="本地资料库目录。")
-    build.add_argument("sources", nargs="+", type=Path, help="要导入的 Markdown/PDF。")
+    build.add_argument(
+        "--base-snapshot-id",
+        help="明确继承的成功快照；省略时从所列文件建立完整新快照。",
+    )
+    build.add_argument(
+        "--remove-document-id",
+        action="append",
+        default=[],
+        help="从基础快照移除一个 document_id；可重复提供。",
+    )
+    build.add_argument(
+        "--replace",
+        action="append",
+        default=[],
+        nargs=2,
+        metavar=("DOCUMENT_ID", "SOURCE"),
+        help="用一个本地文件替换基础快照中的 document_id；可重复提供。",
+    )
+    build.add_argument("sources", nargs="*", type=Path, help="要新增的 Markdown/PDF。")
 
     verify = subparsers.add_parser("verify", help="重新计算快照哈希、schema 和数量。")
     verify.add_argument("snapshot", type=Path, help="快照目录。")
@@ -76,6 +95,20 @@ def _parser() -> argparse.ArgumentParser:
     )
     describe.add_argument("library_id", help="稳定 library_id。")
     describe.add_argument("description", help="新的描述；空字符串表示清空。")
+
+    snapshots = subparsers.add_parser(
+        "snapshots", help="显式查看或激活一个固定资料库中的成功快照。"
+    )
+    snapshot_actions = snapshots.add_subparsers(
+        dest="snapshot_action", required=True
+    )
+    snapshot_list = snapshot_actions.add_parser("list", help="只读列出成功快照和指针。")
+    snapshot_list.add_argument("--library", required=True, type=Path)
+    activate = snapshot_actions.add_parser(
+        "activate", help="把一个已成功且可核验的快照设为当前快照。"
+    )
+    activate.add_argument("--library", required=True, type=Path)
+    activate.add_argument("snapshot_id")
     return parser
 
 
@@ -88,7 +121,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "build":
-            result = build_snapshot(args.library, args.sources)
+            replacement_ids = [item[0] for item in args.replace]
+            if len(replacement_ids) != len(set(replacement_ids)):
+                raise ImportPolicyError("同一 document_id 不能重复提供 --replace。")
+            result = build_snapshot(
+                args.library,
+                args.sources,
+                base_snapshot_id=args.base_snapshot_id,
+                replacements={
+                    document_id: Path(source)
+                    for document_id, source in args.replace
+                },
+                remove_document_ids=args.remove_document_id,
+            )
         elif args.command == "verify":
             result = verify_snapshot(args.snapshot)
         elif args.command == "search":
@@ -118,6 +163,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.library_id, args.description
                     )
                 }
+        elif args.command == "snapshots":
+            library = FixedLibrary(args.library)
+            if args.snapshot_action == "list":
+                result = {
+                    **library.catalog_status(),
+                    "snapshots": library.list_snapshots(),
+                }
+            else:
+                result = library.activate(args.snapshot_id)
         else:
             from .web import serve_local
 

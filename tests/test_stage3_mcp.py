@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ from mcp.types import TextContent
 from literature_evidence_mcp import build_snapshot, search_snapshot
 from literature_evidence_mcp.errors import SearchInputError
 from literature_evidence_mcp.mcp_tools import ReadOnlyEvidenceTools
+from literature_evidence_mcp.registry import LibraryRegistry
 from tests.test_stage1 import _pdf_bytes
 
 
@@ -30,40 +32,70 @@ TOOL_NAMES = [
     "retrieval_status",
 ]
 EXPECTED_REQUIRED = {
-    "search_documents": {"snapshot_id", "query"},
-    "get_excerpt": {"snapshot_id", "document_id", "chunk_id"},
-    "get_multiple_excerpts": {"snapshot_id", "document_id", "chunk_ids"},
-    "get_document_metadata": {"snapshot_id", "document_id"},
-    "get_document_toc": {"snapshot_id", "document_id"},
-    "read_document_section": {"snapshot_id", "document_id", "section_id"},
-    "find_in_document": {"snapshot_id", "document_id", "query"},
-    "retrieval_status": {"snapshot_id"},
+    "search_documents": {"library_id", "snapshot_id", "query"},
+    "get_excerpt": {"library_id", "snapshot_id", "document_id", "chunk_id"},
+    "get_multiple_excerpts": {
+        "library_id",
+        "snapshot_id",
+        "document_id",
+        "chunk_ids",
+    },
+    "get_document_metadata": {"library_id", "snapshot_id", "document_id"},
+    "get_document_toc": {"library_id", "snapshot_id", "document_id"},
+    "read_document_section": {
+        "library_id",
+        "snapshot_id",
+        "document_id",
+        "section_id",
+    },
+    "find_in_document": {"library_id", "snapshot_id", "document_id", "query"},
+    "retrieval_status": set(),
 }
 EXPECTED_PROPERTIES = {
-    "search_documents": {"snapshot_id", "query", "top_k", "excerpt_chars"},
-    "get_excerpt": {"snapshot_id", "document_id", "chunk_id", "max_chars"},
+    "search_documents": {
+        "library_id",
+        "snapshot_id",
+        "query",
+        "top_k",
+        "excerpt_chars",
+    },
+    "get_excerpt": {
+        "library_id",
+        "snapshot_id",
+        "document_id",
+        "chunk_id",
+        "max_chars",
+    },
     "get_multiple_excerpts": {
+        "library_id",
         "snapshot_id",
         "document_id",
         "chunk_ids",
         "per_item_chars",
     },
-    "get_document_metadata": {"snapshot_id", "document_id"},
-    "get_document_toc": {"snapshot_id", "document_id", "max_items"},
+    "get_document_metadata": {"library_id", "snapshot_id", "document_id"},
+    "get_document_toc": {
+        "library_id",
+        "snapshot_id",
+        "document_id",
+        "max_items",
+    },
     "read_document_section": {
+        "library_id",
         "snapshot_id",
         "document_id",
         "section_id",
         "max_chars",
     },
     "find_in_document": {
+        "library_id",
         "snapshot_id",
         "document_id",
         "query",
         "top_k",
         "excerpt_chars",
     },
-    "retrieval_status": {"snapshot_id"},
+    "retrieval_status": {"library_id", "snapshot_id"},
 }
 EXPECTED_DEFAULTS = {
     "search_documents": {"top_k": 5, "excerpt_chars": 1000},
@@ -123,7 +155,11 @@ class _SyntheticLibraryMixin:
     def make_library(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="lemcp-stage3-")
         self.root = Path(self.temporary.name)
-        self.library = self.root / "library"
+        self.application_root = self.root / "application"
+        registry = LibraryRegistry(self.application_root)
+        library_record = registry.create("Protocol library")
+        self.library_id = library_record["library_id"]
+        self.library = Path(library_record["library_root"])
         primary = self.root / "protocol-evidence.md"
         primary.write_text(
             "# Protocol Evidence\n\n"
@@ -166,9 +202,9 @@ class _SyntheticLibraryMixin:
         pdf_search = search_snapshot(self.snapshot, "secondpageunique")
         self.pdf_document_id = pdf_search["results"][0]["document_id"]
         self.pdf_chunk_id = pdf_search["results"][0]["chunk_id"]
-        self.service = ReadOnlyEvidenceTools(self.library)
+        self.service = ReadOnlyEvidenceTools(self.application_root)
         self.section_id = self.service.get_document_toc(
-            self.snapshot_id, self.document_id
+            self.library_id, self.snapshot_id, self.document_id
         )["items"][0]["section_id"]
 
     def remove_library(self) -> None:
@@ -183,55 +219,76 @@ class StageThreeToolTests(_SyntheticLibraryMixin, unittest.TestCase):
         self.remove_library()
 
     def test_all_eight_readonly_operations_preserve_traceability_and_tree(self) -> None:
-        before = _tree_identity(self.library / "snapshots")
+        before = _tree_identity(self.application_root)
         search = self.service.search_documents(
-            self.snapshot_id, "calibrationmarker", top_k=10, excerpt_chars=1200
+            self.library_id,
+            self.snapshot_id,
+            "calibrationmarker",
+            top_k=10,
+            excerpt_chars=1200,
         )
         excerpt = self.service.get_excerpt(
+            self.library_id,
             self.snapshot_id,
             self.document_id,
             self.chunk_ids[0],
             max_chars=1200,
         )
         multiple = self.service.get_multiple_excerpts(
+            self.library_id,
             self.snapshot_id,
             self.document_id,
             list(reversed(self.chunk_ids[:2])),
             per_item_chars=1200,
         )
         metadata = self.service.get_document_metadata(
-            self.snapshot_id, self.document_id
+            self.library_id, self.snapshot_id, self.document_id
         )
-        toc = self.service.get_document_toc(self.snapshot_id, self.document_id)
+        toc = self.service.get_document_toc(
+            self.library_id, self.snapshot_id, self.document_id
+        )
         section = self.service.read_document_section(
-            self.snapshot_id, self.document_id, self.section_id, max_chars=1200
+            self.library_id,
+            self.snapshot_id,
+            self.document_id,
+            self.section_id,
+            max_chars=1200,
         )
         found = self.service.find_in_document(
+            self.library_id,
             self.snapshot_id,
             self.document_id,
             "calibrationmarker",
             top_k=10,
             excerpt_chars=1200,
         )
-        status = self.service.retrieval_status(self.snapshot_id)
+        status = self.service.retrieval_status(self.library_id, self.snapshot_id)
         pdf_metadata = self.service.get_document_metadata(
-            self.snapshot_id, self.pdf_document_id
+            self.library_id, self.snapshot_id, self.pdf_document_id
         )
         pdf_toc = self.service.get_document_toc(
-            self.snapshot_id, self.pdf_document_id
+            self.library_id, self.snapshot_id, self.pdf_document_id
         )
         pdf_excerpt = self.service.get_excerpt(
-            self.snapshot_id, self.pdf_document_id, self.pdf_chunk_id
+            self.library_id,
+            self.snapshot_id,
+            self.pdf_document_id,
+            self.pdf_chunk_id,
         )
         pdf_section = self.service.read_document_section(
+            self.library_id,
             self.snapshot_id,
             self.pdf_document_id,
             pdf_toc["items"][1]["section_id"],
         )
 
-        self.assertEqual(before, _tree_identity(self.library / "snapshots"))
+        self.assertEqual(before, _tree_identity(self.application_root))
         self.assertEqual(search, self.service.search_documents(
-            self.snapshot_id, "calibrationmarker", top_k=10, excerpt_chars=1200
+            self.library_id,
+            self.snapshot_id,
+            "calibrationmarker",
+            top_k=10,
+            excerpt_chars=1200,
         ))
         for item in search["results"]:
             self.assertTrue(
@@ -266,7 +323,7 @@ class StageThreeToolTests(_SyntheticLibraryMixin, unittest.TestCase):
         self.assertTrue(status["closed_world"])
         self.assertTrue(status["readonly"])
         self.assertEqual(status["transport"], "stdio")
-        self.assertEqual(status["snapshot_candidate_count"], 2)
+        self.assertEqual(status["library_id"], self.library_id)
         self.assertEqual(pdf_metadata["document"]["assets"][0]["page_count"], 2)
         self.assertEqual(
             [item["section_kind"] for item in pdf_toc["items"]],
@@ -298,8 +355,11 @@ class StageThreeToolTests(_SyntheticLibraryMixin, unittest.TestCase):
 
     def test_empty_results_boundaries_mismatches_and_deterministic_order(self) -> None:
         for result in (
-            self.service.search_documents(self.snapshot_id, "termabsentfromsnapshot"),
+            self.service.search_documents(
+                self.library_id, self.snapshot_id, "termabsentfromsnapshot"
+            ),
             self.service.find_in_document(
+                self.library_id,
                 self.snapshot_id,
                 self.document_id,
                 "termabsentfromsnapshot",
@@ -309,10 +369,18 @@ class StageThreeToolTests(_SyntheticLibraryMixin, unittest.TestCase):
             self.assertEqual(result["results"], [])
 
         first = self.service.find_in_document(
-            self.snapshot_id, self.document_id, "calibrationmarker", top_k=10
+            self.library_id,
+            self.snapshot_id,
+            self.document_id,
+            "calibrationmarker",
+            top_k=10,
         )
         second = self.service.find_in_document(
-            self.snapshot_id, self.document_id, "calibrationmarker", top_k=10
+            self.library_id,
+            self.snapshot_id,
+            self.document_id,
+            "calibrationmarker",
+            top_k=10,
         )
         self.assertEqual(first, second)
         scores_and_ids = [
@@ -324,100 +392,126 @@ class StageThreeToolTests(_SyntheticLibraryMixin, unittest.TestCase):
         self.assertLess(scores_and_ids[0][1], scores_and_ids[1][1])
 
         invalid_calls = (
-            lambda: self.service.search_documents(self.snapshot_id, "x" * 401),
             lambda: self.service.search_documents(
-                self.snapshot_id, "x" + " " * 400
-            ),
-            lambda: self.service.search_documents(self.snapshot_id, 1),
-            lambda: self.service.search_documents(
-                self.snapshot_id, "evidence", top_k=0
+                self.library_id, self.snapshot_id, "x" * 401
             ),
             lambda: self.service.search_documents(
-                self.snapshot_id, "evidence", top_k=11
+                self.library_id, self.snapshot_id, "x" + " " * 400
             ),
             lambda: self.service.search_documents(
-                self.snapshot_id, "evidence", excerpt_chars=1201
+                self.library_id, self.snapshot_id, 1
             ),
             lambda: self.service.search_documents(
-                self.snapshot_id, "evidence", top_k=True
+                self.library_id, self.snapshot_id, "evidence", top_k=0
+            ),
+            lambda: self.service.search_documents(
+                self.library_id, self.snapshot_id, "evidence", top_k=11
+            ),
+            lambda: self.service.search_documents(
+                self.library_id,
+                self.snapshot_id,
+                "evidence",
+                excerpt_chars=1201,
+            ),
+            lambda: self.service.search_documents(
+                self.library_id, self.snapshot_id, "evidence", top_k=True
             ),
             lambda: self.service.get_excerpt(
+                self.library_id,
                 self.snapshot_id,
                 self.other_document_id,
                 self.chunk_ids[0],
             ),
             lambda: self.service.get_excerpt(
+                self.library_id,
                 self.snapshot_id,
                 self.document_id,
                 self.chunk_ids[0],
                 max_chars=0,
             ),
             lambda: self.service.get_excerpt(
+                self.library_id,
                 self.snapshot_id,
                 self.document_id,
                 "chunk_" + "0" * 25,
             ),
             lambda: self.service.get_multiple_excerpts(
+                self.library_id,
                 self.snapshot_id,
                 self.document_id,
                 [self.chunk_ids[0], self.chunk_ids[0]],
             ),
             lambda: self.service.get_multiple_excerpts(
-                self.snapshot_id, self.document_id, []
+                self.library_id, self.snapshot_id, self.document_id, []
             ),
             lambda: self.service.get_multiple_excerpts(
+                self.library_id,
                 self.snapshot_id,
                 self.document_id,
                 ["chunk_" + f"{index:024x}" for index in range(6)],
             ),
             lambda: self.service.get_multiple_excerpts(
+                self.library_id,
                 self.snapshot_id,
                 self.document_id,
                 [self.chunk_ids[0], self.other_chunk_id],
             ),
             lambda: self.service.get_document_metadata(
-                self.foreign_snapshot_id, self.document_id
+                self.library_id, self.foreign_snapshot_id, self.document_id
             ),
             lambda: self.service.get_document_metadata(
-                self.snapshot_id, "doc_" + "0" * 25
+                self.library_id, self.snapshot_id, "doc_" + "0" * 25
             ),
             lambda: self.service.get_document_toc(
-                self.snapshot_id, self.document_id, max_items=0
+                self.library_id, self.snapshot_id, self.document_id, max_items=0
             ),
             lambda: self.service.get_document_toc(
-                self.snapshot_id, self.document_id, max_items=101
+                self.library_id, self.snapshot_id, self.document_id, max_items=101
             ),
             lambda: self.service.read_document_section(
+                self.library_id,
                 self.snapshot_id,
                 self.other_document_id,
                 self.section_id,
             ),
             lambda: self.service.read_document_section(
+                self.library_id,
                 self.snapshot_id,
                 self.document_id,
                 self.section_id,
                 max_chars=1201,
             ),
             lambda: self.service.read_document_section(
+                self.library_id,
                 self.snapshot_id,
                 self.document_id,
                 "sec_" + "0" * 25,
             ),
             lambda: self.service.find_in_document(
+                self.library_id,
                 self.snapshot_id,
                 "doc_" + "0" * 24,
                 "evidence",
             ),
             lambda: self.service.find_in_document(
-                self.snapshot_id, self.document_id, 1
+                self.library_id, self.snapshot_id, self.document_id, 1
             ),
             lambda: self.service.find_in_document(
-                self.snapshot_id, self.document_id, "evidence", top_k=0
+                self.library_id,
+                self.snapshot_id,
+                self.document_id,
+                "evidence",
+                top_k=0,
             ),
             lambda: self.service.find_in_document(
-                self.snapshot_id, self.document_id, "evidence", top_k=11
+                self.library_id,
+                self.snapshot_id,
+                self.document_id,
+                "evidence",
+                top_k=11,
             ),
             lambda: self.service.find_in_document(
+                self.library_id,
                 self.snapshot_id,
                 self.document_id,
                 "evidence",
@@ -441,11 +535,15 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
     ) -> None:
         command = Path(sys.executable).with_name("literature-evidence-mcp")
         self.assertTrue(command.is_file(), command)
-        before = _tree_identity(self.library / "snapshots")
+        before = _tree_identity(self.application_root)
         params = StdioServerParameters(
             command=str(command),
-            args=["--library", str(self.library)],
+            args=["--application-root", str(self.application_root)],
             cwd=self.root,
+            env={
+                **os.environ,
+                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+            },
         )
         with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errlog:
             async with asyncio.timeout(30):
@@ -465,6 +563,13 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                             set(schema["properties"]), EXPECTED_PROPERTIES[tool.name]
                         )
                         properties = schema["properties"]
+                        self.assertEqual(
+                            properties["library_id"]["pattern"],
+                            "^lib_[0-9a-f]{32}$",
+                        )
+                        self.assertEqual(properties["library_id"]["type"], "string")
+                        self.assertEqual(properties["library_id"]["minLength"], 36)
+                        self.assertEqual(properties["library_id"]["maxLength"], 36)
                         self.assertEqual(
                             properties["snapshot_id"]["pattern"],
                             "^[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}-[0-9a-f]{8}$",
@@ -553,6 +658,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                     search = await client.call_tool(
                         "search_documents",
                         {
+                            "library_id": self.library_id,
                             "snapshot_id": self.snapshot_id,
                             "query": "calibrationmarker",
                             "top_k": 10,
@@ -564,6 +670,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                     self.assertEqual(
                         search_payload,
                         self.service.search_documents(
+                            self.library_id,
                             self.snapshot_id,
                             "calibrationmarker",
                             top_k=10,
@@ -571,7 +678,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         ),
                     )
                     self.assertEqual(
-                        before, _tree_identity(self.library / "snapshots")
+                        before, _tree_identity(self.application_root)
                     )
 
                     async def valid_call(
@@ -585,11 +692,12 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                             str(self.root), json.dumps(payload, ensure_ascii=False)
                         )
                         self.assertEqual(
-                            before, _tree_identity(self.library / "snapshots")
+                            before, _tree_identity(self.application_root)
                         )
                         return payload
 
                     excerpt_arguments = {
+                        "library_id": self.library_id,
                         "snapshot_id": self.snapshot_id,
                         "document_id": self.pdf_document_id,
                         "chunk_id": self.pdf_chunk_id,
@@ -605,6 +713,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                     )
 
                     multiple_arguments = {
+                        "library_id": self.library_id,
                         "snapshot_id": self.snapshot_id,
                         "document_id": self.document_id,
                         "chunk_ids": list(reversed(self.chunk_ids[:2])),
@@ -621,6 +730,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                     )
 
                     metadata_arguments = {
+                        "library_id": self.library_id,
                         "snapshot_id": self.snapshot_id,
                         "document_id": self.pdf_document_id,
                     }
@@ -632,6 +742,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                     )
 
                     toc_arguments = {
+                        "library_id": self.library_id,
                         "snapshot_id": self.snapshot_id,
                         "document_id": self.pdf_document_id,
                     }
@@ -647,6 +758,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                     protocol_section_id = toc_payload["items"][1]["section_id"]
 
                     section_arguments = {
+                        "library_id": self.library_id,
                         "snapshot_id": self.snapshot_id,
                         "document_id": self.pdf_document_id,
                         "section_id": protocol_section_id,
@@ -664,6 +776,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                     self.assertLessEqual(section_payload["returned_chars"], 1200)
 
                     find_arguments = {
+                        "library_id": self.library_id,
                         "snapshot_id": self.snapshot_id,
                         "document_id": self.document_id,
                         "query": "calibrationmarker",
@@ -682,16 +795,37 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         find_payload["results"][1]["chunk_id"],
                     )
 
-                    status_arguments = {"snapshot_id": self.snapshot_id}
+                    status_arguments = {
+                        "library_id": self.library_id,
+                        "snapshot_id": self.snapshot_id,
+                    }
                     status_payload = await valid_call(
                         "retrieval_status", status_arguments
                     )
                     self.assertTrue(status_payload["closed_world"])
                     self.assertTrue(status_payload["readonly"])
                     self.assertEqual(status_payload["transport"], "stdio")
+                    libraries_payload = await valid_call("retrieval_status", {})
+                    self.assertEqual(libraries_payload["scope"], "libraries")
+                    self.assertEqual(
+                        [item["library_id"] for item in libraries_payload["libraries"]],
+                        [self.library_id],
+                    )
+                    snapshots_payload = await valid_call(
+                        "retrieval_status", {"library_id": self.library_id}
+                    )
+                    self.assertEqual(snapshots_payload["scope"], "snapshots")
+                    self.assertEqual(
+                        snapshots_payload["current_snapshot_id"], self.snapshot_id
+                    )
+                    self.assertEqual(
+                        snapshots_payload["last_successful_snapshot_id"],
+                        self.foreign_snapshot_id,
+                    )
 
                     valid_arguments_by_tool = {
                         "search_documents": {
+                            "library_id": self.library_id,
                             "snapshot_id": self.snapshot_id,
                             "query": "calibrationmarker",
                         },
@@ -701,7 +835,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         "get_document_toc": toc_arguments,
                         "read_document_section": section_arguments,
                         "find_in_document": find_arguments,
-                        "retrieval_status": status_arguments,
+                        "retrieval_status": {},
                     }
                     for name, arguments in valid_arguments_by_tool.items():
                         result = await client.call_tool(
@@ -719,13 +853,30 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         self.assertNotIn(str(self.root), rendered_error)
                         self.assertNotIn("Traceback", rendered_error)
                         self.assertEqual(
-                            before, _tree_identity(self.library / "snapshots")
+                            before, _tree_identity(self.application_root)
                         )
+
+                    for name, arguments in valid_arguments_by_tool.items():
+                        if name == "retrieval_status":
+                            continue
+                        for missing in ("library_id", "snapshot_id"):
+                            incomplete = dict(arguments)
+                            incomplete.pop(missing)
+                            result = await client.call_tool(name, incomplete)
+                            self.assertTrue(result.is_error, (name, missing))
+                            self.assertEqual(
+                                _protocol_payload(result)["error"]["code"],
+                                "LEMCP_E_INVALID_INPUT",
+                            )
+                            self.assertEqual(
+                                before, _tree_identity(self.application_root)
+                            )
 
                     for name, arguments in (
                         (
                             "search_documents",
                             {
+                                "library_id": self.library_id,
                                 "snapshot_id": self.snapshot_id,
                                 "query": "termabsentfromsnapshot",
                             },
@@ -733,6 +884,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         (
                             "find_in_document",
                             {
+                                "library_id": self.library_id,
                                 "snapshot_id": self.snapshot_id,
                                 "document_id": self.document_id,
                                 "query": "termabsentfromsnapshot",
@@ -745,13 +897,14 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         self.assertFalse(payload["found"])
                         self.assertEqual(payload["results"], [])
                         self.assertEqual(
-                            before, _tree_identity(self.library / "snapshots")
+                            before, _tree_identity(self.application_root)
                         )
 
                     invalid_calls = [
                         (
                             "search_documents",
                             {
+                                "library_id": self.library_id,
                                 "snapshot_id": self.snapshot_id,
                                 "query": "evidence",
                                 "unexpected": 1,
@@ -760,6 +913,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         (
                             "search_documents",
                             {
+                                "library_id": self.library_id,
                                 "snapshot_id": self.snapshot_id,
                                 "query": "evidence",
                                 "top_k": True,
@@ -767,11 +921,16 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         ),
                         (
                             "search_documents",
-                            {"snapshot_id": self.snapshot_id, "query": "x" * 401},
+                            {
+                                "library_id": self.library_id,
+                                "snapshot_id": self.snapshot_id,
+                                "query": "x" * 401,
+                            },
                         ),
                         (
                             "search_documents",
                             {
+                                "library_id": self.library_id,
                                 "snapshot_id": self.snapshot_id,
                                 "query": "x" + " " * 400,
                             },
@@ -779,6 +938,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         (
                             "get_excerpt",
                             {
+                                "library_id": self.library_id,
                                 "snapshot_id": self.snapshot_id,
                                 "document_id": self.other_document_id,
                                 "chunk_id": self.chunk_ids[0],
@@ -787,6 +947,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         (
                             "get_multiple_excerpts",
                             {
+                                "library_id": self.library_id,
                                 "snapshot_id": self.snapshot_id,
                                 "document_id": self.document_id,
                                 "chunk_ids": [self.chunk_ids[0], self.chunk_ids[0]],
@@ -795,6 +956,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         (
                             "get_document_metadata",
                             {
+                                "library_id": self.library_id,
                                 "snapshot_id": self.foreign_snapshot_id,
                                 "document_id": self.document_id,
                             },
@@ -802,6 +964,7 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         (
                             "read_document_section",
                             {
+                                "library_id": self.library_id,
                                 "snapshot_id": self.snapshot_id,
                                 "document_id": self.other_document_id,
                                 "section_id": self.section_id,
@@ -824,13 +987,13 @@ class StageThreeProtocolTests(_SyntheticLibraryMixin, unittest.IsolatedAsyncioTe
                         self.assertNotIn(str(self.root), rendered_error)
                         self.assertNotIn("Traceback", rendered_error)
                         self.assertEqual(
-                            before, _tree_identity(self.library / "snapshots")
+                            before, _tree_identity(self.application_root)
                         )
             errlog.flush()
             errlog.seek(0)
             stderr = errlog.read()
 
-        self.assertEqual(before, _tree_identity(self.library / "snapshots"))
+        self.assertEqual(before, _tree_identity(self.application_root))
         self.assertNotIn("Traceback", stderr)
         self.assertNotIn(str(self.root), stderr)
 

@@ -30,12 +30,19 @@ _READ_ONLY_CLOSED = ToolAnnotations(
     open_world_hint=False,
 )
 
+_LIBRARY_ID_SCHEMA = {
+    "type": "string",
+    "pattern": "^lib_[0-9a-f]{32}$",
+    "minLength": 36,
+    "maxLength": 36,
+    "description": "A stable library_id returned by retrieval_status.",
+}
 _SNAPSHOT_ID_SCHEMA = {
     "type": "string",
     "pattern": "^[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}-[0-9a-f]{8}$",
     "minLength": 44,
     "maxLength": 44,
-    "description": "A snapshot_id returned by this fixed local library.",
+    "description": "A snapshot_id returned for the explicit library_id.",
 }
 _DOCUMENT_ID_SCHEMA = {
     "type": "string",
@@ -86,6 +93,7 @@ TOOLS = (
         ),
         input_schema=_input_schema(
             {
+                "library_id": _LIBRARY_ID_SCHEMA,
                 "snapshot_id": _SNAPSHOT_ID_SCHEMA,
                 "query": _QUERY_SCHEMA,
                 "top_k": {
@@ -101,7 +109,7 @@ TOOLS = (
                     "default": 1000,
                 },
             },
-            ["snapshot_id", "query"],
+            ["library_id", "snapshot_id", "query"],
         ),
         annotations=_READ_ONLY_CLOSED,
     ),
@@ -113,6 +121,7 @@ TOOLS = (
         ),
         input_schema=_input_schema(
             {
+                "library_id": _LIBRARY_ID_SCHEMA,
                 "snapshot_id": _SNAPSHOT_ID_SCHEMA,
                 "document_id": _DOCUMENT_ID_SCHEMA,
                 "chunk_id": _CHUNK_ID_SCHEMA,
@@ -123,7 +132,7 @@ TOOLS = (
                     "default": 600,
                 },
             },
-            ["snapshot_id", "document_id", "chunk_id"],
+            ["library_id", "snapshot_id", "document_id", "chunk_id"],
         ),
         annotations=_READ_ONLY_CLOSED,
     ),
@@ -135,6 +144,7 @@ TOOLS = (
         ),
         input_schema=_input_schema(
             {
+                "library_id": _LIBRARY_ID_SCHEMA,
                 "snapshot_id": _SNAPSHOT_ID_SCHEMA,
                 "document_id": _DOCUMENT_ID_SCHEMA,
                 "chunk_ids": {
@@ -151,7 +161,7 @@ TOOLS = (
                     "default": 600,
                 },
             },
-            ["snapshot_id", "document_id", "chunk_ids"],
+            ["library_id", "snapshot_id", "document_id", "chunk_ids"],
         ),
         annotations=_READ_ONLY_CLOSED,
     ),
@@ -162,10 +172,11 @@ TOOLS = (
         ),
         input_schema=_input_schema(
             {
+                "library_id": _LIBRARY_ID_SCHEMA,
                 "snapshot_id": _SNAPSHOT_ID_SCHEMA,
                 "document_id": _DOCUMENT_ID_SCHEMA,
             },
-            ["snapshot_id", "document_id"],
+            ["library_id", "snapshot_id", "document_id"],
         ),
         annotations=_READ_ONLY_CLOSED,
     ),
@@ -177,6 +188,7 @@ TOOLS = (
         ),
         input_schema=_input_schema(
             {
+                "library_id": _LIBRARY_ID_SCHEMA,
                 "snapshot_id": _SNAPSHOT_ID_SCHEMA,
                 "document_id": _DOCUMENT_ID_SCHEMA,
                 "max_items": {
@@ -186,7 +198,7 @@ TOOLS = (
                     "default": 100,
                 },
             },
-            ["snapshot_id", "document_id"],
+            ["library_id", "snapshot_id", "document_id"],
         ),
         annotations=_READ_ONLY_CLOSED,
     ),
@@ -198,6 +210,7 @@ TOOLS = (
         ),
         input_schema=_input_schema(
             {
+                "library_id": _LIBRARY_ID_SCHEMA,
                 "snapshot_id": _SNAPSHOT_ID_SCHEMA,
                 "document_id": _DOCUMENT_ID_SCHEMA,
                 "section_id": _SECTION_ID_SCHEMA,
@@ -208,7 +221,7 @@ TOOLS = (
                     "default": 1200,
                 },
             },
-            ["snapshot_id", "document_id", "section_id"],
+            ["library_id", "snapshot_id", "document_id", "section_id"],
         ),
         annotations=_READ_ONLY_CLOSED,
     ),
@@ -220,6 +233,7 @@ TOOLS = (
         ),
         input_schema=_input_schema(
             {
+                "library_id": _LIBRARY_ID_SCHEMA,
                 "snapshot_id": _SNAPSHOT_ID_SCHEMA,
                 "document_id": _DOCUMENT_ID_SCHEMA,
                 "query": _QUERY_SCHEMA,
@@ -236,32 +250,46 @@ TOOLS = (
                     "default": 600,
                 },
             },
-            ["snapshot_id", "document_id", "query"],
+            ["library_id", "snapshot_id", "document_id", "query"],
         ),
         annotations=_READ_ONLY_CLOSED,
     ),
     Tool(
         name="retrieval_status",
         description=(
-            "Verify one snapshot and return path-free local identity, counts, versions, "
-            "read-only state, and known retrieval limitations."
+            "List libraries, list one library's successful snapshots, or verify one "
+            "explicit library_id and snapshot_id pair."
         ),
         input_schema=_input_schema(
-            {"snapshot_id": _SNAPSHOT_ID_SCHEMA}, ["snapshot_id"]
+            {
+                "library_id": _LIBRARY_ID_SCHEMA,
+                "snapshot_id": _SNAPSHOT_ID_SCHEMA,
+            },
+            [],
         ),
         annotations=_READ_ONLY_CLOSED,
     ),
 )
 
 _REQUIRED_ARGUMENTS = {
-    "search_documents": {"snapshot_id", "query"},
-    "get_excerpt": {"snapshot_id", "document_id", "chunk_id"},
-    "get_multiple_excerpts": {"snapshot_id", "document_id", "chunk_ids"},
-    "get_document_metadata": {"snapshot_id", "document_id"},
-    "get_document_toc": {"snapshot_id", "document_id"},
-    "read_document_section": {"snapshot_id", "document_id", "section_id"},
-    "find_in_document": {"snapshot_id", "document_id", "query"},
-    "retrieval_status": {"snapshot_id"},
+    "search_documents": {"library_id", "snapshot_id", "query"},
+    "get_excerpt": {"library_id", "snapshot_id", "document_id", "chunk_id"},
+    "get_multiple_excerpts": {
+        "library_id",
+        "snapshot_id",
+        "document_id",
+        "chunk_ids",
+    },
+    "get_document_metadata": {"library_id", "snapshot_id", "document_id"},
+    "get_document_toc": {"library_id", "snapshot_id", "document_id"},
+    "read_document_section": {
+        "library_id",
+        "snapshot_id",
+        "document_id",
+        "section_id",
+    },
+    "find_in_document": {"library_id", "snapshot_id", "document_id", "query"},
+    "retrieval_status": set(),
 }
 _OPTIONAL_ARGUMENTS = {
     "search_documents": {"top_k", "excerpt_chars"},
@@ -271,7 +299,7 @@ _OPTIONAL_ARGUMENTS = {
     "get_document_toc": {"max_items"},
     "read_document_section": {"max_chars"},
     "find_in_document": {"top_k", "excerpt_chars"},
-    "retrieval_status": set(),
+    "retrieval_status": {"library_id", "snapshot_id"},
 }
 
 
@@ -338,6 +366,7 @@ def create_server(service: ReadOnlyEvidenceTools) -> Server[object]:
             arguments = _strict_arguments(params.name, params.arguments)
             if params.name == "search_documents":
                 payload = service.search_documents(
+                    arguments["library_id"],
                     arguments["snapshot_id"],
                     arguments["query"],
                     top_k=arguments.get("top_k", 5),
@@ -345,6 +374,7 @@ def create_server(service: ReadOnlyEvidenceTools) -> Server[object]:
                 )
             elif params.name == "get_excerpt":
                 payload = service.get_excerpt(
+                    arguments["library_id"],
                     arguments["snapshot_id"],
                     arguments["document_id"],
                     arguments["chunk_id"],
@@ -352,6 +382,7 @@ def create_server(service: ReadOnlyEvidenceTools) -> Server[object]:
                 )
             elif params.name == "get_multiple_excerpts":
                 payload = service.get_multiple_excerpts(
+                    arguments["library_id"],
                     arguments["snapshot_id"],
                     arguments["document_id"],
                     arguments["chunk_ids"],
@@ -359,16 +390,20 @@ def create_server(service: ReadOnlyEvidenceTools) -> Server[object]:
                 )
             elif params.name == "get_document_metadata":
                 payload = service.get_document_metadata(
-                    arguments["snapshot_id"], arguments["document_id"]
+                    arguments["library_id"],
+                    arguments["snapshot_id"],
+                    arguments["document_id"],
                 )
             elif params.name == "get_document_toc":
                 payload = service.get_document_toc(
+                    arguments["library_id"],
                     arguments["snapshot_id"],
                     arguments["document_id"],
                     max_items=arguments.get("max_items", 100),
                 )
             elif params.name == "read_document_section":
                 payload = service.read_document_section(
+                    arguments["library_id"],
                     arguments["snapshot_id"],
                     arguments["document_id"],
                     arguments["section_id"],
@@ -376,6 +411,7 @@ def create_server(service: ReadOnlyEvidenceTools) -> Server[object]:
                 )
             elif params.name == "find_in_document":
                 payload = service.find_in_document(
+                    arguments["library_id"],
                     arguments["snapshot_id"],
                     arguments["document_id"],
                     arguments["query"],
@@ -383,13 +419,15 @@ def create_server(service: ReadOnlyEvidenceTools) -> Server[object]:
                     excerpt_chars=arguments.get("excerpt_chars", 600),
                 )
             else:
-                payload = service.retrieval_status(arguments["snapshot_id"])
+                payload = service.retrieval_status(
+                    arguments.get("library_id"), arguments.get("snapshot_id")
+                )
         except SearchInputError as exc:
             return _error("LEMCP_E_INVALID_INPUT", str(exc))
         except SnapshotError:
             return _error(
                 "LEMCP_E_SNAPSHOT",
-                "所选快照不存在、与固定资料库不匹配，或未通过只读核验。",
+                "所选快照不存在、与 library_id 不匹配，或未通过只读核验。",
             )
         except LiteratureEvidenceError:
             return _error("LEMCP_E_LOCAL", "本地只读检索失败。")
@@ -418,13 +456,12 @@ async def _serve_stdio(server: Server[object]) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="literature-evidence-mcp",
-        description="以本地 stdio 暴露固定资料库的八个只读 MCP 工具。",
+        description="以本地 stdio 暴露注册资料库的八个只读 MCP 工具。",
     )
     parser.add_argument(
-        "--library",
-        required=True,
+        "--application-root",
         type=Path,
-        help="启动时固定的本地资料库根目录。",
+        help="固定应用目录；省略时使用当前用户的标准 Application Support 目录。",
     )
     return parser
 
@@ -432,12 +469,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        service = ReadOnlyEvidenceTools(args.library)
-        service.require_ready_library()
+        service = ReadOnlyEvidenceTools(args.application_root)
         server = create_server(service)
         asyncio.run(_serve_stdio(server))
     except (LiteratureEvidenceError, OSError, ValueError):
-        sys.stderr.write("错误：固定资料库无法安全启动只读 MCP 服务。\n")
+        sys.stderr.write("错误：本地资料库注册表无法安全启动只读 MCP 服务。\n")
         return 2
     except KeyboardInterrupt:
         return 130

@@ -7,6 +7,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -15,11 +16,24 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from . import __version__
+from .catalog import (
+    empty_snapshot_catalog,
+    load_snapshot_catalog,
+    snapshot_catalog_exists,
+    snapshot_catalog_lock,
+    snapshot_record,
+    write_snapshot_catalog,
+)
 from .errors import ImportPolicyError, SnapshotError
-from .ingest import MAX_CHUNK_CHARS, PreparedDocument, prepare_documents
+from .ingest import (
+    MAX_CHUNK_CHARS,
+    PreparedDocument,
+    prepare_document,
+    prepare_documents,
+)
 
 
 SNAPSHOT_FORMAT = "literature-evidence-snapshot"
@@ -27,6 +41,7 @@ SCHEMA_VERSION = 1
 DATABASE_NAME = "evidence.sqlite"
 MANIFEST_NAME = "manifest.json"
 SCHEMA_NAME = "schema.sql"
+_DOCUMENT_ID = re.compile(r"\Adoc_[0-9a-f]{24}\Z")
 
 SCHEMA_SQL = """PRAGMA foreign_keys=ON;
 PRAGMA page_size=4096;
@@ -459,16 +474,21 @@ def _publish_directory_no_replace(source: Path, target: Path) -> None:
     os.rename(source, target)
 
 
-def build_snapshot(library: Path, sources: Sequence[Path]) -> dict[str, Any]:
-    """Create a new, never-overwritten snapshot from explicitly selected local files."""
-    documents = prepare_documents(sources)
+def _publish_prepared_snapshot(
+    snapshots_root: Path,
+    documents: Sequence[PreparedDocument],
+    *,
+    reserved_snapshot_ids: set[str],
+) -> dict[str, Any]:
+    """Build, verify, and no-replace publish one complete prepared snapshot."""
     corpus_sha256 = _corpus_sha256(documents)
-    _library_root, snapshots_root = _prepare_library(library)
     created_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace(
         "+00:00", "Z"
     )
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     snapshot_id = f"{timestamp}-{corpus_sha256[:12]}-{uuid.uuid4().hex[:8]}"
+    if snapshot_id in reserved_snapshot_ids:
+        raise SnapshotError("新快照 ID 已在目录册中使用；不会重复发布。")
     final_directory = snapshots_root / snapshot_id
     if final_directory.exists():
         raise SnapshotError("新快照 ID 意外冲突；未覆盖任何已有快照。")
@@ -547,6 +567,174 @@ def build_snapshot(library: Path, sources: Sequence[Path]) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "counts": counts,
     }
+
+
+def _validated_document_id(value: str, *, label: str) -> str:
+    if not isinstance(value, str) or _DOCUMENT_ID.fullmatch(value) is None:
+        raise ImportPolicyError(f"{label} 必须是有效的 document_id。")
+    return value
+
+
+def _base_documents(
+    snapshots_root: Path,
+    catalog: dict[str, Any],
+    base_snapshot_id: str,
+) -> tuple[PreparedDocument, ...]:
+    record = snapshot_record(catalog, base_snapshot_id)
+    snapshot_directory = snapshots_root / base_snapshot_id
+    status, _database_image = _verify_snapshot(
+        snapshot_directory, require_directory_name=True
+    )
+    if status["manifest_sha256"] != record["manifest_sha256"]:
+        raise SnapshotError("基础快照与目录册绑定的内容不一致。")
+    manifest, manifest_sha256 = _load_manifest(snapshot_directory)
+    if manifest_sha256 != record["manifest_sha256"]:
+        raise SnapshotError("读取期间基础快照 manifest 发生变化。")
+
+    documents: list[PreparedDocument] = []
+    for source in manifest["sources"]:
+        source_name = source.get("source_name")
+        stored = _snapshot_member(snapshot_directory, source.get("stored_path"))
+        document = prepare_document(stored, source_name=source_name)
+        if (
+            document.document_id != source.get("document_id")
+            or document.asset_id != source.get("asset_id")
+            or document.source_sha256 != source.get("source_sha256")
+        ):
+            raise SnapshotError("基础快照成员在继承读取期间发生变化。")
+        documents.append(document)
+    return tuple(sorted(documents, key=lambda item: item.document_id))
+
+
+def build_snapshot(
+    library: Path,
+    sources: Sequence[Path],
+    *,
+    base_snapshot_id: str | None = None,
+    replacements: Mapping[str, Path] | None = None,
+    remove_document_ids: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Publish one complete snapshot, optionally derived from an explicit base."""
+    if isinstance(remove_document_ids, (str, bytes)):
+        raise ImportPolicyError("remove_document_ids 必须是 document_id 列表。")
+    removed = tuple(
+        _validated_document_id(value, label="待移除项")
+        for value in remove_document_ids
+    )
+    if len(removed) != len(set(removed)):
+        raise ImportPolicyError("待移除的 document_id 不能重复。")
+
+    replacement_paths = {} if replacements is None else replacements
+    if not isinstance(replacement_paths, Mapping):
+        raise ImportPolicyError("replacements 必须是 document_id 到源文件的映射。")
+    prepared_replacements: dict[str, PreparedDocument] = {}
+    for raw_document_id, source in replacement_paths.items():
+        document_id = _validated_document_id(raw_document_id, label="待替换项")
+        if document_id in prepared_replacements:
+            raise ImportPolicyError("待替换的 document_id 不能重复。")
+        prepared_replacements[document_id] = prepare_document(source)
+    if set(removed) & set(prepared_replacements):
+        raise ImportPolicyError("同一 document_id 不能同时替换和移除。")
+
+    additions = prepare_documents(sources) if sources else ()
+    if base_snapshot_id is None:
+        if removed or prepared_replacements:
+            raise ImportPolicyError("替换或移除必须明确提供 base_snapshot_id。")
+        if not additions:
+            raise ImportPolicyError("请至少选择一个 Markdown 或 PDF 文件。")
+
+    library_root, snapshots_root = _prepare_library(library)
+    with snapshot_catalog_lock(library_root):
+        catalog = load_snapshot_catalog(library_root)
+        if not snapshot_catalog_exists(library_root):
+            write_snapshot_catalog(library_root, empty_snapshot_catalog())
+            catalog = empty_snapshot_catalog()
+
+        members: dict[str, PreparedDocument]
+        if base_snapshot_id is None:
+            members = {}
+        else:
+            members = {
+                document.document_id: document
+                for document in _base_documents(
+                    snapshots_root, catalog, base_snapshot_id
+                )
+            }
+            requested = set(removed) | set(prepared_replacements)
+            missing = requested - set(members)
+            if missing:
+                raise ImportPolicyError("待替换或移除的 document_id 不属于基础快照。")
+            for document_id in removed:
+                del members[document_id]
+            for document_id, document in prepared_replacements.items():
+                del members[document_id]
+                if document.document_id in members:
+                    raise ImportPolicyError("替换文件与另一现有成员重复。")
+                members[document.document_id] = document
+
+        for document in additions:
+            if document.document_id in members:
+                raise ImportPolicyError("新增文件与快照中的成员重复。")
+            members[document.document_id] = document
+        if not members:
+            raise ImportPolicyError("完整快照必须至少包含一个文件。")
+
+        result = _publish_prepared_snapshot(
+            snapshots_root,
+            tuple(sorted(members.values(), key=lambda item: item.document_id)),
+            reserved_snapshot_ids={
+                item["snapshot_id"] for item in catalog["snapshots"]
+            },
+        )
+        record = {
+            "snapshot_id": result["snapshot_id"],
+            "manifest_sha256": result["manifest_sha256"],
+            "base_snapshot_id": base_snapshot_id,
+        }
+        next_catalog = {
+            "format": catalog["format"],
+            "version": catalog["version"],
+            "current_snapshot_id": (
+                catalog["current_snapshot_id"] or result["snapshot_id"]
+            ),
+            "last_successful_snapshot_id": result["snapshot_id"],
+            "snapshots": [*catalog["snapshots"], record],
+        }
+        try:
+            write_snapshot_catalog(library_root, next_catalog)
+        except BaseException:
+            # An asynchronous interruption can arrive after the atomic catalog
+            # replace but before the writer returns.  Never delete a directory
+            # whose ID is already visible in the authoritative catalog.
+            registered: bool | None = None
+            try:
+                persisted = load_snapshot_catalog(library_root)
+            except (SnapshotError, OSError):
+                pass
+            else:
+                registered = any(
+                    item["snapshot_id"] == result["snapshot_id"]
+                    for item in persisted["snapshots"]
+                )
+            if registered is False:
+                published = Path(result["snapshot_path"])
+                try:
+                    shutil.rmtree(published)
+                    _fsync_directory(snapshots_root)
+                except OSError:
+                    pass
+            raise
+
+    result.update(
+        {
+            "base_snapshot_id": base_snapshot_id,
+            "current_snapshot_id": next_catalog["current_snapshot_id"],
+            "last_successful_snapshot_id": next_catalog[
+                "last_successful_snapshot_id"
+            ],
+        }
+    )
+    return result
 
 
 def _load_manifest(snapshot_directory: Path) -> tuple[dict[str, Any], str]:

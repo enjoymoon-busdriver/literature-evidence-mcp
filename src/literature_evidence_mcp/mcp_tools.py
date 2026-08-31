@@ -13,6 +13,7 @@ from typing import Any, Iterator
 from . import __version__
 from .errors import SearchInputError, SnapshotError
 from .library import FixedLibrary
+from .registry import LibraryRegistry
 from .retrieval import (
     EMPTY_MESSAGE,
     _authorizer,
@@ -148,7 +149,9 @@ def _chunk_source(
     return result
 
 
-def _make_section(snapshot_id: str, rows: list[sqlite3.Row]) -> _Section:
+def _make_section(
+    library_id: str, snapshot_id: str, rows: list[sqlite3.Row]
+) -> _Section:
     first = rows[0]
     heading_path = tuple(
         _parse_json_list(first["heading_path"], label="heading_path")
@@ -156,6 +159,7 @@ def _make_section(snapshot_id: str, rows: list[sqlite3.Row]) -> _Section:
     section_kind = "pdf_page" if first["material_type"] == "pdf" else "heading"
     identity = json.dumps(
         [
+            library_id,
             snapshot_id,
             first["document_id"],
             first["asset_id"],
@@ -180,7 +184,9 @@ def _make_section(snapshot_id: str, rows: list[sqlite3.Row]) -> _Section:
     )
 
 
-def _sections(snapshot_id: str, rows: list[sqlite3.Row]) -> list[_Section]:
+def _sections(
+    library_id: str, snapshot_id: str, rows: list[sqlite3.Row]
+) -> list[_Section]:
     sections: list[_Section] = []
     pending: list[sqlite3.Row] = []
     pending_key: tuple[object, ...] | None = None
@@ -197,12 +203,12 @@ def _sections(snapshot_id: str, rows: list[sqlite3.Row]) -> list[_Section]:
         else:
             key = (row["asset_id"], "heading", heading_path)
         if pending and key != pending_key:
-            sections.append(_make_section(snapshot_id, pending))
+            sections.append(_make_section(library_id, snapshot_id, pending))
             pending = []
         pending_key = key
         pending.append(row)
     if pending:
-        sections.append(_make_section(snapshot_id, pending))
+        sections.append(_make_section(library_id, snapshot_id, pending))
     return sections
 
 
@@ -245,22 +251,25 @@ def _section_item(section: _Section) -> dict[str, Any]:
 
 
 class ReadOnlyEvidenceTools:
-    """Eight path-free, closed-world operations over one fixed local library."""
+    """Eight path-free operations over the fixed local library registry."""
 
-    def __init__(self, library: Path) -> None:
-        self._library = FixedLibrary(library)
+    def __init__(self, application_root: Path | None = None) -> None:
+        self._registry = LibraryRegistry(application_root)
 
-    def require_ready_library(self) -> None:
-        status = self._library.status()
-        if status.get("ready") is not True:
-            raise SnapshotError("固定资料库尚未安全建立。")
+    def _library(self, library_id: str) -> FixedLibrary:
+        return FixedLibrary(self._registry.library_path(library_id))
 
     @contextlib.contextmanager
     def _database(
-        self, snapshot_id: str
+        self, library_id: str, snapshot_id: str
     ) -> Iterator[tuple[dict[str, Any], sqlite3.Connection]]:
-        snapshot = self._library._snapshot_directory(snapshot_id)
+        snapshot, record, _catalog = self._library(library_id)._published_snapshot(
+            snapshot_id
+        )
         status, database = _open_verified_snapshot(snapshot)
+        if status["manifest_sha256"] != record["manifest_sha256"]:
+            database.close()
+            raise SnapshotError("快照内容与目录册绑定不一致。")
         try:
             database.set_authorizer(_authorizer)
             yield status, database
@@ -279,6 +288,7 @@ class ReadOnlyEvidenceTools:
 
     def search_documents(
         self,
+        library_id: str,
         snapshot_id: str,
         query: str,
         *,
@@ -286,15 +296,18 @@ class ReadOnlyEvidenceTools:
         excerpt_chars: int = 1000,
     ) -> dict[str, Any]:
         query = _validated_tool_query(query)
-        return self._library.search(
+        result = self._library(library_id).search(
             snapshot_id,
             query,
             top_k=top_k,
             excerpt_chars=excerpt_chars,
         )
+        result["library_id"] = library_id
+        return result
 
     def get_excerpt(
         self,
+        library_id: str,
         snapshot_id: str,
         document_id: str,
         chunk_id: str,
@@ -304,7 +317,7 @@ class ReadOnlyEvidenceTools:
         document_id = _validated_document_id(document_id)
         chunk_id = _validated_chunk_id(chunk_id)
         max_chars = _bounded_int(max_chars, name="max_chars", maximum=1200)
-        with self._database(snapshot_id) as (status, database):
+        with self._database(library_id, snapshot_id) as (status, database):
             row = database.execute(
                 _CHUNK_SOURCE_SQL + " WHERE c.chunk_id=?",
                 (chunk_id,),
@@ -315,6 +328,7 @@ class ReadOnlyEvidenceTools:
             raise SearchInputError("chunk_id 不属于指定的 document_id。")
         return {
             "found": True,
+            "library_id": library_id,
             "snapshot_id": status["snapshot_id"],
             "result": _chunk_source(row, row["chunk_text"][:max_chars]),
             "truncated": len(row["chunk_text"]) > max_chars,
@@ -322,6 +336,7 @@ class ReadOnlyEvidenceTools:
 
     def get_multiple_excerpts(
         self,
+        library_id: str,
         snapshot_id: str,
         document_id: str,
         chunk_ids: list[str],
@@ -334,7 +349,7 @@ class ReadOnlyEvidenceTools:
             per_item_chars, name="per_item_chars", maximum=1200
         )
         placeholders = ",".join("?" for _ in chunk_ids)
-        with self._database(snapshot_id) as (status, database):
+        with self._database(library_id, snapshot_id) as (status, database):
             rows = database.execute(
                 _CHUNK_SOURCE_SQL + f" WHERE c.chunk_id IN ({placeholders})",
                 tuple(chunk_ids),
@@ -354,16 +369,17 @@ class ReadOnlyEvidenceTools:
             results.append(result)
         return {
             "found": True,
+            "library_id": library_id,
             "snapshot_id": status["snapshot_id"],
             "document_id": document_id,
             "results": results,
         }
 
     def get_document_metadata(
-        self, snapshot_id: str, document_id: str
+        self, library_id: str, snapshot_id: str, document_id: str
     ) -> dict[str, Any]:
         document_id = _validated_document_id(document_id)
-        with self._database(snapshot_id) as (status, database):
+        with self._database(library_id, snapshot_id) as (status, database):
             document = database.execute(
                 """SELECT document_id,title,identifiers,source_name,source_type,
                 media_type,material_type,language,topics,evidence_role,
@@ -384,6 +400,7 @@ class ReadOnlyEvidenceTools:
             ).fetchall()
         return {
             "found": True,
+            "library_id": library_id,
             "snapshot_id": status["snapshot_id"],
             "document": {
                 "document_id": document["document_id"],
@@ -416,6 +433,7 @@ class ReadOnlyEvidenceTools:
 
     def get_document_toc(
         self,
+        library_id: str,
         snapshot_id: str,
         document_id: str,
         *,
@@ -423,13 +441,14 @@ class ReadOnlyEvidenceTools:
     ) -> dict[str, Any]:
         document_id = _validated_document_id(document_id)
         max_items = _bounded_int(max_items, name="max_items", maximum=100)
-        with self._database(snapshot_id) as (status, database):
+        with self._database(library_id, snapshot_id) as (status, database):
             rows = self._document_rows(database, document_id)
         if not rows:
             raise SearchInputError("所选快照中不存在该 document_id。")
-        sections = _sections(status["snapshot_id"], rows)
+        sections = _sections(library_id, status["snapshot_id"], rows)
         return {
             "found": True,
+            "library_id": library_id,
             "snapshot_id": status["snapshot_id"],
             "document_id": document_id,
             "title": rows[0]["title"],
@@ -443,6 +462,7 @@ class ReadOnlyEvidenceTools:
 
     def read_document_section(
         self,
+        library_id: str,
         snapshot_id: str,
         document_id: str,
         section_id: str,
@@ -452,14 +472,14 @@ class ReadOnlyEvidenceTools:
         document_id = _validated_document_id(document_id)
         section_id = _validated_section_id(section_id)
         max_chars = _bounded_int(max_chars, name="max_chars", maximum=1200)
-        with self._database(snapshot_id) as (status, database):
+        with self._database(library_id, snapshot_id) as (status, database):
             rows = self._document_rows(database, document_id)
         if not rows:
             raise SearchInputError("所选快照中不存在该 document_id。")
         selected = next(
             (
                 section
-                for section in _sections(status["snapshot_id"], rows)
+                for section in _sections(library_id, status["snapshot_id"], rows)
                 if section.section_id == section_id
             ),
             None,
@@ -481,6 +501,7 @@ class ReadOnlyEvidenceTools:
         returned_chars = max_chars - remaining
         return {
             "found": True,
+            "library_id": library_id,
             "snapshot_id": status["snapshot_id"],
             "document_id": document_id,
             "section": _section_item(selected),
@@ -491,6 +512,7 @@ class ReadOnlyEvidenceTools:
 
     def find_in_document(
         self,
+        library_id: str,
         snapshot_id: str,
         document_id: str,
         query: str,
@@ -505,7 +527,7 @@ class ReadOnlyEvidenceTools:
             excerpt_chars, name="excerpt_chars", maximum=1200
         )
         expression = _fts_expression(query)
-        with self._database(snapshot_id) as (status, database):
+        with self._database(library_id, snapshot_id) as (status, database):
             document = database.execute(
                 "SELECT 1 FROM document WHERE document_id=?", (document_id,)
             ).fetchone()
@@ -514,6 +536,7 @@ class ReadOnlyEvidenceTools:
             if expression is None:
                 return _empty(
                     status["snapshot_id"],
+                    library_id=library_id,
                     document_id=document_id,
                     retrieval_mode="bm25",
                 )
@@ -530,11 +553,13 @@ class ReadOnlyEvidenceTools:
         if not rows:
             return _empty(
                 status["snapshot_id"],
+                library_id=library_id,
                 document_id=document_id,
                 retrieval_mode="bm25",
             )
         return {
             "found": True,
+            "library_id": library_id,
             "snapshot_id": status["snapshot_id"],
             "document_id": document_id,
             "retrieval_mode": "bm25",
@@ -548,32 +573,75 @@ class ReadOnlyEvidenceTools:
             ],
         }
 
-    def retrieval_status(self, snapshot_id: str) -> dict[str, Any]:
-        with self._database(snapshot_id) as (status, _database):
-            library_status = self._library.status()
-        return {
-            "found": True,
-            "ready": True,
-            "snapshot_id": status["snapshot_id"],
-            "verified": status["verified"],
+    def retrieval_status(
+        self,
+        library_id: str | None = None,
+        snapshot_id: str | None = None,
+    ) -> dict[str, Any]:
+        common = {
             "readonly": True,
             "closed_world": True,
             "transport": "stdio",
+            "service_version": __version__,
+            "mcp_sdk_version": importlib.metadata.version("mcp"),
+        }
+        if library_id is None and snapshot_id is not None:
+            raise SearchInputError("只提供 snapshot_id 无法确定所属资料库。")
+        if library_id is None:
+            libraries = []
+            for item in self._registry.list_libraries():
+                status = FixedLibrary(Path(item["library_root"])).catalog_status()
+                libraries.append(
+                    {
+                        "library_id": item["library_id"],
+                        "name": item["name"],
+                        "description": item["description"],
+                        "current_snapshot_id": status["current_snapshot_id"],
+                        "last_successful_snapshot_id": status[
+                            "last_successful_snapshot_id"
+                        ],
+                    }
+                )
+            return {"scope": "libraries", "libraries": libraries, **common}
+
+        library = self._library(library_id)
+        if snapshot_id is None:
+            status = library.catalog_status()
+            return {
+                "scope": "snapshots",
+                "library_id": library_id,
+                "current_snapshot_id": status["current_snapshot_id"],
+                "last_successful_snapshot_id": status[
+                    "last_successful_snapshot_id"
+                ],
+                "snapshots": library.list_snapshots(),
+                **common,
+            }
+
+        status = library.verify(snapshot_id)
+        return {
+            "scope": "snapshot",
+            "found": True,
+            "ready": True,
+            "library_id": library_id,
+            "snapshot_id": status["snapshot_id"],
+            "verified": status["verified"],
+            "current": status["current"],
+            "last_successful": status["last_successful"],
+            "base_snapshot_id": status["base_snapshot_id"],
             "retrieval_mode": "bm25",
             "schema_version": status["schema_version"],
             "counts": status["counts"],
             "manifest_sha256": status["manifest_sha256"],
             "corpus_sha256": status["corpus_sha256"],
             "database_sha256": status["database_sha256"],
-            "snapshot_candidate_count": library_status.get("snapshot_count", 0),
-            "service_version": __version__,
-            "mcp_sdk_version": importlib.metadata.version("mcp"),
             "known_limitations": [
                 "SQLite FTS5 unicode61 没有专门中文分词。",
                 "空结果只表示本次检索未返回证据。",
                 "PDF 导航按已索引页码派生，不是作者提供的目录。",
                 "本服务不会提升全文或公式核验状态。",
             ],
+            **common,
         }
 
 

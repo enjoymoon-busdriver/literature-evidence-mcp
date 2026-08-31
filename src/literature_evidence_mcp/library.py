@@ -4,16 +4,21 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
+from .catalog import (
+    SNAPSHOT_ID_PATTERN,
+    load_snapshot_catalog,
+    snapshot_catalog_lock,
+    snapshot_record,
+    write_snapshot_catalog,
+)
 from .errors import ImportPolicyError, LiteratureEvidenceError, SnapshotError
 from .retrieval import search_snapshot
 from .snapshot import build_snapshot, verify_snapshot
 
 
-_SNAPSHOT_ID = re.compile(
-    r"\A[0-9]{8}T[0-9]{12}Z-[0-9a-f]{12}-[0-9a-f]{8}\Z"
-)
+_SNAPSHOT_ID = SNAPSHOT_ID_PATTERN
 _CONTIGUOUS_CJK = re.compile(
     r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]{2,}"
 )
@@ -98,6 +103,31 @@ class FixedLibrary:
             raise SnapshotError("所选快照必须是普通目录且不能是符号链接。")
         return candidate
 
+    def _published_snapshot(
+        self, snapshot_id: str
+    ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+        catalog = load_snapshot_catalog(self._root)
+        record = snapshot_record(catalog, snapshot_id)
+        return self._snapshot_directory(snapshot_id), record, catalog
+
+    @staticmethod
+    def _catalog_bound_status(
+        status: dict[str, Any], record: dict[str, Any]
+    ) -> dict[str, Any]:
+        if status["manifest_sha256"] != record["manifest_sha256"]:
+            raise SnapshotError("快照内容与目录册绑定不一致。")
+        return status
+
+    def catalog_status(self) -> dict[str, Any]:
+        catalog = load_snapshot_catalog(self._root)
+        return {
+            "snapshot_count": len(catalog["snapshots"]),
+            "current_snapshot_id": catalog["current_snapshot_id"],
+            "last_successful_snapshot_id": catalog[
+                "last_successful_snapshot_id"
+            ],
+        }
+
     def status(self) -> dict[str, Any]:
         """Return a cheap path-free status without verifying snapshot contents."""
         try:
@@ -129,44 +159,62 @@ class FixedLibrary:
         }
 
     def list_snapshots(self) -> list[dict[str, Any]]:
-        """Verify safe, direct snapshot children and return newest IDs first."""
-        snapshots = self._snapshots_directory(allow_missing=True)
-        if snapshots is None:
-            return []
+        """Return only cataloged successful snapshots, newest first."""
         try:
-            with os.scandir(snapshots) as entries:
-                names = sorted(
-                    (
-                        entry.name
-                        for entry in entries
-                        if _SNAPSHOT_ID.fullmatch(entry.name) is not None
-                        and entry.is_dir(follow_symlinks=False)
-                    ),
-                    reverse=True,
-                )
+            self._root.lstat()
+        except FileNotFoundError:
+            return []
         except OSError as exc:
-            raise SnapshotError("无法列出固定资料库中的快照。") from exc
-
+            raise SnapshotError("无法读取固定资料库状态。") from exc
+        catalog = load_snapshot_catalog(self._root)
         results: list[dict[str, Any]] = []
-        for snapshot_id in names:
+        for record in reversed(catalog["snapshots"]):
+            snapshot_id = record["snapshot_id"]
             try:
-                result = verify_snapshot(self._snapshot_directory(snapshot_id))
+                result = self._catalog_bound_status(
+                    verify_snapshot(self._snapshot_directory(snapshot_id)), record
+                )
             except (LiteratureEvidenceError, OSError):
                 results.append(
                     {
                         "snapshot_id": snapshot_id,
                         "verified": False,
                         "counts": None,
+                        "base_snapshot_id": record["base_snapshot_id"],
+                        "current": snapshot_id
+                        == catalog["current_snapshot_id"],
+                        "last_successful": snapshot_id
+                        == catalog["last_successful_snapshot_id"],
                         "error": "快照未通过核验。",
                     }
                 )
             else:
-                results.append(_public_result(result))
+                public = _public_result(result)
+                public.update(
+                    {
+                        "base_snapshot_id": record["base_snapshot_id"],
+                        "current": snapshot_id
+                        == catalog["current_snapshot_id"],
+                        "last_successful": snapshot_id
+                        == catalog["last_successful_snapshot_id"],
+                    }
+                )
+                results.append(public)
         return results
 
     def verify(self, snapshot_id: str) -> dict[str, Any]:
-        result = verify_snapshot(self._snapshot_directory(snapshot_id))
-        return _public_result(result)
+        snapshot, record, catalog = self._published_snapshot(snapshot_id)
+        result = self._catalog_bound_status(verify_snapshot(snapshot), record)
+        public = _public_result(result)
+        public.update(
+            {
+                "base_snapshot_id": record["base_snapshot_id"],
+                "current": snapshot_id == catalog["current_snapshot_id"],
+                "last_successful": snapshot_id
+                == catalog["last_successful_snapshot_id"],
+            }
+        )
+        return public
 
     def search(
         self,
@@ -176,11 +224,13 @@ class FixedLibrary:
         top_k: int = 5,
         excerpt_chars: int = 1000,
     ) -> dict[str, Any]:
+        snapshot, record, _catalog = self._published_snapshot(snapshot_id)
         result = search_snapshot(
-            self._snapshot_directory(snapshot_id),
+            snapshot,
             query,
             top_k=top_k,
             excerpt_chars=excerpt_chars,
+            expected_manifest_sha256=record["manifest_sha256"],
         )
         public = _public_result(result)
         if public.get("found") is False and isinstance(query, str):
@@ -188,12 +238,47 @@ class FixedLibrary:
                 public["input_hint"] = "连续中文检索召回有限，可尝试在关键词间加空格。"
         return public
 
-    def build(self, controlled_sources: Sequence[Path]) -> dict[str, Any]:
+    def build(
+        self,
+        controlled_sources: Sequence[Path],
+        *,
+        base_snapshot_id: str | None = None,
+        replacements: Mapping[str, Path] | None = None,
+        remove_document_ids: Sequence[str] = (),
+    ) -> dict[str, Any]:
         """Build from paths already confined and validated by the upload layer."""
         if not all(isinstance(source, Path) for source in controlled_sources):
             raise ImportPolicyError("构建输入必须来自受控临时文件。")
-        result = build_snapshot(self._root, tuple(controlled_sources))
+        result = build_snapshot(
+            self._root,
+            tuple(controlled_sources),
+            base_snapshot_id=base_snapshot_id,
+            replacements=replacements,
+            remove_document_ids=remove_document_ids,
+        )
         return _public_result(result)
+
+    def activate(self, snapshot_id: str) -> dict[str, Any]:
+        """Explicitly move current to one verified successful snapshot."""
+        with snapshot_catalog_lock(self._root):
+            snapshot, record, catalog = self._published_snapshot(snapshot_id)
+            self._catalog_bound_status(verify_snapshot(snapshot), record)
+            if catalog["current_snapshot_id"] != snapshot_id:
+                next_catalog = {
+                    **catalog,
+                    "current_snapshot_id": snapshot_id,
+                    "snapshots": [dict(item) for item in catalog["snapshots"]],
+                }
+                write_snapshot_catalog(self._root, next_catalog)
+                catalog = next_catalog
+        return {
+            "snapshot_id": snapshot_id,
+            "current_snapshot_id": catalog["current_snapshot_id"],
+            "last_successful_snapshot_id": catalog[
+                "last_successful_snapshot_id"
+            ],
+            "verified": True,
+        }
 
 
 __all__ = ["FixedLibrary"]
