@@ -2,9 +2,9 @@
 
 一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 写入资料库自己的内容寻址对象区，生成完整冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
 
-项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–6；下一轮阶段 7–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
+项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–7；下一轮阶段 8–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
 
-## 当前已实现：历史阶段一至阶段四与产品化阶段 1–6
+## 当前已实现：历史阶段一至阶段四与产品化阶段 1–7
 
 - 显式导入 UTF-8 Markdown 和带文本层 PDF。
 - 每次 `build` 都新建快照；不覆盖或修改旧快照。
@@ -32,6 +32,8 @@
 - 显式 `mode="enhanced"` 可使用构造参数注入的三角色链：原问题改写一次、改写问题查询向量一次、所选快照的有界候选重排一次。三次串行、零自动重试、首错停止，且不以 BM25 暗中补候选或回退。
 - 增强链在第一次 transport 前核验明确 `library_id + snapshot_id`、完整快照和精确阶段 4 vector profile/artifact；结果只从该冻结快照投影，并返回不含正文、路径或秘密的调用审计。
 - 运行时代码只定义 provider-neutral transport 合同，以及构造注入的非秘密 provider、三个 model ID、精确 profile 和候选/字符边界；没有任何真实供应商 HTTP adapter、密钥读取或真实模型 ID 配置。生产 Web/stdio 入口未注入 transport，显式 enhanced 会明确返回“尚未配置或不可用”。
+- 独立 Stage 7 入口用一次性临时应用根生成两库、三快照和中英/双向跨语言合成题集，实际运行本地 BM25，并让增强模式完整经过 Stage 6 的三调用 recording fake；不加入 Web 或八个 MCP 工具。
+- Stage 7 JSON 报告按模式记录 hit@k、recall@k、MRR、真实空准确率、库/快照隔离违规和 anchor/页码可追溯覆盖，并固定标为 `offline_simulated`、真实模型调用 0、网络调用 0。它只验收离线管线，不能推出真实模型质量提升。
 - Finder 可双击的 [`启动文献证据管理页.command`](./启动文献证据管理页.command)：从自身位置确定完整项目，路径含空格也可使用。
 - 首次运行先核对 macOS、arm64、Python 3.11+、SQLite `serialize/deserialize` 和 FTS5，再在项目 `.venv/` 中做非 editable 安装。
 - 双击入口使用稳定的用户应用根，端口绑定成功后才打开默认浏览器；终端前台运行，`Ctrl+C` 即停止。
@@ -134,6 +136,14 @@ python -m pip install -e '.[test]'
 python -m unittest discover -s tests -v
 ```
 
+运行 Stage 7 合成离线搜索质量验收（JSON 报告写到标准输出，成功退出码为 0，验收失败为非 0）：
+
+```bash
+PYTHONPATH=src python -m literature_evidence_mcp.quality_eval
+```
+
+该命令只在系统临时目录建立可分享的合成 Markdown/PDF、资料库、快照和离线向量，结束时自动清理；不会读取或写入用户真实应用根、仓库业务数据、密钥或网络。报告中的 simulated enhanced 命中由逐题脚本 fake 驱动，只能说明三调用、隔离、真实空和引用边界按合同工作。逐题 `case_pass` 表示合同完成或已知 BM25 局限被如实记录，不表示预期文档一定命中；质量观测要看分模式的 positive hit@k 与 MRR。报告内的“小白说明”解释这些区别。
+
 自动验收可显式指定测试用 Python，但该变量不会写入 shell 配置，也不会修改 `PATH`：
 
 ```bash
@@ -216,7 +226,7 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 3. **阶段三（已完成）**：八类 closed-world stdio 只读 MCP 能力；`search_documents` 与 `find_in_document` 只走本地 BM25，不含 combo、API Key 或 Tunnel。
 4. **阶段四（已完成）**：macOS Apple Silicon 开发版 `.command` 入口、首次预检/受控安装、标准用户应用根和前台管理页启动。自包含、签名/公证 App、DMG 或 pkg 仍属范围外。
 
-下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1–6 已依次实现多资料库核心、双级快照生命周期、库内对象复用、离线同配置向量复用、小白多资料库导入界面和离线可替换三角色增强链，阶段 7–9 尚未实现。阶段 6 没有真实 provider adapter、真实模型/密钥、真实 Keychain 或真实链路质量结论。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
+下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1–7 已依次实现多资料库核心、双级快照生命周期、库内对象复用、离线同配置向量复用、小白多资料库导入界面、离线可替换三角色增强链和合成离线搜索质量验收，阶段 8–9 尚未实现。阶段 6–7 都没有真实 provider adapter、真实模型/密钥、真实 Keychain 或真实链路质量结论。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
 
 OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完整聊天界面、自动删除/垃圾回收、App/DMG 打包、签名、公证和发布不在阶段 0–9 范围内。
 
