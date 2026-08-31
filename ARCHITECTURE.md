@@ -1,7 +1,7 @@
 # 最小架构合同
 
 本合同前半部分记录 `0.1.0.dev0` 历史阶段一至阶段三的已实现边界。阶段二在阶段一
-`build_snapshot` / `verify_snapshot` / `search_snapshot` 核心之外增加固定资料库应用层和本机管理页；阶段三再增加八个本地 stdio、closed-world、只读 MCP 工具。历史阶段四只增加 macOS 开发版启动入口，没有改变快照格式、SQLite schema、分块规则或 BM25 算法。文末“下一轮产品化阶段 0 合同”冻结后续阶段 1–9 的目标；阶段 1–7 已实现，阶段 8–9 尚未实现。前半部分的固定单库 HTTP/MCP schema 只保留为历史阶段记录；当前运行合同以产品化“阶段 2–7 实现”小节为准。
+`build_snapshot` / `verify_snapshot` / `search_snapshot` 核心之外增加固定资料库应用层和本机管理页；阶段三再增加八个本地 stdio、closed-world、只读 MCP 工具。历史阶段四只增加 macOS 开发版启动入口，没有改变快照格式、SQLite schema、分块规则或 BM25 算法。文末“下一轮产品化阶段 0 合同”冻结后续阶段 1–9 的目标；阶段 1–8 已实现，阶段 9 尚未实现。前半部分的固定单库 HTTP/MCP schema 只保留为历史阶段记录；当前运行合同以产品化“阶段 2–8 实现”小节为准。
 
 ## 信任边界
 
@@ -96,7 +96,7 @@ annotations 只是 host 的行为提示，不承担安全控制；上面的固�
 
 ### 状态与冻结基线
 
-下一轮使用阶段 0–9 编号，与上文已经完成的历史阶段一至四不是同一组阶段。阶段 0 只冻结合同，不修改运行时代码、快照、SQLite schema 或 MCP schema；阶段 1–7 已按顺序实现，阶段 8–9 仍须依次实现和验收，不能把后阶段能力提前混入前阶段。
+下一轮使用阶段 0–9 编号，与上文已经完成的历史阶段一至四不是同一组阶段。阶段 0 只冻结合同，不修改运行时代码、快照、SQLite schema 或 MCP schema；阶段 1–8 已按顺序实现，阶段 9 仍须单独实现和验收，不能把后阶段能力提前混入前阶段。
 
 冻结前基线是 commit `641eceb5fd5786f3da83c7c948e396c3740a0341`。该基线的 README、本文档和当前运行时 MCP schema 已只读核对；MCP 运行时恰好列出八个工具，使用 Python 3.12 并强制加载该工作树源码时，完整测试为 62/62 通过。
 
@@ -192,6 +192,16 @@ JSON 报告按模式分列 positive hit@k/recall@k、MRR、首次命中 rank、�
 
 报告固定写明 `evidence_level=offline_simulated`、`real_model_calls=0`、`network_calls=0` 和“不能推出真实模型质量提升”。它证明的是合成夹具上的管线合同、隔离和可追溯性，不是公开语料评测、真实 provider 适配、真实模型效果或生产链路验证。阶段 7 不改变八个 MCP 工具及其 schema，不新增依赖、缓存、日志或持久报告。
 
+### 阶段 8 本地 MCP 新手向导与离线自检实现
+
+管理页的 Stage 8 向导只从代码常量生成两个等价、可复制的本地 stdio 配置：`codex mcp add literature-evidence -- literature-evidence-mcp` 和只含 `command = "literature-evidence-mcp"` 的 TOML。两者复用现有安装后的 console entry，不包含 key、用户资料路径、源码/虚拟环境绝对路径、任意 command、args 或 env。复制使用浏览器 Clipboard API，只改变页面提示为“已复制但尚未配置”；后端不运行 shell、不调用 `codex mcp add`，也不读写任何外部客户端配置。
+
+这条配置只面向同一 host 上支持 stdio 的 ChatGPT desktop、Codex CLI 与 Codex IDE 扩展。根据 [OpenAI 官方 MCP 文档](https://developers.openai.com/codex/mcp/)，这些本地客户端共享 Codex MCP 配置，而 ChatGPT web 使用插件且不读取本机 Codex 配置。因此网页端远程插件/Tunnel 明确保留给尚未实现的 Stage 9；Stage 8 不声称真实客户端已经连接。
+
+无参数 `POST /api/mcp-self-check` 仍经过同源 session、Origin、CSRF 和专用 action intent；任何 query 或 body 都拒绝，不能注入 command、path 或 env。自检在线程中创建一次性临时应用根和合成 Markdown，建立一座合成资料库与冻结快照，再以受控白名单环境启动真实 `literature_evidence_mcp.mcp_server` stdio 子进程。客户端先核验工具名恰好八个、全部 `readOnlyHint=true`/`destructiveHint=false` 且仅 `search_documents` 为 open-world，再依次调用 `retrieval_status`、省略/显式 BM25 的 `search_documents` 和 `get_excerpt`。最后比较合成应用树读取前后的类型与内容摘要；首错停止、零重试，不调用 enhanced、模型、网络或 key。
+
+自检响应只含固定中文步骤、布尔状态与计数，不返回临时路径、合成正文、stderr、raw exception 或 traceback。异常响应同样固定脱敏。前端每次自检递增 request ID，并用 `AbortController` 终止旧浏览器请求；即使旧响应最后到达，也必须经过 request ID 核对后丢弃。通过信息固定说明它只证明本项目的本地离线 stdio 合成链可用，不等于 ChatGPT desktop、Codex CLI 或 IDE 已配置。
+
 ### 阶段 0–9 顺序与最小验收
 
 | 阶段 | 最小交付 | 进入下一阶段前的最小验收 |
@@ -204,7 +214,7 @@ JSON 报告按模式分列 positive hit@k/recall@k、MRR、首次命中 rank、�
 | 5. 小白导入界面（已完成） | 在现有本地网页中创建/切换资料库，拖放或选择文件，显示逐文件阶段、失败原因、快照差异和新增/复用统计 | 从空白状态仅用界面建立两个库和多个快照；无需终端；部分失败不会发布残缺快照或破坏旧快照 |
 | 6. 三模型增强搜索（已完成） | 问题改写、向量召回、候选重排的一套可替换传输层；BM25 与增强模式分离 | 用离线假服务验证调用次数、外发边界、首错停止、无自动重试和无静默回退；真实模型、真实密钥和真实钥匙串不在本轮验收 |
 | 7. 搜索质量验收（已完成） | 公开或合成的多库、中英文、跨语言正例和负例；BM25/增强对比与指标报告 | 离线证明不串库/快照、引用可回到页码或 anchor、负例可真实为空，且评测流程可重复；不得把假模型结果宣称为真实模型质量提升 |
-| 8. 本地 MCP 向导 | 为支持 stdio 的 host 生成可复制配置，提供八工具本地自检和连接状态；不自动改其他软件配置 | 用项目内本地 stdio 测试客户端和离线 host 替身验证生成配置可依次列库、列快照、核验、搜索和读证据；自检保持只读且不产生资料库写入，真实 host 配置留待后续用户复核 |
+| 8. 本地 MCP 向导（已完成） | 为同一 host 的本地客户端生成 path/key/env-free 可复制配置；真实启动项目 stdio server，提供八工具离线合成自检；不自动改其他软件配置 | 真实 stdio 客户端核验八工具 annotations，并完成状态、默认/显式 BM25 搜索和读证据；树身份不变、首错停止、错误脱敏、网络/模型/key/外部配置写入均为零；真实客户端配置仍留给用户复核 |
 | 9. ChatGPT Secure MCP Tunnel 向导 | Tunnel 配置、权限提示、启动/停止与健康状态流程；生产适配器和离线替身分离 | 仅用离线替身验证状态机、脱敏错误和停止流程；模拟结果只能标为“模拟通过”，不得显示真实“已连接”；到此停止，不启动真实 Tunnel |
 
 ### 阶段 9 后的停止闸门

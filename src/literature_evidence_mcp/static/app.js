@@ -16,6 +16,10 @@ const state = {
   searching: false,
   enhancedAvailable: false,
   enhancedSimulated: null,
+  mcpGuide: null,
+  mcpSelfCheckRequestId: 0,
+  mcpSelfCheckController: null,
+  mcpSelfChecking: false,
 };
 
 const elements = {
@@ -35,6 +39,14 @@ const elements = {
   libraryName: document.querySelector("#library-name"),
   librarySelect: document.querySelector("#library-select"),
   libraryStatus: document.querySelector("#library-status"),
+  mcpCli: document.querySelector("#mcp-cli"),
+  mcpCopyStatus: document.querySelector("#mcp-copy-status"),
+  mcpSelfCheckButton: document.querySelector("#mcp-self-check-button"),
+  mcpSelfCheckReport: document.querySelector("#mcp-self-check-report"),
+  mcpSelfCheckStatus: document.querySelector("#mcp-self-check-status"),
+  mcpToml: document.querySelector("#mcp-toml"),
+  copyMcpCliButton: document.querySelector("#copy-mcp-cli-button"),
+  copyMcpTomlButton: document.querySelector("#copy-mcp-toml-button"),
   query: document.querySelector("#query"),
   refreshButton: document.querySelector("#refresh-button"),
   searchButton: document.querySelector("#search-button"),
@@ -118,6 +130,21 @@ function enhancedRunLabel(simulated) {
   return "增强状态未知";
 }
 
+function renderMcpGuide(guide) {
+  state.mcpGuide = guide && guide.state === "copy_only_not_configured"
+    ? guide
+    : null;
+  elements.mcpCli.value = state.mcpGuide ? state.mcpGuide.cli : "";
+  elements.mcpToml.value = state.mcpGuide ? state.mcpGuide.toml : "";
+  const unavailable = !state.mcpGuide;
+  elements.copyMcpCliButton.disabled = unavailable;
+  elements.copyMcpTomlButton.disabled = unavailable;
+  elements.mcpSelfCheckButton.disabled = unavailable || state.mcpSelfChecking;
+  if (unavailable) {
+    setNotice(elements.mcpCopyStatus, "本地 MCP 配置模板当前不可用。", true);
+  }
+}
+
 async function loadStatus() {
   const payload = await api("/api/status");
   state.csrfToken = payload.csrf_token;
@@ -127,6 +154,7 @@ async function loadStatus() {
     : null;
   state.enhancedAvailable =
     payload.enhanced_available === true && state.enhancedSimulated !== null;
+  renderMcpGuide(payload.mcp_guide);
   elements.enhancedModeOption.disabled = !state.enhancedAvailable;
   elements.enhancedModeOption.textContent = state.enhancedAvailable
     ? (state.enhancedSimulated
@@ -859,6 +887,112 @@ async function search() {
   }
 }
 
+async function copyMcpConfig(text, label) {
+  if (!text || !navigator.clipboard || !navigator.clipboard.writeText) {
+    setNotice(
+      elements.mcpCopyStatus,
+      "浏览器未提供复制权限；请手动选择文本复制。未修改任何客户端配置。",
+      true,
+    );
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    setNotice(
+      elements.mcpCopyStatus,
+      `${label}已复制，但尚未配置；本页没有执行命令或写入客户端配置。`,
+    );
+  } catch (_error) {
+    setNotice(
+      elements.mcpCopyStatus,
+      "复制未完成；请手动选择文本复制。未修改任何客户端配置。",
+      true,
+    );
+  }
+}
+
+function renderMcpSelfCheck(report) {
+  elements.mcpSelfCheckReport.replaceChildren();
+  elements.mcpSelfCheckReport.hidden = false;
+  appendText(
+    elements.mcpSelfCheckReport,
+    "h3",
+    report.passed
+      ? "本地离线 STDIO 自检通过"
+      : "本地离线 STDIO 自检未通过",
+  );
+  const summary = [
+    `工具数：${report.tool_count === null ? "未取得" : report.tool_count}`,
+    `网络调用：${report.network_calls}`,
+    `模型调用：${report.model_calls}`,
+    `API key 使用：${report.api_keys_used}`,
+    `外部配置写入：${report.external_config_writes}`,
+    `重试：${report.retry_count}`,
+  ];
+  appendText(elements.mcpSelfCheckReport, "p", summary.join("；"));
+  const list = document.createElement("ol");
+  for (const step of Array.isArray(report.steps) ? report.steps : []) {
+    appendText(
+      list,
+      "li",
+      `${step.passed ? "通过" : "未通过"}：${step.name}。${step.message}`,
+    );
+  }
+  elements.mcpSelfCheckReport.append(list);
+}
+
+async function runMcpSelfCheck() {
+  const requestId = ++state.mcpSelfCheckRequestId;
+  if (state.mcpSelfCheckController) {
+    state.mcpSelfCheckController.abort();
+  }
+  const controller = new AbortController();
+  state.mcpSelfCheckController = controller;
+  state.mcpSelfChecking = true;
+  elements.mcpSelfCheckButton.disabled = true;
+  elements.mcpSelfCheckReport.replaceChildren();
+  elements.mcpSelfCheckReport.hidden = true;
+  setNotice(
+    elements.mcpSelfCheckStatus,
+    "正在用临时合成资料启动真实本地 STDIO MCP；首错停止、不会重试……",
+  );
+  try {
+    const payload = await api("/api/mcp-self-check", {
+      method: "POST",
+      headers: actionHeaders("mcp-self-check"),
+      signal: controller.signal,
+    });
+    if (requestId !== state.mcpSelfCheckRequestId) {
+      return;
+    }
+    const report = payload.self_check;
+    renderMcpSelfCheck(report);
+    setNotice(
+      elements.mcpSelfCheckStatus,
+      report.message,
+      report.passed !== true,
+    );
+  } catch (error) {
+    if (
+      error.name === "AbortError" ||
+      requestId !== state.mcpSelfCheckRequestId
+    ) {
+      return;
+    }
+    setNotice(
+      elements.mcpSelfCheckStatus,
+      `${error.message} 未写入任何客户端配置。`,
+      true,
+    );
+  } finally {
+    if (requestId === state.mcpSelfCheckRequestId) {
+      state.mcpSelfChecking = false;
+      state.mcpSelfCheckController = null;
+      elements.mcpSelfCheckButton.disabled = !state.mcpGuide;
+    }
+  }
+}
+
 async function refreshAll() {
   try {
     await loadStatus();
@@ -886,6 +1020,13 @@ elements.searchButton.addEventListener("click", search);
 elements.query.addEventListener("input", invalidateSearch);
 elements.searchMode.addEventListener("change", invalidateSearch);
 elements.snapshotSelect.addEventListener("change", invalidateSearch);
+elements.copyMcpCliButton.addEventListener("click", () => {
+  copyMcpConfig(elements.mcpCli.value, "CLI");
+});
+elements.copyMcpTomlButton.addEventListener("click", () => {
+  copyMcpConfig(elements.mcpToml.value, "TOML");
+});
+elements.mcpSelfCheckButton.addEventListener("click", runMcpSelfCheck);
 elements.dropZone.addEventListener("dragover", (event) => {
   event.preventDefault();
   elements.dropZone.classList.add("dragging");

@@ -2,9 +2,9 @@
 
 一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 写入资料库自己的内容寻址对象区，生成完整冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
 
-项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–7；下一轮阶段 8–9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
+项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–8；阶段 9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
 
-## 当前已实现：历史阶段一至阶段四与产品化阶段 1–7
+## 当前已实现：历史阶段一至阶段四与产品化阶段 1–8
 
 - 显式导入 UTF-8 Markdown 和带文本层 PDF。
 - 每次 `build` 都新建快照；不覆盖或修改旧快照。
@@ -34,6 +34,8 @@
 - 运行时代码只定义 provider-neutral transport 合同，以及构造注入的非秘密 provider、三个 model ID、精确 profile 和候选/字符边界；没有任何真实供应商 HTTP adapter、密钥读取或真实模型 ID 配置。生产 Web/stdio 入口未注入 transport，显式 enhanced 会明确返回“尚未配置或不可用”。
 - 独立 Stage 7 入口用一次性临时应用根生成两库、三快照和中英/双向跨语言合成题集，实际运行本地 BM25，并让增强模式完整经过 Stage 6 的三调用 recording fake；不加入 Web 或八个 MCP 工具。
 - Stage 7 JSON 报告按模式记录 hit@k、recall@k、MRR、真实空准确率、库/快照隔离违规和 anchor/页码可追溯覆盖，并固定标为 `offline_simulated`、真实模型调用 0、网络调用 0。它只验收离线管线，不能推出真实模型质量提升。
+- Stage 8 在本地管理页生成可复制的 `codex mcp add` 与等价 TOML，只使用已安装的稳定 `literature-evidence-mcp` 命令；页面不会执行命令、写入 Codex 配置或让用户填写任意路径、命令和环境变量。
+- Stage 8 自检在一次性临时应用根建立合成快照，真实启动本项目 stdio MCP 子进程，核验恰好八工具及 annotations，再依次调用状态、默认/显式 BM25 搜索和有界证据读取，并核对资料树读取前后身份一致。报告固定为零网络、零模型、零 key、零外部配置写入、零重试；通过只代表本地离线链路可用，不代表客户端已经配置。
 - Finder 可双击的 [`启动文献证据管理页.command`](./启动文献证据管理页.command)：从自身位置确定完整项目，路径含空格也可使用。
 - 首次运行先核对 macOS、arm64、Python 3.11+、SQLite `serialize/deserialize` 和 FTS5，再在项目 `.venv/` 中做非 editable 安装。
 - 双击入口使用稳定的用户应用根，端口绑定成功后才打开默认浏览器；终端前台运行，`Ctrl+C` 即停止。
@@ -67,7 +69,22 @@
 
 ## 管理页与 MCP 的区别
 
-双击入口只启动本机管理页。管理页用于用户明确创建/切换资料库、选择 PDF/Markdown、从空白或明确基础快照新增冻结快照、核验/激活和本地搜索；create/select/build/activate 都是明确写操作。MCP 则是给支持本地 stdio（标准输入/输出）的 MCP host 调用的八个只读工具。双击入口不会自动启动 MCP，也不会修改任何 Codex、ChatGPT 或 Claude 配置。
+双击入口只启动本机管理页。管理页用于用户明确创建/切换资料库、选择 PDF/Markdown、从空白或明确基础快照新增冻结快照、核验/激活和本地搜索；create/select/build/activate 都是明确写操作。MCP 则是给支持本地 stdio（标准输入/输出）的 MCP host 调用的八个只读工具。Stage 8 页面只显示并复制配置、自检临时合成链路；不会执行配置命令，也不会修改任何 Codex、ChatGPT 或其他客户端配置。
+
+按 [OpenAI 官方 MCP 文档](https://developers.openai.com/codex/mcp/)，同一台电脑上的 ChatGPT desktop、Codex CLI 和 Codex IDE 扩展共享本机 Codex MCP 配置并支持 stdio；ChatGPT web 使用插件，不读取这份本机配置。因此本阶段只提供本地入口：
+
+```bash
+codex mcp add literature-evidence -- literature-evidence-mcp
+```
+
+等价 TOML 为：
+
+```toml
+[mcp_servers.literature-evidence]
+command = "literature-evidence-mcp"
+```
+
+这些文本不含 key、任意路径或环境变量。点击复制后仍是“未配置”，需要用户自行粘贴并按客户端提示操作。本地 BM25 与八工具不需要 OpenAI API key。ChatGPT web 的远程插件/Tunnel 路径属于尚未实现的 Stage 9。
 
 需要 MCP 时，由用户在支持 stdio command/args 的 host 中手工设置下列等价命令；它固定应用注册表根，没有 host、port、URL 或其他 transport 参数：
 
@@ -226,7 +243,7 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 3. **阶段三（已完成）**：八类 closed-world stdio 只读 MCP 能力；`search_documents` 与 `find_in_document` 只走本地 BM25，不含 combo、API Key 或 Tunnel。
 4. **阶段四（已完成）**：macOS Apple Silicon 开发版 `.command` 入口、首次预检/受控安装、标准用户应用根和前台管理页启动。自包含、签名/公证 App、DMG 或 pkg 仍属范围外。
 
-下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1–7 已依次实现多资料库核心、双级快照生命周期、库内对象复用、离线同配置向量复用、小白多资料库导入界面、离线可替换三角色增强链和合成离线搜索质量验收，阶段 8–9 尚未实现。阶段 6–7 都没有真实 provider adapter、真实模型/密钥、真实 Keychain 或真实链路质量结论。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
+下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1–8 已依次实现多资料库核心、双级快照生命周期、库内对象复用、离线同配置向量复用、小白多资料库导入界面、离线可替换三角色增强链、合成离线搜索质量验收和本地 MCP 向导/真实 stdio 离线自检，阶段 9 尚未实现。阶段 6–8 都没有真实 provider adapter、真实模型/密钥、真实 Keychain、真实外部客户端配置或真实远程链路结论。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
 
 OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完整聊天界面、自动删除/垃圾回收、App/DMG 打包、签名、公证和发布不在阶段 0–9 范围内。
 

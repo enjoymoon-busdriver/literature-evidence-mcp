@@ -37,6 +37,11 @@ from .errors import (
 )
 from .ingest import prepare_document
 from .library import FixedLibrary
+from .mcp_selfcheck import (
+    SELF_CHECK_INTENT,
+    local_mcp_guide,
+    run_stdio_self_check,
+)
 from .registry import LibraryRegistry
 
 
@@ -977,6 +982,7 @@ def create_app(
         "call_count": 0,
         "calls": [],
     }
+    mcp_guide = local_mcp_guide()
 
     async def index(_request: Request) -> Response:
         return FileResponse(_STATIC_ROOT / "index.html", media_type="text/html")
@@ -1016,6 +1022,7 @@ def create_app(
                 "max_file_bytes": upload_limits.max_file_bytes,
                 "max_total_bytes": upload_limits.max_total_bytes,
             },
+            "mcp_guide": mcp_guide,
             "csrf_token": csrf_token,
         }
         response = JSONResponse(payload)
@@ -1172,6 +1179,22 @@ def create_app(
             status_code=201,
         )
 
+    async def mcp_self_check(request: Request) -> Response:
+        _require_intent(request, SELF_CHECK_INTENT)
+        if request.url.query or await request.body():
+            raise RequestBoundaryError(
+                400,
+                "本地 MCP 自检不接受参数、路径、命令或环境变量。",
+            )
+        try:
+            report = await run_in_threadpool(run_stdio_self_check)
+        except Exception:
+            return _error_response(
+                503,
+                "本地 MCP 自检未能安全启动；未写入任何客户端配置。",
+            )
+        return JSONResponse({"self_check": report})
+
     async def request_boundary_handler(
         _request: Request, exc: Exception
     ) -> JSONResponse:
@@ -1229,6 +1252,7 @@ def create_app(
         Route("/static/styles.css", styles, methods=["GET"]),
         Route("/static/app.js", script, methods=["GET"]),
         Route("/api/status", status, methods=["GET"]),
+        Route("/api/mcp-self-check", mcp_self_check, methods=["POST"]),
         Route("/api/libraries", libraries, methods=["GET"]),
         Route("/api/libraries", create_library, methods=["POST"]),
         Route(
@@ -1346,6 +1370,7 @@ __all__ = [
     "CREATE_LIBRARY_INTENT",
     "DEFAULT_PORT",
     "DEFAULT_UPLOAD_LIMITS",
+    "SELF_CHECK_INTENT",
     "SELECT_LIBRARY_INTENT",
     "SESSION_COOKIE",
     "UploadLimits",

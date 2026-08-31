@@ -10,7 +10,7 @@
   <body>
     <main>
       <header class="hero">
-        <p class="eyebrow">literature-evidence-mcp · 阶段六</p>
+        <p class="eyebrow">literature-evidence-mcp · 阶段八</p>
         <h1>本地文献证据管理页</h1>
         <p>
           你明确选择的 Markdown/PDF 只交给本机 <code>127.0.0.1</code>；
@@ -140,6 +140,47 @@
         <p id="search-status" class="notice quiet" role="status" aria-live="polite"></p>
         <div id="search-audit" class="summary" hidden></div>
         <div id="search-results" class="results"></div>
+      </section>
+
+      <section aria-labelledby="mcp-heading">
+        <p class="eyebrow">本地只读接入 · 复制但未配置</p>
+        <h2 id="mcp-heading">5. 连接本地 AI / MCP</h2>
+        <p>
+          本地 BM25 和八个只读工具不需要 OpenAI API key。这里仅生成可复制配置；
+          不会执行命令，也不会写入 <code>~/.codex/config.toml</code> 或修改任何客户端。
+        </p>
+        <p class="hint">
+          适用于同一台电脑上的 ChatGPT desktop、Codex CLI 与 Codex IDE 扩展。
+          复制完成仍是“未配置”，需要你自己粘贴并按客户端提示操作。
+        </p>
+        <div class="two-column mcp-config-grid">
+          <div>
+            <label for="mcp-cli">可复制 CLI</label>
+            <textarea id="mcp-cli" class="code-copy" rows="3" readonly></textarea>
+            <button id="copy-mcp-cli-button" class="secondary" type="button">
+              复制 CLI（不执行）
+            </button>
+          </div>
+          <div>
+            <label for="mcp-toml">等价 TOML</label>
+            <textarea id="mcp-toml" class="code-copy" rows="3" readonly></textarea>
+            <button id="copy-mcp-toml-button" class="secondary" type="button">
+              复制 TOML（不写配置）
+            </button>
+          </div>
+        </div>
+        <p id="mcp-copy-status" class="notice quiet" role="status" aria-live="polite"></p>
+        <div class="boundary-note">
+          <strong>网页端边界：</strong>
+          ChatGPT web 不会读取本机 Codex 配置；远程插件或 Tunnel 留到 Stage 9，本阶段没有实现。
+        </div>
+        <button id="mcp-self-check-button" type="button">运行本地离线 STDIO 自检</button>
+        <p class="hint">
+          自检只使用临时合成资料，真实启动本项目 STDIO MCP 服务；零网络、零模型、零 key、零重试，
+          不读取当前用户资料库。通过只代表本地离线链路可用，不代表客户端已配置。
+        </p>
+        <p id="mcp-self-check-status" class="notice quiet" role="status" aria-live="polite"></p>
+        <div id="mcp-self-check-report" class="summary" hidden></div>
       </section>
     </main>
   </body>

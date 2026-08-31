@@ -281,6 +281,26 @@ td p {
   margin: 5px 0;
 }
 
+.code-copy {
+  min-height: 78px;
+  white-space: pre;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.86rem;
+}
+
+.mcp-config-grid button {
+  margin-top: 8px;
+}
+
+.boundary-note {
+  margin: 18px 0;
+  padding: 13px;
+  border-left: 4px solid #c68b22;
+  border-radius: 8px;
+  background: #fff8e8;
+  color: #654b18;
+}
+
 .compact-list {
   margin: 0;
   padding-left: 18px;
