@@ -5,10 +5,7 @@ import unittest
 from pathlib import Path
 
 
-NODE = Path(
-    "/Users/hongchengyu/.cache/codex-runtimes/codex-primary-runtime/"
-    "dependencies/node/bin/node"
-)
+from tests.node_runtime import NODE
 STATIC_ROOT = (
     Path(__file__).resolve().parents[1]
     / "src"

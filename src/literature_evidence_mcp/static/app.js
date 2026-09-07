@@ -192,8 +192,15 @@ function renderMcpGuide(guide) {
 async function loadStatus() {
   const tunnelRequestId = state.tunnelRequestId;
   const tunnelWasBusy = !!state.tunnelAction;
+  const realRequestId = typeof realTunnelRequest === "number" ? realTunnelRequest : 0;
+  const realWasBusy = typeof realTunnelBusy === "boolean" && realTunnelBusy;
   const payload = await api("/api/status");
   state.csrfToken = payload.csrf_token;
+  state.connections = payload.connections;
+  if (typeof renderConnections === "function") {
+    renderConnections(payload.connections,
+      !realWasBusy && !realTunnelBusy && realRequestId === realTunnelRequest);
+  }
   const reportedSimulated = payload.enhanced && payload.enhanced.simulated;
   state.enhancedSimulated = typeof reportedSimulated === "boolean"
     ? reportedSimulated

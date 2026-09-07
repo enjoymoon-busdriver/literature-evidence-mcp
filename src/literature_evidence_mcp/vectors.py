@@ -253,12 +253,14 @@ OfflineEmbedder = Callable[
 
 def _validated_adapter(embedder: OfflineEmbedder) -> dict[str, Any]:
     if not callable(embedder):
-        raise VectorError("离线 embedder 必须是可调用对象。")
-    if (
-        getattr(embedder, "offline", None) is not True
-        or getattr(embedder, "simulated", None) is not True
-    ):
-        raise VectorError("本阶段只接受明确标记 offline/simulated 的 embedder。")
+        raise VectorError("embedder 必须是可调用对象。")
+    simulated = getattr(embedder, "simulated", None)
+    if type(simulated) is not bool or getattr(embedder, "offline", None) is not simulated:
+        raise VectorError("embedder 必须明确且一致地标记 offline/simulated。")
+    if not simulated:
+        batch_size = getattr(embedder, "batch_size", None)
+        if type(batch_size) is not int or not 1 <= batch_size <= 10:
+            raise VectorError("真实 embedder 的批次大小必须为 1-10。")
     identity = getattr(embedder, "adapter_identity", None)
     if not isinstance(identity, Mapping) or set(identity) != {
         "implementation",
@@ -649,16 +651,19 @@ def _validated_artifact(
     dimensions = profile["dimensions"]
 
     generation = value["generation"]
-    if not isinstance(generation, dict) or set(generation) != {
+    generation_keys = {
         "mode",
         "adapter",
         "embedder_calls",
         "submitted_unique_inputs",
-    }:
-        raise VectorError("向量 artifact 的离线生成记录无效。")
+    }
+    if isinstance(generation, dict) and generation.get("mode") == "real_provider":
+        generation_keys.add("batch_size")
+    if not isinstance(generation, dict) or set(generation) != generation_keys:
+        raise VectorError("向量 artifact 的生成记录无效。")
     adapter = generation["adapter"]
     if (
-        generation["mode"] != "offline_simulated"
+        generation["mode"] not in {"offline_simulated", "real_provider"}
         or not isinstance(adapter, dict)
         or set(adapter) != {"implementation", "version"}
         or not isinstance(adapter["implementation"], str)
@@ -666,11 +671,17 @@ def _validated_artifact(
         or type(adapter["version"]) is not int
         or adapter["version"] < 1
         or type(generation["embedder_calls"]) is not int
-        or generation["embedder_calls"] not in {0, 1}
+        or generation["embedder_calls"] < 0
         or type(generation["submitted_unique_inputs"]) is not int
         or generation["submitted_unique_inputs"] < 0
     ):
-        raise VectorError("向量 artifact 未明确标记有效的 offline/simulated 生成。")
+        raise VectorError("向量 artifact 未明确标记有效的生成模式。")
+    simulated = generation["mode"] == "offline_simulated"
+    if profile["provider"].casefold().startswith("offline-") is not simulated:
+        raise VectorError("向量 profile 与生成模式不匹配。")
+    batch_size = generation.get("batch_size")
+    if not simulated and (type(batch_size) is not int or not 1 <= batch_size <= 10):
+        raise VectorError("真实向量生成批次大小无效。")
 
     expected_mappings, texts = _expected_inputs(profile, chunks)
     mappings = value["mappings"]
@@ -700,11 +711,13 @@ def _validated_artifact(
     expected_statistics = _statistics(mappings, objects, dimensions)
     if value["statistics"] != expected_statistics:
         raise VectorError("向量 artifact 统计与完整映射不一致。")
+    new_objects = expected_statistics["new_objects"]
+    expected_calls = int(new_objects > 0) if simulated else (new_objects + batch_size - 1) // batch_size
     if (
         generation["submitted_unique_inputs"] != expected_statistics["new_objects"]
-        or generation["embedder_calls"] != int(expected_statistics["new_objects"] > 0)
+        or generation["embedder_calls"] != expected_calls
     ):
-        raise VectorError("向量 artifact 的假模型调用记录与新增对象不一致。")
+        raise VectorError("向量 artifact 的模型调用记录与新增对象不一致。")
     return value, vectors
 
 
@@ -970,8 +983,8 @@ def _artifact_status(
 ) -> dict[str, Any]:
     return {
         "verified": True,
-        "offline": True,
-        "simulated": True,
+        "offline": artifact["generation"]["mode"] == "offline_simulated",
+        "simulated": artifact["generation"]["mode"] == "offline_simulated",
         "snapshot_id": artifact["snapshot"]["snapshot_id"],
         "snapshot_manifest_sha256": artifact["snapshot"]["manifest_sha256"],
         "profile_id": artifact["profile_id"],
@@ -984,19 +997,70 @@ def _artifact_status(
     }
 
 
+def _reusable_inputs(root, profile, chunks, verified, existing_objects):
+    selected_profile_id = profile_id(profile)
+    mappings, texts = _expected_inputs(profile, chunks)
+    reusable: dict[str, dict[str, Any]] = {}
+    for (_candidate_snapshot, candidate_profile), (artifact, _vectors, _record) in verified.items():
+        if candidate_profile == selected_profile_id:
+            for record in artifact["objects"]:
+                reusable[record["vector_object_id"]] = {**record, "created_in_artifact": False}
+    for vector_object_id in sorted(texts):
+        if vector_object_id in reusable or vector_object_id not in existing_objects:
+            continue
+        existing = existing_objects[vector_object_id]
+        payload = _read_regular_file(root.joinpath(*Path(existing["path"]).parts),
+                                     label="未登记孤儿向量 payload")
+        record = _object_record(vector_object_id, texts[vector_object_id], payload, created=False)
+        if any(record[name] != existing[name] for name in ("payload_sha256", "payload_byte_size", "path")):
+            raise VectorError("未登记孤儿向量对象的摘要或路径不一致。")
+        _read_vector_payload(root, record, profile["dimensions"])
+        reusable[vector_object_id] = record
+    missing_ids = [item for item in sorted(texts) if item not in reusable]
+    return mappings, texts, reusable, missing_ids
+
+
+def preview_vectors(library: Path | LibraryRegistry, snapshot_id: str,
+                    profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Read and verify the inputs that a ten-item real provider build would send."""
+    snapshot_id = _validated_identifier(snapshot_id, SNAPSHOT_ID_PATTERN, "snapshot_id")
+    profile = validate_profile(profile)
+    selected_profile_id = profile_id(profile)
+    root_guard = _root_guard(library)
+    root = _validated_root(root_guard)
+    assert root is not None
+    snapshot_catalog = load_snapshot_catalog(root_guard)
+    status, chunks = _snapshot_chunks(root, snapshot_catalog, snapshot_id)
+    vector_catalog = _load_vector_catalog(root)
+    verified, existing_objects = _verify_vector_state(
+        root, snapshot_catalog, vector_catalog, {snapshot_id: (status, chunks)})
+    _mappings, texts, _reusable, missing_ids = _reusable_inputs(
+        root, profile, chunks, verified, existing_objects)
+    already_exists = (snapshot_id, selected_profile_id) in verified
+    if already_exists:
+        missing_ids = []
+    return {
+        "profile_id": selected_profile_id, "already_exists": already_exists,
+        "new_inputs": len(missing_ids), "reused_inputs": len(texts) - len(missing_ids),
+        "new_input_chars": sum(len(texts[item]) for item in missing_ids),
+        "batch_size": 10, "planned_calls": (len(missing_ids) + 9) // 10,
+    }
+
+
 def build_vectors(
     library: Path | LibraryRegistry,
     snapshot_id: str,
     profile: Mapping[str, Any],
     embedder: OfflineEmbedder,
 ) -> dict[str, Any]:
-    """Build one complete offline/simulated vector mapping under the library lock."""
+    """Build one complete vector mapping under the library lock, with no retries."""
     snapshot_id = _validated_identifier(snapshot_id, SNAPSHOT_ID_PATTERN, "snapshot_id")
     profile = validate_profile(profile)
-    if not profile["provider"].casefold().startswith("offline-"):
-        raise VectorError("本阶段 fake profile 的 provider 必须明确使用 offline- 前缀。")
     selected_profile_id = profile_id(profile)
     adapter = _validated_adapter(embedder)
+    simulated = embedder.simulated
+    if profile["provider"].casefold().startswith("offline-") is not simulated:
+        raise VectorError("向量 profile 与 embedder 的真实/模拟模式不匹配。")
     root_guard = _root_guard(library)
 
     with snapshot_catalog_lock(root_guard):
@@ -1022,60 +1086,33 @@ def build_vectors(
                     "already_exists": True,
                     "embedder_calls": 0,
                     "submitted_unique_inputs": 0,
+                    **({} if simulated else {"provider_audit": {"call_count": 0, "calls": []}}),
                 }
             )
             return result
 
-        mappings, texts = _expected_inputs(profile, chunks)
-        reusable: dict[str, dict[str, Any]] = {}
-        for (_candidate_snapshot, candidate_profile), (
-            artifact,
-            _vectors,
-            _record,
-        ) in verified.items():
-            if candidate_profile != selected_profile_id:
-                continue
-            for object_record in artifact["objects"]:
-                reusable[object_record["vector_object_id"]] = {
-                    **object_record,
-                    "created_in_artifact": False,
-                }
-
-        for vector_object_id in sorted(texts):
-            if vector_object_id in reusable or vector_object_id not in existing_objects:
-                continue
-            existing = existing_objects[vector_object_id]
-            payload = _read_regular_file(
-                root.joinpath(*Path(existing["path"]).parts),
-                label="未登记孤儿向量 payload",
-            )
-            orphan_record = _object_record(
-                vector_object_id,
-                texts[vector_object_id],
-                payload,
-                created=False,
-            )
-            if any(
-                orphan_record[name] != existing[name]
-                for name in ("payload_sha256", "payload_byte_size", "path")
-            ):
-                raise VectorError("未登记孤儿向量对象的摘要或路径不一致。")
-            _read_vector_payload(root, orphan_record, profile["dimensions"])
-            reusable[vector_object_id] = orphan_record
-
-        missing_ids = [item for item in sorted(texts) if item not in reusable]
+        mappings, texts, reusable, missing_ids = _reusable_inputs(
+            root, profile, chunks, verified, existing_objects)
         missing_texts = tuple(texts[vector_object_id] for vector_object_id in missing_ids)
         encoded: list[bytes] = []
+        embedder_calls = 0
+        provider_calls: list[dict[str, Any]] = []
+        batch_size = max(1, len(missing_texts)) if simulated else embedder.batch_size
         if missing_texts:
-            try:
-                raw_vectors = embedder(missing_texts, profile)
-            except VectorError:
-                raise
-            except Exception as exc:
-                raise VectorError("离线模拟 embedder 调用失败；未重试。") from exc
-            encoded = _validated_outputs(
-                raw_vectors, len(missing_texts), profile["dimensions"]
-            )
+            for start in range(0, len(missing_texts), batch_size):
+                batch = missing_texts[start : start + batch_size]
+                try:
+                    embedder_calls += 1
+                    raw_vectors = embedder(batch, profile)
+                    encoded.extend(_validated_outputs(raw_vectors, len(batch), profile["dimensions"]))
+                except Exception:
+                    if not simulated:
+                        provider_calls.extend(getattr(embedder, "last_audit", {}).get("calls", []))
+                    error = VectorError("向量模型调用或响应失败；未重试，未发布本次向量。")
+                    error.provider_audit = {"call_count": len(provider_calls), "calls": provider_calls}
+                    raise error from None
+                if not simulated:
+                    provider_calls.extend(getattr(embedder, "last_audit", {}).get("calls", []))
 
         object_records = dict(reusable)
         for vector_object_id, text, payload in zip(
@@ -1096,10 +1133,11 @@ def build_vectors(
             "profile_id": selected_profile_id,
             "profile": profile,
             "generation": {
-                "mode": "offline_simulated",
+                "mode": "offline_simulated" if simulated else "real_provider",
                 "adapter": adapter,
-                "embedder_calls": int(bool(missing_ids)),
+                "embedder_calls": embedder_calls,
                 "submitted_unique_inputs": len(missing_ids),
+                **({} if simulated else {"batch_size": batch_size}),
             },
             "encoding": VECTOR_ENCODING,
             "objects": ordered_objects,
@@ -1148,8 +1186,10 @@ def build_vectors(
         result.update(
             {
                 "already_exists": False,
-                "embedder_calls": int(bool(missing_ids)),
+                "embedder_calls": embedder_calls,
                 "submitted_unique_inputs": len(missing_ids),
+                **({} if simulated else {"provider_audit": {
+                    "call_count": len(provider_calls), "calls": provider_calls}}),
             }
         )
         return result
@@ -1222,6 +1262,7 @@ __all__ = [
     "load_verified_vectors",
     "offline_fake_profile",
     "profile_id",
+    "preview_vectors",
     "validate_profile",
     "verify_vectors",
 ]

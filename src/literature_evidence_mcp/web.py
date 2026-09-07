@@ -12,6 +12,7 @@ import stat
 import tempfile
 import threading
 import unicodedata
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -955,6 +956,7 @@ def create_app(
     port: int = DEFAULT_PORT,
     upload_limits: UploadLimits = DEFAULT_UPLOAD_LIMITS,
     enhanced_search: Any | None = None,
+    connections: Any | None = None,
 ) -> Starlette:
     if type(port) is not int or not 1024 <= port <= 65535:
         raise ImportPolicyError("port 必须是 1024-65535 的整数。")
@@ -1002,7 +1004,14 @@ def create_app(
             media_type="text/javascript",
         )
 
+    async def connection_script(_request: Request) -> Response:
+        return FileResponse(_STATIC_ROOT / "connections.js", media_type="text/javascript")
+
     async def status(request: Request) -> Response:
+        connection_status = None if connections is None else await run_in_threadpool(connections.status)
+        active_enhanced = enhanced_summary
+        if connection_status and connection_status["aliyun_configured"]:
+            active_enhanced = connection_status["models"]
         cookie = request.cookies.get(cookie_name)
         session_id = sessions.validate_cookie(cookie)
         new_cookie: str | None = None
@@ -1018,8 +1027,9 @@ def create_app(
             "binding": "127.0.0.1",
             "local_only": True,
             "offline_default": "bm25",
-            "enhanced_available": enhanced_search is not None,
-            "enhanced": enhanced_summary,
+            "enhanced_available": active_enhanced is not None,
+            "enhanced": active_enhanced,
+            "connections": connection_status,
             "library_count": len(library_records),
             "readonly_actions": ["status", "list", "verify", "search"],
             "write_actions": ["create", "select", "build", "activate"],
@@ -1150,8 +1160,11 @@ def create_app(
                 )
             raise RequestBoundaryError(400, "搜索请求缺少 snapshot_id 或 query。")
         try:
+            selected_enhanced = enhanced_search
+            if mode == "enhanced" and connections is not None and selected_enhanced is None:
+                selected_enhanced = connections.enhanced
             library = await run_in_threadpool(
-                _fixed_library, registry, library_id, enhanced_search
+                _fixed_library, registry, library_id, selected_enhanced
             )
         except LiteratureEvidenceError as exc:
             if mode == "enhanced":
@@ -1230,10 +1243,74 @@ def create_app(
         _require_intent(request, PRODUCTION_START_INTENT)
         if request.url.query or await request.body():
             raise RequestBoundaryError(400, "生产 Tunnel 边界不接受任何参数。")
+        if connections is not None:
+            report = await run_in_threadpool(connections.start_tunnel)
+            return JSONResponse({"tunnel": report}, status_code=200 if report["passed"] else 503)
         report = production_boundary_report()
         return _error_response(
             409, report["message"], {**report, "code": "real-approval-required"}
         )
+
+    def require_connections() -> Any:
+        if connections is None:
+            raise RequestBoundaryError(503, "真实接入尚未在此管理页启用。")
+        return connections
+
+    async def save_credential(request: Request) -> Response:
+        _require_intent(request, "save-credential")
+        runtime = require_connections()
+        body = await _bounded_json(request, 4096)
+        if request.url.query or set(body) != {"kind", "key"}:
+            raise RequestBoundaryError(400, "凭据保存只接受指定种类和 Key。")
+        result = await run_in_threadpool(runtime.save_key, body["kind"], body["key"])
+        return JSONResponse({"connections": result})
+
+    async def save_tunnel_settings(request: Request) -> Response:
+        _require_intent(request, "save-tunnel-settings")
+        body = await _bounded_json(request, 4096)
+        if request.url.query or set(body) != {"tunnel_id", "accept_backoff"}:
+            raise RequestBoundaryError(400, "Tunnel 设置只接受身份和重连选项。")
+        result = await run_in_threadpool(require_connections().save_tunnel,
+                                        body["tunnel_id"], body["accept_backoff"])
+        return JSONResponse({"connections": result})
+
+    async def real_tunnel_action(request: Request) -> Response:
+        action = request.path_params["action"]
+        if action not in {"health", "stop"}:
+            raise RequestBoundaryError(404, "未找到此操作。")
+        _require_intent(request, f"tunnel-production-{action}")
+        if request.url.query or await request.body():
+            raise RequestBoundaryError(400, "此操作不接受参数。")
+        report = await run_in_threadpool(getattr(require_connections().tunnel, action))
+        return JSONResponse({"tunnel": report}, status_code=200 if report["passed"] else 503)
+
+    async def vectors_action(request: Request) -> Response:
+        action = request.path_params["action"]
+        if action not in {"preview", "build"}:
+            raise RequestBoundaryError(404, "未找到此操作。")
+        _require_intent(request, f"vectors-{action}")
+        body = await _bounded_json(request, 4096)
+        if request.url.query or set(body) != {"snapshot_id"}:
+            raise RequestBoundaryError(400, "向量操作必须明确指定快照。")
+        runtime = require_connections()
+        method = runtime.preview_vectors if action == "preview" else runtime.build_vectors
+        result = await run_in_threadpool(method, request.path_params["library_id"], body["snapshot_id"])
+        return JSONResponse({"vectors": result})
+
+    async def connection_error_handler(_request: Request, _exc: Exception) -> JSONResponse:
+        from .connections import ConnectionError
+        from .credentials import CredentialError
+        message = str(_exc) if isinstance(_exc, (ConnectionError, CredentialError)) else (
+            "真实接入操作未完成；请检查本机凭据和所选配置。没有自动重试。")
+        return _error_response(503, message)
+
+    @asynccontextmanager
+    async def lifespan(_app: Starlette):
+        try:
+            yield
+        finally:
+            if connections is not None:
+                await run_in_threadpool(connections.tunnel.close)
 
     async def request_boundary_handler(
         _request: Request, exc: Exception
@@ -1264,7 +1341,11 @@ def create_app(
         _request: Request, exc: Exception
     ) -> JSONResponse:
         assert isinstance(exc, SnapshotError)
-        return _error_response(_expected_error_status(str(exc)), str(exc))
+        audit = getattr(exc, "provider_audit", None)
+        return _error_response(
+            _expected_error_status(str(exc)), str(exc),
+            {"provider_audit": audit} if audit is not None else None,
+        )
 
     async def registry_error_handler(
         _request: Request, exc: Exception
@@ -1291,6 +1372,11 @@ def create_app(
         Route("/", index, methods=["GET"]),
         Route("/static/styles.css", styles, methods=["GET"]),
         Route("/static/app.js", script, methods=["GET"]),
+        Route("/static/connections.js", connection_script, methods=["GET"]),
+        Route("/api/connections/credentials", save_credential, methods=["POST"]),
+        Route("/api/connections/tunnel", save_tunnel_settings, methods=["POST"]),
+        Route("/api/tunnel/production/{action:str}", real_tunnel_action, methods=["POST"]),
+        Route("/api/libraries/{library_id:str}/vectors/{action:str}", vectors_action, methods=["POST"]),
         Route("/api/status", status, methods=["GET"]),
         Route("/api/mcp-self-check", mcp_self_check, methods=["POST"]),
         Route("/api/tunnel/simulated/{action:str}", tunnel_action, methods=["POST"]),
@@ -1339,6 +1425,7 @@ def create_app(
         )
     ]
     return Starlette(
+        lifespan=lifespan,
         debug=False,
         routes=routes,
         middleware=middleware,
@@ -1350,6 +1437,7 @@ def create_app(
             SnapshotError: snapshot_error_handler,
             LibraryRegistryError: registry_error_handler,
             HTTPException: http_error_handler,
+            LiteratureEvidenceError: connection_error_handler,
         },
     )
 
@@ -1364,7 +1452,8 @@ def serve_local(
     """Run one foreground Uvicorn process bound only to IPv4 loopback."""
     import uvicorn
 
-    app = create_app(application_root, port=port)
+    from .connections import Connections
+    app = create_app(application_root, port=port, connections=Connections(application_root))
     url = f"http://{LOOPBACK_HOST}:{port}/"
     config = uvicorn.Config(
         app,

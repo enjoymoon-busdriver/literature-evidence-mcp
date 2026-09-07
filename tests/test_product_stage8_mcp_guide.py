@@ -17,10 +17,7 @@ from literature_evidence_mcp.web import create_app
 
 PORT = 19128
 ORIGIN = f"http://127.0.0.1:{PORT}"
-NODE = Path(
-    "/Users/hongchengyu/.cache/codex-runtimes/codex-primary-runtime/"
-    "dependencies/node/bin/node"
-)
+from tests.node_runtime import NODE
 STATIC_ROOT = (
     Path(__file__).resolve().parents[1]
     / "src"

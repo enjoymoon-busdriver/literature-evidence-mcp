@@ -6,11 +6,12 @@
     <title>本地文献证据管理页</title>
     <link rel="stylesheet" href="/static/styles.css">
     <script src="/static/app.js" defer></script>
+    <script src="/static/connections.js" defer></script>
   </head>
   <body>
     <main>
       <header class="hero">
-        <p class="eyebrow">literature-evidence-mcp · 阶段八</p>
+        <p class="eyebrow">literature-evidence-mcp</p>
         <h1>本地文献证据管理页</h1>
         <p>
           你明确选择的 Markdown/PDF 只交给本机 <code>127.0.0.1</code>；
@@ -210,10 +211,53 @@
         <p id="tunnel-state" class="notice" role="status" aria-live="polite">正在读取模拟状态……</p>
         <p id="tunnel-message" class="hint" role="status" aria-live="polite"></p>
         <div class="boundary-note">
-          <strong>真实运行待另行授权，当前不可用。</strong>
-          未来批准前须说明问题数与总调用数、发送的查询／正文范围、模型与成本可见性、
-          零自动重试与首错停止规则，以及需要用户完成的电脑操作。模拟流程失败后也不会自动重试。
+          <strong>以上按钮只演练模拟流程。</strong>
+          真实连接使用下方独立区域。模型调用零自动重试、首错停止；官方 Tunnel 客户端有断线退避重连。
         </div>
+      </section>
+
+      <section id="real-connections" aria-labelledby="real-connections-heading" hidden>
+        <h2 id="real-connections-heading">7. 真实模型与 ChatGPT 连接</h2>
+        <p>Key 只发送到本机并保存到 macOS 钥匙串；保存不会测试模型或启动连接。</p>
+        <p class="hint">阿里云使用北京地域按量付费 Key，不能使用 Coding Plan 的 Key。
+          已准备问题改写、向量、重排三个模型。模型按实际用量计费，准确费用以供应商账单为准；模型请求零重试。</p>
+        <div class="two-column">
+          <div>
+            <label for="aliyun-secret">阿里云 API Key</label>
+            <input id="aliyun-secret" type="password" autocomplete="off" maxlength="512">
+            <button id="save-aliyun-secret" type="button">保存到本机钥匙串</button>
+            <p id="aliyun-key-state" class="hint"></p>
+          </div>
+          <div>
+            <label for="openai-secret">OpenAI Tunnel 运行 Key</label>
+            <input id="openai-secret" type="password" autocomplete="off" maxlength="512">
+            <button id="save-openai-secret" type="button">保存到本机钥匙串</button>
+            <p id="openai-key-state" class="hint"></p>
+          </div>
+        </div>
+        <p id="connection-notice" class="notice" role="status" aria-live="polite"></p>
+        <h3>为所选快照准备增强搜索</h3>
+        <p>使用上方明确选择的资料库和快照。先查看预计发送量，再构建向量；只发送该快照尚未复用的文本块到阿里云。</p>
+        <button id="preview-real-vectors" class="secondary" type="button">查看发送量与调用数</button>
+        <p id="real-vector-plan" class="hint" role="status"></p>
+        <button id="build-real-vectors" type="button" disabled>明确发送并构建向量</button>
+        <p class="hint">向量就绪后，在上方选择增强搜索；每个问题最多三次模型请求。
+          问题最长 400 字符，重排最多 10 条候选、每条 600 字符、合计 4000 字符。
+          这些模型响应可能有误，仍需核对返回证据。</p>
+        <h3>连接 ChatGPT</h3>
+        <label for="real-tunnel-id">本项目 Tunnel ID（由助手准备）</label>
+        <input id="real-tunnel-id" type="text" autocomplete="off" maxlength="135">
+        <label class="radio-label"><input id="accept-tunnel-backoff" type="checkbox">
+          接受官方 Tunnel 客户端断线重连；应用不自动重启进程</label>
+        <button id="save-real-tunnel" class="secondary" type="button">保存连接设置</button>
+        <p class="hint">启动会通过出站 HTTPS 连接 OpenAI，将此资料库应用的八个只读工具开放给所关联的工作区。
+          工具调用可读取本应用登记的各库和快照；本地健康通过不等于 ChatGPT 已发现工具。</p>
+        <div class="tunnel-actions">
+          <button id="real-tunnel-start" type="button">启动真实 Tunnel</button>
+          <button id="real-tunnel-health" class="secondary" type="button">检查真实连接</button>
+          <button id="real-tunnel-stop" class="secondary" type="button">停止真实 Tunnel</button>
+        </div>
+        <p id="real-tunnel-status" class="notice" role="status" aria-live="polite"></p>
       </section>
     </main>
   </body>
