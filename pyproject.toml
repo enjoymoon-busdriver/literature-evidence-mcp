@@ -31,4 +31,4 @@ literature-evidence-mcp = "literature_evidence_mcp.mcp_server:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-literature_evidence_mcp = ["static/*.css", "static/*.html", "static/*.js"]
+literature_evidence_mcp = ["static/*.css", "static/*.html", "static/*.js", "static/*.png"]

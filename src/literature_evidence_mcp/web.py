@@ -995,6 +995,9 @@ def create_app(
     async def index(_request: Request) -> Response:
         return FileResponse(_STATIC_ROOT / "index.html", media_type="text/html")
 
+    async def icon(_request: Request) -> Response:
+        return FileResponse(_STATIC_ROOT / "icon.png", media_type="image/png")
+
     async def styles(_request: Request) -> Response:
         return FileResponse(_STATIC_ROOT / "styles.css", media_type="text/css")
 
@@ -1370,6 +1373,7 @@ def create_app(
 
     routes = [
         Route("/", index, methods=["GET"]),
+        Route("/static/icon.png", icon, methods=["GET"]),
         Route("/static/styles.css", styles, methods=["GET"]),
         Route("/static/app.js", script, methods=["GET"]),
         Route("/static/connections.js", connection_script, methods=["GET"]),

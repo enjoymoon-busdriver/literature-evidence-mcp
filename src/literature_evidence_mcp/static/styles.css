@@ -67,6 +67,9 @@ h2 {
 }
 
 .hero .eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   color: #bce0cb;
 }
 

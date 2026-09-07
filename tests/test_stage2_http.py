@@ -151,10 +151,15 @@ class StageTwoHttpTests(unittest.TestCase):
         page = self.client.get("/")
         script = self.client.get("/static/app.js")
         styles = self.client.get("/static/styles.css")
+        icon = self.client.get("/static/icon.png")
         self.assertEqual(
-            (page.status_code, script.status_code, styles.status_code),
-            (200, 200, 200),
+            (page.status_code, script.status_code, styles.status_code, icon.status_code),
+            (200, 200, 200, 200),
         )
+        self.assertEqual(icon.headers["content-type"], "image/png")
+        self.assertTrue(icon.content.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertIn('<link rel="icon" type="image/png" href="/static/icon.png">', page.text)
+        self.assertIn('<img src="/static/icon.png" alt="" width="56" height="56">', page.text)
         self.assertIn("<title>FolioHook · 寻章 — 本地知识库</title>", page.text)
         self.assertIn("<h1>寻章 · 本地知识库</h1>", page.text)
         self.assertIn("创建或切换资料库", page.text)
@@ -167,9 +172,10 @@ class StageTwoHttpTests(unittest.TestCase):
         self.assertNotIn("https://", page.text + script.text)
         self.assertIn("default-src 'self'", page.headers["content-security-policy"])
         self.assertIn("form-action 'none'", page.headers["content-security-policy"])
-        for item in (response, listed, page, script, styles):
+        for item in (response, listed, page, script, styles, icon):
             self.assertEqual(item.headers["cache-control"], "no-store")
             self.assertNotIn("access-control-allow-origin", item.headers)
+        self.assertFalse(self.application_root.exists())
 
     def test_host_origin_session_csrf_and_action_intent_are_enforced(self) -> None:
         self.assertEqual(self.client.get("/api/libraries").status_code, 403)

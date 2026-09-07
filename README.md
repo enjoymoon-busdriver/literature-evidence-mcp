@@ -1,3 +1,5 @@
+<img src="./src/literature_evidence_mcp/static/icon.png" alt="FolioHook · 寻章" width="128" height="128">
+
 # FolioHook · 寻章
 
 面向个人的本地知识库管理与 AI 接入工具。把用户明确选择的 Markdown 或带文本层 PDF 写入资料库自己的内容寻址对象区，生成完整冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
