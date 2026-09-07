@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "literature-evidence-mcp"
 version = "0.1.0.dev0"
-description = "Auditable local literature evidence snapshots and read-only retrieval."
+description = "FolioHook: personal local knowledge libraries and auditable, read-only AI access."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

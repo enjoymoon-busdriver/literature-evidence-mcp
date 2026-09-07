@@ -155,6 +155,8 @@ class StageTwoHttpTests(unittest.TestCase):
             (page.status_code, script.status_code, styles.status_code),
             (200, 200, 200),
         )
+        self.assertIn("<title>FolioHook · 寻章 — 本地知识库</title>", page.text)
+        self.assertIn("<h1>寻章 · 本地知识库</h1>", page.text)
         self.assertIn("创建或切换资料库", page.text)
         self.assertIn("拖到这里", page.text)
         self.assertIn('/static/app.js', page.text)

@@ -1,6 +1,8 @@
-# literature-evidence-mcp
+# FolioHook · 寻章
 
-一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 写入资料库自己的内容寻址对象区，生成完整冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
+面向个人的本地知识库管理与 AI 接入工具。把用户明确选择的 Markdown 或带文本层 PDF 写入资料库自己的内容寻址对象区，生成完整冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
+
+FolioHook／寻章是产品显示名。当前仓库地址、Python 包名、命令和应用数据目录仍沿用 `literature-evidence-mcp` 等原有标识；本次改名不迁移资料、钥匙串凭据或客户端配置。
 
 > **普通用户入口：** 把 [本地 Agent 完整安装与连接提示词](./docs/local-agent-setup.md) 整段复制给能操作这台 Mac 文件和终端的本地 Agent；它会分阶段检查、安装、启动合成样例和自检，并只在你确认后配置选定连接。
 
