@@ -1,7 +1,7 @@
 # 最小架构合同
 
 本合同前半部分记录 `0.1.0.dev0` 历史阶段一至阶段三的已实现边界。阶段二在阶段一
-`build_snapshot` / `verify_snapshot` / `search_snapshot` 核心之外增加固定资料库应用层和本机管理页；阶段三再增加八个本地 stdio、closed-world、只读 MCP 工具。历史阶段四只增加 macOS 开发版启动入口，没有改变快照格式、SQLite schema、分块规则或 BM25 算法。文末“下一轮产品化阶段 0 合同”冻结后续阶段 1–9 的目标；阶段 1–8 已实现，阶段 9 尚未实现。前半部分的固定单库 HTTP/MCP schema 只保留为历史阶段记录；当前运行合同以产品化“阶段 2–8 实现”小节为准。
+`build_snapshot` / `verify_snapshot` / `search_snapshot` 核心之外增加固定资料库应用层和本机管理页；阶段三再增加八个本地 stdio、closed-world、只读 MCP 工具。历史阶段四只增加 macOS 开发版启动入口，没有改变快照格式、SQLite schema、分块规则或 BM25 算法。文末“下一轮产品化阶段 0 合同”冻结阶段 1–9 的目标；阶段 0–9 的本地实现与离线合同已完成，停在真实模型／客户端／Tunnel 复核之前。前半部分的固定单库 HTTP/MCP schema 只保留为历史阶段记录；当前运行合同以产品化“阶段 2–9 实现”小节为准。
 
 ## 信任边界
 
@@ -96,7 +96,7 @@ annotations 只是 host 的行为提示，不承担安全控制；上面的固�
 
 ### 状态与冻结基线
 
-下一轮使用阶段 0–9 编号，与上文已经完成的历史阶段一至四不是同一组阶段。阶段 0 只冻结合同，不修改运行时代码、快照、SQLite schema 或 MCP schema；阶段 1–8 已按顺序实现，阶段 9 仍须单独实现和验收，不能把后阶段能力提前混入前阶段。
+下一轮使用阶段 0–9 编号，与上文已经完成的历史阶段一至四不是同一组阶段。阶段 0 只冻结合同，不修改运行时代码、快照、SQLite schema 或 MCP schema；阶段 1–9 的本地／离线部分已按顺序实现和验收，不把真实链路能力提前混入这轮交付。
 
 冻结前基线是 commit `641eceb5fd5786f3da83c7c948e396c3740a0341`。该基线的 README、本文档和当前运行时 MCP schema 已只读核对；MCP 运行时恰好列出八个工具，使用 Python 3.12 并强制加载该工作树源码时，完整测试为 62/62 通过。
 
@@ -196,11 +196,19 @@ JSON 报告按模式分列 positive hit@k/recall@k、MRR、首次命中 rank、�
 
 Finder 启动器在标准应用根原子安装权限为 0700 的 `mcp-server` shim，固定调用本项目 `.venv` Python 的 `-I -B -m literature_evidence_mcp.mcp_server`，不限制正常增强搜索能力。管理页从代码常量生成等价 CLI/TOML：`/bin/zsh -fc` 执行 `exec "$HOME/Library/Application Support/literature-evidence-mcp/mcp-server"`。文本无 key、用户绝对路径、虚拟环境路径或可填写的 env；只在标准根、shim 模板与解释器就绪时允许复制。复制只显示“已复制但尚未配置”，不执行配置命令或修改外部客户端配置；就绪检查不等于真实入口已执行。
 
-这条配置只面向同一 host 上支持 stdio 的 ChatGPT desktop、Codex CLI 与 Codex IDE 扩展。根据 [OpenAI 官方 MCP 文档](https://developers.openai.com/codex/mcp/)，这些本地客户端共享 Codex MCP 配置，而 ChatGPT web 使用插件且不读取本机 Codex 配置。因此网页端远程插件/Tunnel 明确保留给尚未实现的 Stage 9；Stage 8 不声称真实客户端已经连接。
+这条配置只面向同一 host 上支持 stdio 的 ChatGPT desktop、Codex CLI 与 Codex IDE 扩展。根据 [OpenAI 官方 MCP 文档](https://developers.openai.com/codex/mcp/)，这些本地客户端共享 Codex MCP 配置，而 ChatGPT web 使用插件且不读取本机 Codex 配置。网页端 Tunnel 使用 Stage 9 的独立向导；Stage 8 不声称真实客户端已经连接。
 
 无参数 `POST /api/mcp-self-check` 仍经过同源 session、Origin、CSRF 和专用 action intent，拒绝 query/body。自检在线程中建立隔离 fake HOME、合成库/快照和与安装器一致的 shim 模板；使用复制配置相同的 `/bin/zsh -fc` 命令和最小 PATH 启动真实 stdio 子进程。依次核验八工具 annotations、列库→列快照→核验、默认/显式 BM25 与 get_excerpt，最后比较完整临时树（包括 fake HOME 配置哨兵）。首错停止、零重试，不选择增强模型或凭据。`network_calls` 与 `external_config_writes` 为 null：没有系统级网络及隔离树外写入观测，不能把未观测伪装成零。
 
 自检响应只含固定中文步骤、布尔状态、计数及明确观测范围，不返回路径、正文、stderr 或原始异常。前端初始禁用按钮，完整校验 guide/report 后才允许复制或显示成功；每次自检使用 request ID 和 AbortController 丢弃旧响应。通过只证明隔离 fake HOME 内相同启动模板与合成链可用，不证明真实 HOME 入口执行成功或客户端已配置。
+
+### 阶段 9 ChatGPT Secure MCP Tunnel 离线向导实现
+
+向导只提供固定的非秘密演示配置模板，不接收真实 Tunnel ID、API key、任意 command/path/env，也不写入 Tunnel 或其他客户端配置。权限提示基于 [OpenAI 官方说明](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)：Platform 组织须与 ChatGPT 工作区正确关联；创建／编辑与运行／选择需要不同权限；本地健康检查不能替代 ChatGPT 发现工具的真实验证。
+
+`OfflineTunnelAdapter` 只改变进程内模拟状态，与始终返回 `real-approval-required` 的生产边界分离。Web 按签名浏览器会话保存模拟状态；无参数的启动／健康／停止动作沿用 Origin、CSRF 与专用 intent。模拟错误固定脱敏、首错停止、零自动重试；开始或健康失败后尝试停止清理，只有清理成功才显示模拟停止，显式停止或清理停止失败显示模拟状态未知。报告始终标明模拟与 `real_connected=false`，模拟健康不代表 ChatGPT 已发现工具。
+
+前端校验响应并按操作次序拒绝过期结果，避免停止后被迟到的健康结果覆盖。验收只使用内存 fake、合成会话与 Node DOM 替身；本阶段不增加依赖、不运行子进程、不发网络请求、不访问钥匙串或真实凭据。这里完成的是离线向导合同，不是生产 Tunnel transport、安全凭据接入或真实 ChatGPT 链路。
 
 ### 阶段 0–9 顺序与最小验收
 
@@ -215,7 +223,7 @@ Finder 启动器在标准应用根原子安装权限为 0700 的 `mcp-server` sh
 | 6. 三模型增强搜索（已完成） | 问题改写、向量召回、候选重排的一套可替换传输层；BM25 与增强模式分离 | 用离线假服务验证调用次数、外发边界、首错停止、无自动重试和无静默回退；真实模型、真实密钥和真实钥匙串不在本轮验收 |
 | 7. 搜索质量验收（已完成） | 公开或合成的多库、中英文、跨语言正例和负例；BM25/增强对比与指标报告 | 离线证明不串库/快照、引用可回到页码或 anchor、负例可真实为空，且评测流程可重复；不得把假模型结果宣称为真实模型质量提升 |
 | 8. 本地 MCP 向导（已完成） | 生成无 key/用户绝对路径/env 参数的固定 shell/shim 配置；同模板真实 stdio 合成自检；不自动改其他软件配置 | 八工具 annotations、列库/版本/核验、默认/显式 BM25 与读证据；完整隔离树不变、首错停止、错误脱敏、未观测项 null、不用模型/key；真实客户端配置仍留给用户复核 |
-| 9. ChatGPT Secure MCP Tunnel 向导 | Tunnel 配置、权限提示、启动/停止与健康状态流程；生产适配器和离线替身分离 | 仅用离线替身验证状态机、脱敏错误和停止流程；模拟结果只能标为“模拟通过”，不得显示真实“已连接”；到此停止，不启动真实 Tunnel |
+| 9. ChatGPT Secure MCP Tunnel 向导（本地／离线已完成） | 演示配置模板、权限提示、模拟启停与健康状态；生产待授权边界与离线替身分离 | 仅用离线替身验证状态机、脱敏错误、停止失败、会话隔离和迟到响应；只标“模拟通过”，不显示真实“已连接”；到此停止，不启动真实 Tunnel |
 
 ### 阶段 9 后的停止闸门
 

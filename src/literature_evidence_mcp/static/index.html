@@ -172,7 +172,7 @@
         <p id="mcp-copy-status" class="notice quiet" role="status" aria-live="polite"></p>
         <div class="boundary-note">
           <strong>网页端边界：</strong>
-          ChatGPT web 不会读取本机 Codex 配置；远程插件或 Tunnel 留到 Stage 9，本阶段没有实现。
+          ChatGPT web 不会读取本机 Codex 配置；Stage 9 仅提供 Tunnel 离线模拟向导。
         </div>
         <button id="mcp-self-check-button" type="button" disabled>运行本地离线 STDIO 自检</button>
         <p class="hint">
@@ -181,6 +181,39 @@
         </p>
         <p id="mcp-self-check-status" class="notice quiet" role="status" aria-live="polite"></p>
         <div id="mcp-self-check-report" class="summary" hidden></div>
+      </section>
+      <section aria-labelledby="tunnel-heading">
+        <p class="eyebrow">演示配置模板 · 尚未真实配置</p>
+        <h2 id="tunnel-heading">6. ChatGPT Secure MCP Tunnel（离线模拟）</h2>
+        <p>
+          依次体验模拟启动、健康检查、停止。这里只使用内存中的离线替身，
+          不会收集或保存真实 API key，也不会建立真实连接。
+        </p>
+        <dl class="details">
+          <dt>Tunnel ID 模板</dt><dd><code>tunnel_&lt;未来获批后由 OpenAI Platform 创建&gt;</code>（未配置）</dd>
+          <dt>本地 MCP</dt><dd>本项目固定八个只读 stdio MCP 工具</dd>
+          <dt>当前传输</dt><dd>进程内离线替身</dd>
+        </dl>
+        <h3>真实接入前需要的权限</h3>
+        <p>
+          OpenAI Platform 组织必须关联正确的 ChatGPT 工作区。
+          创建 Tunnel 需要 Read + Manage；选择或运行已有 Tunnel 需要 Read + Use，
+          ChatGPT developer mode 中的创建者也需要该 Tunnel 的 Read + Use。
+          真实运行还需要 Tunnel ID、运行凭据和本地 MCP，通过出站 HTTPS 连接；当前仅演示流程。
+        </p>
+        <p class="hint">本地健康检查不等于 ChatGPT 已发现工具；模拟通过也不代表网页端可调用工具。</p>
+        <div class="tunnel-actions">
+          <button id="tunnel-start-button" type="button" disabled>模拟启动</button>
+          <button id="tunnel-health-button" class="secondary" type="button" disabled>检查模拟健康状态</button>
+          <button id="tunnel-stop-button" class="secondary" type="button" disabled>模拟停止</button>
+        </div>
+        <p id="tunnel-state" class="notice" role="status" aria-live="polite">正在读取模拟状态……</p>
+        <p id="tunnel-message" class="hint" role="status" aria-live="polite"></p>
+        <div class="boundary-note">
+          <strong>真实运行待另行授权，当前不可用。</strong>
+          未来批准前须说明问题数与总调用数、发送的查询／正文范围、模型与成本可见性、
+          零自动重试与首错停止规则，以及需要用户完成的电脑操作。模拟流程失败后也不会自动重试。
+        </div>
       </section>
     </main>
   </body>

@@ -52,7 +52,7 @@ def _guide_base() -> dict[str, Any]:
         "tool_count": len(_TOOL_NAMES),
         "local_clients": ["ChatGPT desktop", "Codex CLI", "Codex IDE extension"],
         "web_boundary_zh": (
-            "ChatGPT web 不会读取本机 Codex 配置；远程插件或 Tunnel 留到 Stage 9。"
+            "ChatGPT web 不会读取本机 Codex 配置；Stage 9 仅提供 Tunnel 离线模拟向导。"
         ),
     }
 

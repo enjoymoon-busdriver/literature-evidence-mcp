@@ -20,6 +20,10 @@ const state = {
   mcpSelfCheckRequestId: 0,
   mcpSelfCheckController: null,
   mcpSelfChecking: false,
+  tunnelReport: null,
+  tunnelRequestId: 0,
+  tunnelController: null,
+  tunnelAction: null,
 };
 
 const MCP_GUIDE_UNAVAILABLE_MESSAGE = "本地 MCP 配置模板当前不可用。";
@@ -65,6 +69,11 @@ const elements = {
   snapshotSelect: document.querySelector("#snapshot-select"),
   switchLibraryButton: document.querySelector("#switch-library-button"),
   uploadLimits: document.querySelector("#upload-limits"),
+  tunnelStartButton: document.querySelector("#tunnel-start-button"),
+  tunnelHealthButton: document.querySelector("#tunnel-health-button"),
+  tunnelStopButton: document.querySelector("#tunnel-stop-button"),
+  tunnelState: document.querySelector("#tunnel-state"),
+  tunnelMessage: document.querySelector("#tunnel-message"),
 };
 
 function setNotice(element, message, isError = false) {
@@ -181,6 +190,8 @@ function renderMcpGuide(guide) {
 }
 
 async function loadStatus() {
+  const tunnelRequestId = state.tunnelRequestId;
+  const tunnelWasBusy = !!state.tunnelAction;
   const payload = await api("/api/status");
   state.csrfToken = payload.csrf_token;
   const reportedSimulated = payload.enhanced && payload.enhanced.simulated;
@@ -190,6 +201,9 @@ async function loadStatus() {
   state.enhancedAvailable =
     payload.enhanced_available === true && state.enhancedSimulated !== null;
   renderMcpGuide(payload.mcp_guide);
+  if (!tunnelWasBusy && tunnelRequestId === state.tunnelRequestId && !state.tunnelAction) {
+    renderTunnelReport(payload.tunnel_wizard && payload.tunnel_wizard.simulation, "status");
+  }
   elements.enhancedModeOption.disabled = !state.enhancedAvailable;
   elements.enhancedModeOption.textContent = state.enhancedAvailable
     ? (state.enhancedSimulated
@@ -1082,6 +1096,98 @@ async function runMcpSelfCheck() {
   }
 }
 
+function validTunnelReport(report, action) {
+  if (!report || typeof report !== "object" || Array.isArray(report)) {
+    return false;
+  }
+  const running = report.state === "模拟运行" || report.state === "模拟通过";
+  const unknown = report.state === "模拟状态未知";
+  return (
+    report.mode === "offline_simulation" &&
+    ["status", "start", "health", "stop"].includes(report.action) &&
+    (!action || report.action === action) &&
+    ["模拟停止", "模拟运行", "模拟通过", "模拟状态未知"].includes(report.state) &&
+    typeof report.passed === "boolean" &&
+    (!unknown || report.passed === false) &&
+    report.simulated === true &&
+    report.simulated_running === (unknown ? null : running) &&
+    report.real_connected === false &&
+    report.local_health_checked === (report.state === "模拟通过") &&
+    report.chatgpt_tool_discovery_checked === false &&
+    ["network_calls", "model_calls", "api_keys_collected", "external_config_writes", "retry_count"]
+      .every((key) => report[key] === 0) &&
+    typeof report.message === "string" && report.message.trim().length > 0 &&
+    (report.error_code === undefined || typeof report.error_code === "string") &&
+    (!report.passed || report.action === "status" ||
+      report.state === {start: "模拟运行", health: "模拟通过", stop: "模拟停止"}[report.action])
+  );
+}
+
+function updateTunnelControls() {
+  const report = state.tunnelReport;
+  elements.tunnelStartButton.disabled =
+    !!state.tunnelAction || !report || report.state !== "模拟停止";
+  elements.tunnelHealthButton.disabled =
+    !!state.tunnelAction || !report || report.simulated_running !== true;
+  // Allow stop to supersede a pending health request.
+  elements.tunnelStopButton.disabled =
+    state.tunnelAction === "start" || state.tunnelAction === "stop" ||
+    (!state.tunnelAction && (!report || report.state === "模拟停止"));
+}
+
+function renderTunnelReport(report, action) {
+  if (!validTunnelReport(report, action)) {
+    state.tunnelReport = null;
+    setNotice(elements.tunnelState, "模拟状态未知", true);
+    setNotice(elements.tunnelMessage, "模拟报告格式无效；请刷新读取状态。未确认真实连接。", true);
+    updateTunnelControls();
+    return false;
+  }
+  state.tunnelReport = report;
+  setNotice(elements.tunnelState, `${report.state} · 真实连接：未建立`, !report.passed);
+  setNotice(elements.tunnelMessage, report.message, !report.passed);
+  updateTunnelControls();
+  return true;
+}
+
+async function runTunnelAction(action) {
+  const requestId = ++state.tunnelRequestId;
+  if (state.tunnelController) state.tunnelController.abort();
+  const controller = new AbortController();
+  state.tunnelController = controller;
+  state.tunnelAction = action;
+  updateTunnelControls();
+  setNotice(elements.tunnelMessage, "正在执行离线模拟操作……");
+  try {
+    const payload = await api(`/api/tunnel/simulated/${action}`, {
+      method: "POST",
+      headers: actionHeaders(`tunnel-simulated-${action}`),
+      signal: controller.signal,
+    });
+    if (requestId !== state.tunnelRequestId) return;
+    renderTunnelReport(payload.tunnel, action);
+  } catch (error) {
+    if (requestId !== state.tunnelRequestId || error.name === "AbortError") return;
+    const report = error.payload && error.payload.tunnel;
+    if (report && report.passed === false) {
+      renderTunnelReport(report, action);
+    } else {
+      renderTunnelReport(null);
+      setNotice(elements.tunnelMessage, "未能确认模拟操作结果；请刷新读取状态。没有自动重试。", true);
+    }
+  } finally {
+    if (requestId === state.tunnelRequestId) {
+      state.tunnelController = null;
+      state.tunnelAction = null;
+      updateTunnelControls();
+    }
+  }
+}
+
+function runTunnelStart() { return runTunnelAction("start"); }
+function runTunnelHealth() { return runTunnelAction("health"); }
+function runTunnelStop() { return runTunnelAction("stop"); }
+
 async function refreshAll() {
   try {
     await loadStatus();
@@ -1116,6 +1222,9 @@ elements.copyMcpTomlButton.addEventListener("click", () => {
   copyMcpConfig(elements.mcpToml.value, "TOML");
 });
 elements.mcpSelfCheckButton.addEventListener("click", runMcpSelfCheck);
+elements.tunnelStartButton.addEventListener("click", runTunnelStart);
+elements.tunnelHealthButton.addEventListener("click", runTunnelHealth);
+elements.tunnelStopButton.addEventListener("click", runTunnelStop);
 elements.dropZone.addEventListener("dragover", (event) => {
   event.preventDefault();
   elements.dropZone.classList.add("dragging");

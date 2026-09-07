@@ -43,6 +43,12 @@ from .mcp_selfcheck import (
     run_stdio_self_check,
 )
 from .registry import LibraryRegistry
+from .tunnel_wizard import (
+    PRODUCTION_START_INTENT,
+    TunnelSimulation,
+    production_boundary_report,
+    tunnel_wizard_guide,
+)
 
 
 LOOPBACK_HOST = "127.0.0.1"
@@ -965,6 +971,7 @@ def create_app(
 
     registry = LibraryRegistry(application_root)
     sessions = SessionTokens()
+    tunnel_simulations: dict[str, TunnelSimulation] = {}
     build_lock = threading.Lock()
     authority = f"{LOOPBACK_HOST}:{port}"
     origin = f"http://{authority}"
@@ -1022,6 +1029,12 @@ def create_app(
                 "max_total_bytes": upload_limits.max_total_bytes,
             },
             "mcp_guide": local_mcp_guide(application_root),
+            "tunnel_wizard": {
+                "guide": tunnel_wizard_guide(),
+                "simulation": tunnel_simulations.setdefault(
+                    session_id, TunnelSimulation()
+                ).snapshot(),
+            },
             "csrf_token": csrf_token,
         }
         response = JSONResponse(payload)
@@ -1199,6 +1212,29 @@ def create_app(
             )
         return JSONResponse({"self_check": report})
 
+    async def tunnel_action(request: Request) -> Response:
+        action = request.path_params["action"]
+        if action not in {"start", "health", "stop"}:
+            raise RequestBoundaryError(404, "未找到该模拟操作。")
+        _require_intent(request, f"tunnel-simulated-{action}")
+        if request.url.query or await request.body():
+            raise RequestBoundaryError(400, "Tunnel 离线模拟不接受任何参数。")
+        session_id = sessions.validate_cookie(request.cookies.get(cookie_name))
+        assert session_id is not None
+        simulation = tunnel_simulations.setdefault(session_id, TunnelSimulation())
+        # The fake completes synchronously, so state transitions cannot interleave.
+        status_code, report = getattr(simulation, action)()
+        return JSONResponse({"tunnel": report}, status_code=status_code)
+
+    async def tunnel_production_start(request: Request) -> Response:
+        _require_intent(request, PRODUCTION_START_INTENT)
+        if request.url.query or await request.body():
+            raise RequestBoundaryError(400, "生产 Tunnel 边界不接受任何参数。")
+        report = production_boundary_report()
+        return _error_response(
+            409, report["message"], {**report, "code": "real-approval-required"}
+        )
+
     async def request_boundary_handler(
         _request: Request, exc: Exception
     ) -> JSONResponse:
@@ -1257,6 +1293,8 @@ def create_app(
         Route("/static/app.js", script, methods=["GET"]),
         Route("/api/status", status, methods=["GET"]),
         Route("/api/mcp-self-check", mcp_self_check, methods=["POST"]),
+        Route("/api/tunnel/simulated/{action:str}", tunnel_action, methods=["POST"]),
+        Route("/api/tunnel/production-start", tunnel_production_start, methods=["POST"]),
         Route("/api/libraries", libraries, methods=["GET"]),
         Route("/api/libraries", create_library, methods=["POST"]),
         Route(

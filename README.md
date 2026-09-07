@@ -2,9 +2,9 @@
 
 一个面向普通用户的本地文献证据工具：把用户明确选择的 Markdown 或带文本层 PDF 写入资料库自己的内容寻址对象区，生成完整冻结快照，记录来源哈希、SQLite schema 与数量，再用本地 SQLite FTS5/BM25 提供可追溯的搜索结果。
 
-项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四、下一轮产品化阶段 0 合同以及阶段 1–8；阶段 9 尚未实现。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
+项目目标是“可审计的本地文献证据工具 + 八个只读 MCP 工具”，不是通用聊天软件。当前已完成历史阶段一至阶段四，以及下一轮产品化阶段 0–9 的本地实现与离线验收合同；真实模型、客户端与 Tunnel 链路尚未验收。历史阶段四提供的是源码项目里的 Apple Silicon macOS 开发版 `.command` 入口，不是自包含、已签名或已公证的 App/DMG/pkg。
 
-## 当前已实现：历史阶段一至阶段四与产品化阶段 1–8
+## 当前已实现：历史阶段一至阶段四与产品化阶段 1–9（本地／离线）
 
 - 显式导入 UTF-8 Markdown 和带文本层 PDF。
 - 每次 `build` 都新建快照；不覆盖或修改旧快照。
@@ -36,6 +36,7 @@
 - Stage 7 JSON 报告按模式记录 hit@k、recall@k、MRR、真实空准确率、库/快照隔离违规和 anchor/页码可追溯覆盖，并固定标为 `offline_simulated`、真实模型调用 0、网络调用 0。它只验收离线管线，不能推出真实模型质量提升。
 - Stage 8 由 Finder 启动器安装固定的 `mcp-server` 入口，管理页生成经 `/bin/zsh -fc` 解析该入口的 `codex mcp add` 与等价 TOML；未准备好时禁止复制。页面不会执行配置命令、写入 Codex 配置或让用户填写任意路径、命令和环境变量。
 - Stage 8 自检通过同一 shell/入口模板，在隔离 fake HOME 中真实启动 stdio MCP 子进程，完成八工具核验、列库→列快照→核验、默认/显式 BM25 搜索和有界证据读取，并检查完整隔离树未改写。报告说明网络与隔离树外写入没有系统级观测（`null`），本次流程不使用增强模型/key，零重试。通过不代表真实 HOME 的入口已运行，也不代表客户端已经配置。
+- Stage 9 页面提供 ChatGPT Secure MCP Tunnel 的演示配置模板、权限说明和模拟启动／健康检查／停止。状态按签名浏览器会话隔离；模拟报告始终标明 `real_connected=false`，停止失败显示状态未知。生产入口只返回 `real-approval-required`，不运行真实 Tunnel、不接收真实密钥，也不修改其他应用配置。
 - Finder 可双击的 [`启动文献证据管理页.command`](./启动文献证据管理页.command)：从自身位置确定完整项目，路径含空格也可使用。
 - 首次运行先核对 macOS、arm64、Python 3.11+、SQLite `serialize/deserialize` 和 FTS5，再在项目 `.venv/` 中做非 editable 安装。
 - 双击入口使用稳定的用户应用根，端口绑定成功后才打开默认浏览器；终端前台运行，`Ctrl+C` 即停止。
@@ -85,7 +86,7 @@ command = "/bin/zsh"
 args = ["-fc", "exec \"$HOME/Library/Application Support/literature-evidence-mcp/mcp-server\""]
 ```
 
-这些文本只解析固定的 `$HOME` 应用位置，不包含 key、用户绝对路径、虚拟环境路径或可填写的 env。Finder 入口会原子更新权限为 0700 的 shim；管理页只检查模板及解释器是否就绪，不执行真实入口。点击复制后仍是“未配置”，需要用户自行粘贴并按客户端提示操作。本地 BM25 与八工具不需要 OpenAI API key。ChatGPT web 的远程插件/Tunnel 路径属于尚未实现的 Stage 9。
+这些文本只解析固定的 `$HOME` 应用位置，不包含 key、用户绝对路径、虚拟环境路径或可填写的 env。Finder 入口会原子更新权限为 0700 的 shim；管理页只检查模板及解释器是否就绪，不执行真实入口。点击复制后仍是“未配置”，需要用户自行粘贴并按客户端提示操作。本地 BM25 与八工具不需要 OpenAI API key。ChatGPT web 使用独立的 Tunnel 路径，Stage 9 当前只提供离线模拟向导。
 
 需要 MCP 时，由用户在支持 stdio command/args 的 host 中手工设置下列等价命令；它固定应用注册表根，没有 host、port、URL 或其他 transport 参数：
 
@@ -244,7 +245,13 @@ literature-evidence search <snapshot-path> "Shannon entropy"
 3. **阶段三（已完成）**：八类 closed-world stdio 只读 MCP 能力；`search_documents` 与 `find_in_document` 只走本地 BM25，不含 combo、API Key 或 Tunnel。
 4. **阶段四（已完成）**：macOS Apple Silicon 开发版 `.command` 入口、首次预检/受控安装、标准用户应用根和前台管理页启动。自包含、签名/公证 App、DMG 或 pkg 仍属范围外。
 
-下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结多资料库、稳定 ID、完整冻结快照、库内增量复用、BM25/增强分离和八工具演进合同；阶段 1–8 已依次实现多资料库核心、双级快照生命周期、库内对象复用、离线同配置向量复用、小白多资料库导入界面、离线可替换三角色增强链、合成离线搜索质量验收和本地 MCP 向导/真实 stdio 离线自检，阶段 9 尚未实现。阶段 6–8 都没有真实 provider adapter、真实模型/密钥、真实 Keychain、真实外部客户端配置或真实远程链路结论。完整顺序、每阶段最小验收和真实模型/钥匙串/Tunnel/ChatGPT 停止闸门见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。后续路线做到阶段 9 的本地实现与离线模拟即停止，不把模拟通过表述为真实链路通过。
+下一轮阶段 0–9 与上面的历史编号分开：阶段 0 冻结合同；阶段 1–9 已依次完成多资料库、双级快照生命周期、库内增量对象复用、离线同配置向量复用、小白导入界面、可替换三角色增强链、合成搜索质量验收、本地 MCP 向导与真实 stdio 离线自检，以及 Tunnel 离线模拟向导。阶段 6 的真实供应商 transport 与安全凭据接入仍未实现，阶段 9 的生产 Tunnel 入口仍明确停在待授权边界；这些不是可直接使用的真实增强／网页连接。完整顺序与最小验收见 [ARCHITECTURE.md](./ARCHITECTURE.md#下一轮产品化阶段-0-合同)。本轮已到停止点，不自动进入首次使用、真实链路排障、总验收或打包发布。
+
+### Tunnel 向导现在能做什么
+
+管理页的“ChatGPT Secure MCP Tunnel（离线模拟）”展示演示配置模板，不能把模板当成已创建的真实 Tunnel。用户可依次点模拟启动、检查模拟健康状态、模拟停止；失败消息固定脱敏，零自动重试。模拟健康通过不等于 ChatGPT 已发现八个工具，页面不收集或保存真实 API key。
+
+真实运行所需的 Tunnel ID、运行凭据、OpenAI Platform 组织与 ChatGPT 工作区关联，以及创建用 `Read + Manage`、运行／选择用 `Read + Use` 权限，见 [OpenAI Secure MCP Tunnel 官方说明](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。这不是当前向导已经完成的真实配置。后续需要另行授权并先明确外发查询／正文、调用次数与成本、首错停止规则，再进行隔离测试环境中的首次使用与真实链路复核；本轮没有启动 Tunnel、提交认证或操作 ChatGPT 网页。
 
 OCR、Zotero、Windows/Linux、Intel Mac、自动更新、文件夹监控、完整聊天界面、自动删除/垃圾回收、App/DMG 打包、签名、公证和发布不在阶段 0–9 范围内。
 
