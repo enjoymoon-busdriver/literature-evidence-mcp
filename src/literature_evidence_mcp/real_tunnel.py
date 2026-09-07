@@ -148,11 +148,16 @@ class RealTunnel:
                 os.close(write_fd)
                 write_fd = None
                 key = ""
+                # Only the MCP child needs the user's HOME for macOS Keychain;
+                # tunnel-client keeps its private HOME and configuration directory.
+                mcp_command = shlex.join([
+                    "/usr/bin/env", f"HOME={Path.home()}", str(self._shim),
+                ])
                 command = [
                     str(self._binary), "run",
                     "--control-plane.tunnel-id", tunnel_id,
                     "--control-plane.api-key", f"file:/dev/fd/{read_fd}",
-                    "--mcp.command", shlex.quote(str(self._shim)),
+                    "--mcp.command", mcp_command,
                     "--health.listen-addr", "127.0.0.1:0",
                     "--health.url-file", str(self._run / "health.url"),
                     "--pid.file", str(self._run / "tunnel.pid"),

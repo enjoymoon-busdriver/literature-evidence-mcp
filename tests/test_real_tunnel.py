@@ -51,6 +51,7 @@ class RealTunnelTests(unittest.TestCase):
         self.processes = []
         self.starts = []
         self.signals = []
+        self.real_popen = subprocess.Popen
         self.popen = mock.patch(MODULE + "subprocess.Popen", side_effect=self.spawn).start()
         self.getpgid = mock.patch(MODULE + "os.getpgid", return_value=FakeProcess.pid).start()
         self.killpg = mock.patch(MODULE + "os.killpg", side_effect=self.kill).start()
@@ -98,7 +99,9 @@ class RealTunnelTests(unittest.TestCase):
         self.assertEqual(command[:2], [str(self.root / "bin" / "tunnel-client"), "run"])
         self.assertEqual(command[command.index("--health.listen-addr") + 1], "127.0.0.1:0")
         mcp_command = command[command.index("--mcp.command") + 1]
-        self.assertEqual(shlex.split(mcp_command), [str(self.root / "mcp-server")])
+        self.assertEqual(shlex.split(mcp_command), [
+            "/usr/bin/env", f"HOME={Path.home()}", str(self.root / "mcp-server"),
+        ])
         self.assertTrue(command[command.index("--control-plane.api-key") + 1].startswith("file:/dev/fd/"))
         self.assertTrue(options["start_new_session"])
         self.assertFalse(options["shell"])
@@ -122,6 +125,27 @@ class RealTunnelTests(unittest.TestCase):
         self.assertFalse(stopped["running"])
         self.assertEqual(self.signals, [signal.SIGINT, 0])
         self.assertFalse(run.exists())
+
+    def test_mcp_child_restores_home_without_changing_tunnel_environment(self) -> None:
+        user_home = self.root / "user home ' $USER"
+        (self.root / "mcp-server").write_text(
+            '#!/bin/sh\n/usr/bin/printf \'%s\\n\' "$HOME" "$XDG_CONFIG_HOME"\n',
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"HOME": str(user_home)}):
+            self.start()
+        command, options = self.starts[0]
+        private_home = str(self.tunnel._run / "home")
+        self.assertEqual(options["env"]["HOME"], private_home)
+        self.assertEqual(options["env"]["XDG_CONFIG_HOME"], private_home + "/.config")
+        mcp_command = command[command.index("--mcp.command") + 1]
+        with mock.patch(MODULE + "subprocess.Popen", new=self.real_popen):
+            child = subprocess.run(
+                ["/bin/sh", "-c", mcp_command], env=options["env"],
+                capture_output=True, text=True, check=True, timeout=5,
+            )
+        self.assertEqual(child.stdout.splitlines(), [str(user_home), private_home + "/.config"])
+        self.assertEqual(options["env"]["HOME"], private_home)
 
     def test_key_failures_are_redacted_and_do_not_start(self) -> None:
         class Missing(Exception):
