@@ -22,6 +22,10 @@ const state = {
   mcpSelfChecking: false,
 };
 
+const MCP_GUIDE_UNAVAILABLE_MESSAGE = "本地 MCP 配置模板当前不可用。";
+const MCP_INVALID_REPORT_MESSAGE =
+  "本地离线自检返回的数据格式无效；未展示结果，也未写入任何客户端配置。";
+
 const elements = {
   baseSnapshotSelect: document.querySelector("#base-snapshot-select"),
   buildBlank: document.querySelector("#build-blank"),
@@ -130,8 +134,28 @@ function enhancedRunLabel(simulated) {
   return "增强状态未知";
 }
 
+function validMcpGuide(guide) {
+  if (!guide || typeof guide !== "object" || Array.isArray(guide)) {
+    return false;
+  }
+  if (guide.state === "unavailable") {
+    return typeof guide.reason === "string" && guide.reason.trim().length > 0;
+  }
+  return (
+    guide.state === "copy_ready_not_configured" &&
+    guide.server_name === "literature-evidence" &&
+    guide.tool_count === 8 &&
+    guide.api_key_required === false &&
+    typeof guide.cli === "string" &&
+    guide.cli.trim().length > 0 &&
+    typeof guide.toml === "string" &&
+    guide.toml.trim().length > 0
+  );
+}
+
 function renderMcpGuide(guide) {
-  state.mcpGuide = guide && guide.state === "copy_only_not_configured"
+  state.mcpGuide = validMcpGuide(guide) &&
+    guide.state === "copy_ready_not_configured"
     ? guide
     : null;
   elements.mcpCli.value = state.mcpGuide ? state.mcpGuide.cli : "";
@@ -141,7 +165,18 @@ function renderMcpGuide(guide) {
   elements.copyMcpTomlButton.disabled = unavailable;
   elements.mcpSelfCheckButton.disabled = unavailable || state.mcpSelfChecking;
   if (unavailable) {
-    setNotice(elements.mcpCopyStatus, "本地 MCP 配置模板当前不可用。", true);
+    elements.mcpCli.value = "";
+    elements.mcpToml.value = "";
+    elements.mcpSelfCheckReport.replaceChildren();
+    elements.mcpSelfCheckReport.hidden = true;
+    setNotice(elements.mcpSelfCheckStatus, "");
+    setNotice(
+      elements.mcpCopyStatus,
+      validMcpGuide(guide) ? guide.reason : MCP_GUIDE_UNAVAILABLE_MESSAGE,
+      true,
+    );
+  } else {
+    setNotice(elements.mcpCopyStatus, "");
   }
 }
 
@@ -888,7 +923,12 @@ async function search() {
 }
 
 async function copyMcpConfig(text, label) {
-  if (!text || !navigator.clipboard || !navigator.clipboard.writeText) {
+  if (
+    typeof text !== "string" ||
+    !text ||
+    !navigator.clipboard ||
+    !navigator.clipboard.writeText
+  ) {
     setNotice(
       elements.mcpCopyStatus,
       "浏览器未提供复制权限；请手动选择文本复制。未修改任何客户端配置。",
@@ -922,11 +962,12 @@ function renderMcpSelfCheck(report) {
       : "本地离线 STDIO 自检未通过",
   );
   const summary = [
+    `观测范围：${report.observation_scope_zh}`,
     `工具数：${report.tool_count === null ? "未取得" : report.tool_count}`,
-    `网络调用：${report.network_calls}`,
+    `网络调用：${report.network_calls === null ? "未观测" : report.network_calls}`,
     `模型调用：${report.model_calls}`,
     `API key 使用：${report.api_keys_used}`,
-    `外部配置写入：${report.external_config_writes}`,
+    `外部配置写入：${report.external_config_writes === null ? "未观测" : report.external_config_writes}`,
     `重试：${report.retry_count}`,
   ];
   appendText(elements.mcpSelfCheckReport, "p", summary.join("；"));
@@ -939,6 +980,50 @@ function renderMcpSelfCheck(report) {
     );
   }
   elements.mcpSelfCheckReport.append(list);
+}
+
+function validMcpSelfCheckReport(report) {
+  if (!report || typeof report !== "object" || Array.isArray(report)) {
+    return false;
+  }
+  if (
+    report.scope !== "local_stdio_self_check" ||
+    report.evidence_level !== "offline_local_stdio" ||
+    typeof report.observation_scope_zh !== "string" ||
+    report.observation_scope_zh.trim().length === 0 ||
+    typeof report.message !== "string" ||
+    report.message.trim().length === 0 ||
+    typeof report.passed !== "boolean" ||
+    report.network_calls !== null ||
+    report.external_config_writes !== null ||
+    report.model_calls !== 0 ||
+    report.api_keys_used !== 0 ||
+    report.retry_count !== 0 ||
+    !Array.isArray(report.steps) ||
+    report.steps.length === 0
+  ) {
+    return false;
+  }
+  if (!report.steps.every((step) => (
+    step &&
+    typeof step === "object" &&
+    !Array.isArray(step) &&
+    typeof step.name === "string" &&
+    step.name.trim().length > 0 &&
+    typeof step.message === "string" &&
+    step.message.trim().length > 0 &&
+    typeof step.passed === "boolean"
+  ))) {
+    return false;
+  }
+  if (report.passed) {
+    return (
+      report.tool_count === 8 &&
+      report.steps.length === 6 &&
+      report.steps.every((step) => step.passed === true)
+    );
+  }
+  return report.tool_count === null || report.tool_count === 8;
 }
 
 async function runMcpSelfCheck() {
@@ -966,6 +1051,10 @@ async function runMcpSelfCheck() {
       return;
     }
     const report = payload.self_check;
+    if (!validMcpSelfCheckReport(report)) {
+      setNotice(elements.mcpSelfCheckStatus, MCP_INVALID_REPORT_MESSAGE, true);
+      return;
+    }
     renderMcpSelfCheck(report);
     setNotice(
       elements.mcpSelfCheckStatus,

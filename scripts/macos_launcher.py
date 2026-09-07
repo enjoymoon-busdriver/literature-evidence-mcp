@@ -11,6 +11,8 @@ import json
 import os
 import platform
 import re
+import secrets
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -24,6 +26,7 @@ PYTHON_DOWNLOAD_URL = "https://www.python.org/downloads/macos/"
 MINIMUM_PYTHON = (3, 11)
 DEFAULT_PORT = 8765
 MARKER_NAME = ".literature-evidence-install.json"
+MCP_SHIM_NAME = "mcp-server"
 PYTHON_LINK_NAME = re.compile(r"python(?:3(?:\.\d+)?t?)?")
 SETUPTOOLS_DISTUTILS_PTH = (
     "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; "
@@ -52,6 +55,7 @@ class LauncherPaths(NamedTuple):
     venv_python: Path
     application_root: Path
     marker: Path
+    mcp_shim: Path
 
 
 class PythonIdentity(NamedTuple):
@@ -166,6 +170,7 @@ def resolve_paths(project_root: Path, *, home: Optional[Path] = None) -> Launche
         venv_python=venv / "bin" / "python",
         application_root=application_root,
         marker=venv / MARKER_NAME,
+        mcp_shim=application_root / MCP_SHIM_NAME,
     )
 
 
@@ -686,7 +691,7 @@ def prepare_environment(
     return True
 
 
-def ensure_application_root(path: Path) -> None:
+def _open_application_root(path: Path, *, create: bool) -> int:
     try:
         absolute = Path(os.path.abspath(os.fspath(path)))
     except (OSError, TypeError, ValueError) as exc:
@@ -702,6 +707,8 @@ def ensure_application_root(path: Path) -> None:
             try:
                 status = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
             except FileNotFoundError:
+                if not create:
+                    raise LauncherError("应用根尚未安全准备；未写入该位置。")
                 try:
                     os.mkdir(part, mode=0o700, dir_fd=descriptor)
                 except FileExistsError:
@@ -714,6 +721,9 @@ def ensure_application_root(path: Path) -> None:
             child = os.open(part, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
+        result = descriptor
+        descriptor = None
+        return result
     except LauncherError:
         raise
     except OSError as exc:
@@ -724,6 +734,118 @@ def ensure_application_root(path: Path) -> None:
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+def ensure_application_root(path: Path) -> None:
+    descriptor = _open_application_root(path, create=True)
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise LauncherError("无法同步应用根目录；未继续启动。") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _mcp_shim_text(paths: LauncherPaths) -> str:
+    command = (
+        f"exec {shlex.quote(os.fspath(paths.venv_python))} -I -B -m "
+        "literature_evidence_mcp.mcp_server --application-root "
+        f"{shlex.quote(os.fspath(paths.application_root))}"
+    )
+    return f"#!/bin/zsh -f\n{command}\n"
+
+
+def install_mcp_shim(paths: LauncherPaths) -> None:
+    """Atomically install the fixed local MCP entry inside the application root."""
+    root_descriptor = _open_application_root(paths.application_root, create=False)
+    temporary_name = None
+    temporary_descriptor = None
+    try:
+        try:
+            current = os.stat(
+                MCP_SHIM_NAME,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            current = None
+        if current is not None and (
+            stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode)
+        ):
+            raise LauncherError(
+                "本地 MCP 启动入口已存在但不是普通文件；未覆盖该位置。"
+            )
+
+        payload = _mcp_shim_text(paths).encode("utf-8")
+        for _attempt in range(8):
+            candidate = f".{MCP_SHIM_NAME}.{secrets.token_hex(8)}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            try:
+                temporary_descriptor = os.open(
+                    candidate,
+                    flags,
+                    0o700,
+                    dir_fd=root_descriptor,
+                )
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_descriptor is None or temporary_name is None:
+            raise LauncherError("无法创建本地 MCP 启动入口临时文件。")
+
+        os.fchmod(temporary_descriptor, 0o700)
+        view = memoryview(payload)
+        while view:
+            written = os.write(temporary_descriptor, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
+        os.fsync(temporary_descriptor)
+        os.close(temporary_descriptor)
+        temporary_descriptor = None
+
+        try:
+            current = os.stat(
+                MCP_SHIM_NAME,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            current = None
+        if current is not None and (
+            stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode)
+        ):
+            raise LauncherError(
+                "本地 MCP 启动入口已改变为非普通文件；未覆盖该位置。"
+            )
+
+        os.replace(
+            temporary_name,
+            MCP_SHIM_NAME,
+            src_dir_fd=root_descriptor,
+            dst_dir_fd=root_descriptor,
+        )
+        temporary_name = None
+        os.fsync(root_descriptor)
+    except LauncherError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise LauncherError("无法安全安装本地 MCP 启动入口。") from exc
+    finally:
+        if temporary_descriptor is not None:
+            try:
+                os.close(temporary_descriptor)
+            except OSError:
+                pass
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=root_descriptor)
+            except OSError:
+                pass
+        os.close(root_descriptor)
 
 
 def _port(value: str) -> int:
@@ -785,6 +907,7 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
 
     prepare_environment(paths)
     ensure_application_root(paths.application_root)
+    install_mcp_shim(paths)
     if args.prepare_only:
         print("环境和多资料库应用根已准备；按要求没有启动管理页。")
         _print_paths(paths)

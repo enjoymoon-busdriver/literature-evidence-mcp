@@ -194,13 +194,13 @@ JSON 报告按模式分列 positive hit@k/recall@k、MRR、首次命中 rank、�
 
 ### 阶段 8 本地 MCP 新手向导与离线自检实现
 
-管理页的 Stage 8 向导只从代码常量生成两个等价、可复制的本地 stdio 配置：`codex mcp add literature-evidence -- literature-evidence-mcp` 和只含 `command = "literature-evidence-mcp"` 的 TOML。两者复用现有安装后的 console entry，不包含 key、用户资料路径、源码/虚拟环境绝对路径、任意 command、args 或 env。复制使用浏览器 Clipboard API，只改变页面提示为“已复制但尚未配置”；后端不运行 shell、不调用 `codex mcp add`，也不读写任何外部客户端配置。
+Finder 启动器在标准应用根原子安装权限为 0700 的 `mcp-server` shim，固定调用本项目 `.venv` Python 的 `-I -B -m literature_evidence_mcp.mcp_server`，不限制正常增强搜索能力。管理页从代码常量生成等价 CLI/TOML：`/bin/zsh -fc` 执行 `exec "$HOME/Library/Application Support/literature-evidence-mcp/mcp-server"`。文本无 key、用户绝对路径、虚拟环境路径或可填写的 env；只在标准根、shim 模板与解释器就绪时允许复制。复制只显示“已复制但尚未配置”，不执行配置命令或修改外部客户端配置；就绪检查不等于真实入口已执行。
 
 这条配置只面向同一 host 上支持 stdio 的 ChatGPT desktop、Codex CLI 与 Codex IDE 扩展。根据 [OpenAI 官方 MCP 文档](https://developers.openai.com/codex/mcp/)，这些本地客户端共享 Codex MCP 配置，而 ChatGPT web 使用插件且不读取本机 Codex 配置。因此网页端远程插件/Tunnel 明确保留给尚未实现的 Stage 9；Stage 8 不声称真实客户端已经连接。
 
-无参数 `POST /api/mcp-self-check` 仍经过同源 session、Origin、CSRF 和专用 action intent；任何 query 或 body 都拒绝，不能注入 command、path 或 env。自检在线程中创建一次性临时应用根和合成 Markdown，建立一座合成资料库与冻结快照，再以受控白名单环境启动真实 `literature_evidence_mcp.mcp_server` stdio 子进程。客户端先核验工具名恰好八个、全部 `readOnlyHint=true`/`destructiveHint=false` 且仅 `search_documents` 为 open-world，再依次调用 `retrieval_status`、省略/显式 BM25 的 `search_documents` 和 `get_excerpt`。最后比较合成应用树读取前后的类型与内容摘要；首错停止、零重试，不调用 enhanced、模型、网络或 key。
+无参数 `POST /api/mcp-self-check` 仍经过同源 session、Origin、CSRF 和专用 action intent，拒绝 query/body。自检在线程中建立隔离 fake HOME、合成库/快照和与安装器一致的 shim 模板；使用复制配置相同的 `/bin/zsh -fc` 命令和最小 PATH 启动真实 stdio 子进程。依次核验八工具 annotations、列库→列快照→核验、默认/显式 BM25 与 get_excerpt，最后比较完整临时树（包括 fake HOME 配置哨兵）。首错停止、零重试，不选择增强模型或凭据。`network_calls` 与 `external_config_writes` 为 null：没有系统级网络及隔离树外写入观测，不能把未观测伪装成零。
 
-自检响应只含固定中文步骤、布尔状态与计数，不返回临时路径、合成正文、stderr、raw exception 或 traceback。异常响应同样固定脱敏。前端每次自检递增 request ID，并用 `AbortController` 终止旧浏览器请求；即使旧响应最后到达，也必须经过 request ID 核对后丢弃。通过信息固定说明它只证明本项目的本地离线 stdio 合成链可用，不等于 ChatGPT desktop、Codex CLI 或 IDE 已配置。
+自检响应只含固定中文步骤、布尔状态、计数及明确观测范围，不返回路径、正文、stderr 或原始异常。前端初始禁用按钮，完整校验 guide/report 后才允许复制或显示成功；每次自检使用 request ID 和 AbortController 丢弃旧响应。通过只证明隔离 fake HOME 内相同启动模板与合成链可用，不证明真实 HOME 入口执行成功或客户端已配置。
 
 ### 阶段 0–9 顺序与最小验收
 
@@ -214,7 +214,7 @@ JSON 报告按模式分列 positive hit@k/recall@k、MRR、首次命中 rank、�
 | 5. 小白导入界面（已完成） | 在现有本地网页中创建/切换资料库，拖放或选择文件，显示逐文件阶段、失败原因、快照差异和新增/复用统计 | 从空白状态仅用界面建立两个库和多个快照；无需终端；部分失败不会发布残缺快照或破坏旧快照 |
 | 6. 三模型增强搜索（已完成） | 问题改写、向量召回、候选重排的一套可替换传输层；BM25 与增强模式分离 | 用离线假服务验证调用次数、外发边界、首错停止、无自动重试和无静默回退；真实模型、真实密钥和真实钥匙串不在本轮验收 |
 | 7. 搜索质量验收（已完成） | 公开或合成的多库、中英文、跨语言正例和负例；BM25/增强对比与指标报告 | 离线证明不串库/快照、引用可回到页码或 anchor、负例可真实为空，且评测流程可重复；不得把假模型结果宣称为真实模型质量提升 |
-| 8. 本地 MCP 向导（已完成） | 为同一 host 的本地客户端生成 path/key/env-free 可复制配置；真实启动项目 stdio server，提供八工具离线合成自检；不自动改其他软件配置 | 真实 stdio 客户端核验八工具 annotations，并完成状态、默认/显式 BM25 搜索和读证据；树身份不变、首错停止、错误脱敏、网络/模型/key/外部配置写入均为零；真实客户端配置仍留给用户复核 |
+| 8. 本地 MCP 向导（已完成） | 生成无 key/用户绝对路径/env 参数的固定 shell/shim 配置；同模板真实 stdio 合成自检；不自动改其他软件配置 | 八工具 annotations、列库/版本/核验、默认/显式 BM25 与读证据；完整隔离树不变、首错停止、错误脱敏、未观测项 null、不用模型/key；真实客户端配置仍留给用户复核 |
 | 9. ChatGPT Secure MCP Tunnel 向导 | Tunnel 配置、权限提示、启动/停止与健康状态流程；生产适配器和离线替身分离 | 仅用离线替身验证状态机、脱敏错误和停止流程；模拟结果只能标为“模拟通过”，不得显示真实“已连接”；到此停止，不启动真实 Tunnel |
 
 ### 阶段 9 后的停止闸门

@@ -10,6 +10,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -151,6 +152,7 @@ class StageFourPreflightTests(unittest.TestCase):
             paths.application_root,
             home.resolve() / "Library/Application Support/literature-evidence-mcp",
         )
+        self.assertEqual(paths.mcp_shim, paths.application_root / "mcp-server")
 
     def test_finder_command_locates_project_with_spaces_from_unrelated_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -728,6 +730,86 @@ class StageFourEnvironmentTests(unittest.TestCase):
                 launcher.ensure_application_root(paths.application_root)
 
             self.assertEqual(list(outside.iterdir()), [])
+
+    def test_mcp_shim_is_atomic_0700_updates_for_spaces_and_rejects_symlink(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            home = root / "home with spaces"
+            first_project = root / "first project with spaces"
+            second_project = root / "moved project with spaces"
+            first_project.mkdir()
+            second_project.mkdir()
+            first = launcher.resolve_paths(first_project, home=home)
+            second = launcher.resolve_paths(second_project, home=home)
+            _make_fake_venv(first)
+            _make_fake_venv(second)
+            launcher.ensure_application_root(first.application_root)
+
+            launcher.install_mcp_shim(first)
+            first_inode = first.mcp_shim.stat().st_ino
+            self.assertEqual(
+                first.mcp_shim.read_text(encoding="utf-8"),
+                launcher._mcp_shim_text(first),
+            )
+            self.assertEqual(stat.S_IMODE(first.mcp_shim.stat().st_mode), 0o700)
+            self.assertIn("literature_evidence_mcp.mcp_server", first.mcp_shim.read_text())
+            self.assertNotIn("guarded_mcp", first.mcp_shim.read_text())
+
+            launcher.install_mcp_shim(second)
+            self.assertNotEqual(first_inode, second.mcp_shim.stat().st_ino)
+            self.assertEqual(
+                second.mcp_shim.read_text(encoding="utf-8"),
+                launcher._mcp_shim_text(second),
+            )
+            self.assertEqual(stat.S_IMODE(second.mcp_shim.stat().st_mode), 0o700)
+            self.assertEqual(
+                list(second.application_root.glob(".mcp-server.*.tmp")),
+                [],
+            )
+
+            outside = root / "outside-sentinel"
+            outside.write_text("unchanged\n", encoding="utf-8")
+            second.mcp_shim.unlink()
+            second.mcp_shim.symlink_to(outside)
+            with self.assertRaisesRegex(launcher.LauncherError, "不是普通文件"):
+                launcher.install_mcp_shim(second)
+            self.assertTrue(second.mcp_shim.is_symlink())
+            self.assertEqual(outside.read_text(encoding="utf-8"), "unchanged\n")
+
+    def test_mcp_shim_replace_failure_preserves_old_entry_and_cleans_temporary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = root / "project"
+            project.mkdir()
+            paths = launcher.resolve_paths(project, home=root / "home")
+            _make_fake_venv(paths)
+            launcher.ensure_application_root(paths.application_root)
+            paths.mcp_shim.write_text("old-safe-shim\n", encoding="utf-8")
+            paths.mcp_shim.chmod(0o700)
+
+            with mock.patch.object(
+                launcher.os,
+                "replace",
+                side_effect=OSError("synthetic replace failure"),
+            ):
+                with self.assertRaisesRegex(
+                    launcher.LauncherError,
+                    "无法安全安装",
+                ):
+                    launcher.install_mcp_shim(paths)
+
+            self.assertEqual(
+                paths.mcp_shim.read_text(encoding="utf-8"),
+                "old-safe-shim\n",
+            )
+            self.assertEqual(
+                list(paths.application_root.glob(".mcp-server.*.tmp")),
+                [],
+            )
 
 
 class StageFourBrowserAndLifecycleTests(unittest.TestCase):

@@ -982,7 +982,6 @@ def create_app(
         "call_count": 0,
         "calls": [],
     }
-    mcp_guide = local_mcp_guide()
 
     async def index(_request: Request) -> Response:
         return FileResponse(_STATIC_ROOT / "index.html", media_type="text/html")
@@ -1022,7 +1021,7 @@ def create_app(
                 "max_file_bytes": upload_limits.max_file_bytes,
                 "max_total_bytes": upload_limits.max_total_bytes,
             },
-            "mcp_guide": mcp_guide,
+            "mcp_guide": local_mcp_guide(application_root),
             "csrf_token": csrf_token,
         }
         response = JSONResponse(payload)
@@ -1185,6 +1184,11 @@ def create_app(
             raise RequestBoundaryError(
                 400,
                 "本地 MCP 自检不接受参数、路径、命令或环境变量。",
+            )
+        if local_mcp_guide(application_root)["state"] != "copy_ready_not_configured":
+            return _error_response(
+                503,
+                "本地 MCP 启动入口尚未由 Finder 路径准备；不能运行连接自检。",
             )
         try:
             report = await run_in_threadpool(run_stdio_self_check)

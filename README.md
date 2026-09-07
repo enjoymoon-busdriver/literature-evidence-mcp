@@ -34,8 +34,8 @@
 - 运行时代码只定义 provider-neutral transport 合同，以及构造注入的非秘密 provider、三个 model ID、精确 profile 和候选/字符边界；没有任何真实供应商 HTTP adapter、密钥读取或真实模型 ID 配置。生产 Web/stdio 入口未注入 transport，显式 enhanced 会明确返回“尚未配置或不可用”。
 - 独立 Stage 7 入口用一次性临时应用根生成两库、三快照和中英/双向跨语言合成题集，实际运行本地 BM25，并让增强模式完整经过 Stage 6 的三调用 recording fake；不加入 Web 或八个 MCP 工具。
 - Stage 7 JSON 报告按模式记录 hit@k、recall@k、MRR、真实空准确率、库/快照隔离违规和 anchor/页码可追溯覆盖，并固定标为 `offline_simulated`、真实模型调用 0、网络调用 0。它只验收离线管线，不能推出真实模型质量提升。
-- Stage 8 在本地管理页生成可复制的 `codex mcp add` 与等价 TOML，只使用已安装的稳定 `literature-evidence-mcp` 命令；页面不会执行命令、写入 Codex 配置或让用户填写任意路径、命令和环境变量。
-- Stage 8 自检在一次性临时应用根建立合成快照，真实启动本项目 stdio MCP 子进程，核验恰好八工具及 annotations，再依次调用状态、默认/显式 BM25 搜索和有界证据读取，并核对资料树读取前后身份一致。报告固定为零网络、零模型、零 key、零外部配置写入、零重试；通过只代表本地离线链路可用，不代表客户端已经配置。
+- Stage 8 由 Finder 启动器安装固定的 `mcp-server` 入口，管理页生成经 `/bin/zsh -fc` 解析该入口的 `codex mcp add` 与等价 TOML；未准备好时禁止复制。页面不会执行配置命令、写入 Codex 配置或让用户填写任意路径、命令和环境变量。
+- Stage 8 自检通过同一 shell/入口模板，在隔离 fake HOME 中真实启动 stdio MCP 子进程，完成八工具核验、列库→列快照→核验、默认/显式 BM25 搜索和有界证据读取，并检查完整隔离树未改写。报告说明网络与隔离树外写入没有系统级观测（`null`），本次流程不使用增强模型/key，零重试。通过不代表真实 HOME 的入口已运行，也不代表客户端已经配置。
 - Finder 可双击的 [`启动文献证据管理页.command`](./启动文献证据管理页.command)：从自身位置确定完整项目，路径含空格也可使用。
 - 首次运行先核对 macOS、arm64、Python 3.11+、SQLite `serialize/deserialize` 和 FTS5，再在项目 `.venv/` 中做非 editable 安装。
 - 双击入口使用稳定的用户应用根，端口绑定成功后才打开默认浏览器；终端前台运行，`Ctrl+C` 即停止。
@@ -74,17 +74,18 @@
 按 [OpenAI 官方 MCP 文档](https://developers.openai.com/codex/mcp/)，同一台电脑上的 ChatGPT desktop、Codex CLI 和 Codex IDE 扩展共享本机 Codex MCP 配置并支持 stdio；ChatGPT web 使用插件，不读取这份本机配置。因此本阶段只提供本地入口：
 
 ```bash
-codex mcp add literature-evidence -- literature-evidence-mcp
+codex mcp add literature-evidence -- /bin/zsh -fc 'exec "$HOME/Library/Application Support/literature-evidence-mcp/mcp-server"'
 ```
 
 等价 TOML 为：
 
 ```toml
 [mcp_servers.literature-evidence]
-command = "literature-evidence-mcp"
+command = "/bin/zsh"
+args = ["-fc", "exec \"$HOME/Library/Application Support/literature-evidence-mcp/mcp-server\""]
 ```
 
-这些文本不含 key、任意路径或环境变量。点击复制后仍是“未配置”，需要用户自行粘贴并按客户端提示操作。本地 BM25 与八工具不需要 OpenAI API key。ChatGPT web 的远程插件/Tunnel 路径属于尚未实现的 Stage 9。
+这些文本只解析固定的 `$HOME` 应用位置，不包含 key、用户绝对路径、虚拟环境路径或可填写的 env。Finder 入口会原子更新权限为 0700 的 shim；管理页只检查模板及解释器是否就绪，不执行真实入口。点击复制后仍是“未配置”，需要用户自行粘贴并按客户端提示操作。本地 BM25 与八工具不需要 OpenAI API key。ChatGPT web 的远程插件/Tunnel 路径属于尚未实现的 Stage 9。
 
 需要 MCP 时，由用户在支持 stdio command/args 的 host 中手工设置下列等价命令；它固定应用注册表根，没有 host、port、URL 或其他 transport 参数：
 

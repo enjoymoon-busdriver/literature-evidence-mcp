@@ -157,14 +157,14 @@
           <div>
             <label for="mcp-cli">可复制 CLI</label>
             <textarea id="mcp-cli" class="code-copy" rows="3" readonly></textarea>
-            <button id="copy-mcp-cli-button" class="secondary" type="button">
+            <button id="copy-mcp-cli-button" class="secondary" type="button" disabled>
               复制 CLI（不执行）
             </button>
           </div>
           <div>
             <label for="mcp-toml">等价 TOML</label>
             <textarea id="mcp-toml" class="code-copy" rows="3" readonly></textarea>
-            <button id="copy-mcp-toml-button" class="secondary" type="button">
+            <button id="copy-mcp-toml-button" class="secondary" type="button" disabled>
               复制 TOML（不写配置）
             </button>
           </div>
@@ -174,7 +174,7 @@
           <strong>网页端边界：</strong>
           ChatGPT web 不会读取本机 Codex 配置；远程插件或 Tunnel 留到 Stage 9，本阶段没有实现。
         </div>
-        <button id="mcp-self-check-button" type="button">运行本地离线 STDIO 自检</button>
+        <button id="mcp-self-check-button" type="button" disabled>运行本地离线 STDIO 自检</button>
         <p class="hint">
           自检只使用临时合成资料，真实启动本项目 STDIO MCP 服务；零网络、零模型、零 key、零重试，
           不读取当前用户资料库。通过只代表本地离线链路可用，不代表客户端已配置。
