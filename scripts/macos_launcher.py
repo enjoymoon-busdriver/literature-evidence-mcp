@@ -154,7 +154,8 @@ def validate_runtime(facts: RuntimeFacts) -> None:
         )
 
 
-def resolve_paths(project_root: Path, *, home: Optional[Path] = None) -> LauncherPaths:
+def resolve_paths(project_root: Path, *, home: Optional[Path] = None,
+                  test_instance: Optional[str] = None) -> LauncherPaths:
     root = project_root.expanduser().resolve()
     user_home = (home if home is not None else Path.home()).expanduser().resolve()
     venv = root / ".venv"
@@ -164,6 +165,15 @@ def resolve_paths(project_root: Path, *, home: Optional[Path] = None) -> Launche
         / "Application Support"
         / "literature-evidence-mcp"
     )
+    if test_instance is not None:
+        if re.fullmatch(r"[a-z][a-z0-9-]{0,39}", test_instance) is None:
+            raise LauncherError("测试实例名只允许小写字母开头、数字和连字符，最长 40 字符。")
+        instance = root / "local-artifacts" / "test-instances" / test_instance
+        for path in (root / "local-artifacts", instance.parent, instance):
+            if path.is_symlink() or (path.exists() and not path.is_dir()):
+                raise LauncherError("测试实例路径不能经过符号链接或非目录。")
+        venv = instance / ".venv"
+        application_root = instance / "application"
     return LauncherPaths(
         project_root=root,
         venv=venv,
@@ -879,6 +889,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="启动服务但不自动打开浏览器（仅用于自动验收）。",
     )
+    parser.add_argument("--test-instance", help="显式隔离测试实例名；全部数据和环境限于本工作树 local-artifacts/test-instances。")
     parser.add_argument("--check-runtime", action="store_true", help=argparse.SUPPRESS)
     return parser
 
@@ -898,13 +909,16 @@ def run(argv: Optional[Sequence[str]] = None) -> int:
     if args.project_root is None:
         raise LauncherError("缺少项目目录，无法确定要安装和启动的本地项目。")
 
-    paths = resolve_paths(args.project_root)
+    paths = resolve_paths(args.project_root, test_instance=args.test_instance)
     validate_project(paths)
     if args.preflight_only:
         print("预检通过；未创建文件、未安装、未启动管理页。")
         _print_paths(paths)
         return 0
 
+    if args.test_instance:
+        ensure_application_root(paths.application_root.parent)
+        print("隔离测试实例：仅使用合成资料，请勿误填正式 Key。")
     prepare_environment(paths)
     ensure_application_root(paths.application_root)
     install_mcp_shim(paths)

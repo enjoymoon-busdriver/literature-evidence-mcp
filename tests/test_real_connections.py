@@ -106,6 +106,14 @@ class RealConnectionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response
 
+    def enable_models(self) -> None:
+        settings = self.connections.model_settings()
+        response = self.post(
+            "/api/connections/models", "save-model-settings",
+            {"enabled": True, "model_ids": settings["recommended_model_ids"]},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
     def assert_secret_absent(self, response) -> None:
         self.assertNotIn(SYNTHETIC_KEY, response.text)
         self.assertNotIn("Authorization", response.text)
@@ -115,6 +123,7 @@ class RealConnectionTests(unittest.TestCase):
 
     def prepare_vectors(self, library_id: str, snapshot_id: str) -> None:
         self.save_key()
+        self.enable_models()
         self.responses.append((200, {"model": EMBEDDING_MODEL, "data": [
             {"index": 0, "embedding": [1.0] + [0.0] * (DIMENSIONS - 1)}
         ]}))
@@ -219,6 +228,7 @@ class RealConnectionTests(unittest.TestCase):
     def test_vector_failure_reports_actual_calls_without_publishing(self) -> None:
         library_id, snapshot_id, library = self.create_snapshot()
         self.save_key()
+        self.enable_models()
         self.responses.append((429, {"message": SYNTHETIC_KEY}))
         response = self.post(
             f"/api/libraries/{library_id}/vectors/build", "vectors-build",

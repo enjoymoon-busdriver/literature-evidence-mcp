@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 .venv-dev/
 .pytest_cache/
+/local-artifacts/
 build/
 dist/
 local-library/

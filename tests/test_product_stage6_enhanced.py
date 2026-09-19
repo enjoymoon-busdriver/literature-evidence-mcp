@@ -567,13 +567,14 @@ class ProductStageSixEnhancedTests(unittest.IsolatedAsyncioTestCase):
             page = client.get("/")
             script = client.get("/static/app.js")
             self.assertNotIn("https://", page.text + script.text)
-            self.assertNotIn("innerHTML", script.text)
-            self.assertIn("增强搜索（离线模拟）", script.text)
-            self.assertIn("enhancedSimulated: null", script.text)
-            self.assertIn("离线模拟增强搜索", script.text)
-            self.assertIn("联网增强搜索", script.text)
-            self.assertIn("增强状态未知", script.text)
-            self.assertIn("error.payload.audit", script.text)
+            # Dynamic templates escape source content; executable malicious-text
+            # scenarios are covered by test_formal_ui_frontend.
+            self.assertIn("escapeHtml(result.excerpt", script.text)
+            self.assertIn("离线模拟增强调用审计", script.text)
+            self.assertIn("state.search.audit.simulated === true", script.text)
+            self.assertIn("搜索未完成", script.text)
+            self.assertIn("error.payload?.audit", script.text)
+
 
         failing = RecordingFake(self.query_vector, fail_role=VECTOR_RECALL)
         with TestClient(

@@ -23,11 +23,16 @@ from urllib.parse import urlsplit
 _TUNNEL_ID = re.compile(r"tunnel_[0-9a-f]{32}\Z")
 _METRIC = re.compile(r"^([\w:]+)(?:\{([^}]*)\})?\s+([^\s]+)\s*$")
 _STARTUP_SECONDS = 45
+_HOMEBREW_CLIENTS = (
+    Path("/opt/homebrew/bin/tunnel-client"),
+    Path("/usr/local/bin/tunnel-client"),
+)
 _MESSAGES = {
     "stopped": "真实 Tunnel 已停止。",
     "starting": "真实 Tunnel 正在启动，等待本次连接检查。",
+    "not_ready": "本地 Tunnel 尚未就绪；进程仍在运行，官方客户端自行处理退避。",
     "connected": "本次 Tunnel 已成功轮询；尚未验收 ChatGPT 工具发现。",
-    "client_missing": "尚未安装本应用专用 Tunnel 客户端。",
+    "client_missing": "未找到 Tunnel 连接程序；请按教程通过 Homebrew 安装 tunnel-client，完成后刷新页面。",
     "mcp_missing": "本应用的 MCP 启动入口尚未就绪。",
     "invalid_tunnel_id": "请输入 OpenAI Platform 创建的有效 Tunnel ID。",
     "key_missing": "尚未保存 OpenAI Tunnel Key，请先填写并保存。",
@@ -62,10 +67,16 @@ def _log_error(line: str) -> str | None:
         "invalid_api_key", "unauthorized", "permission_denied"
     ):
         return "auth_failed"
-    if event.get("level") == "ERROR" or event.get("msg") in (
-        "poll failed; backing off", "poll timed out; backing off"
-    ):
+    # v0.0.14 poller continues after these events; ERROR alone is not fatal.
+    message = event.get("msg")
+    if message in ("poll failed; backing off", "poll timed out; backing off"):
+        return "recovering"
+    if message == "poller recovered; polling operational":
+        return "recovered"
+    if message in ("health server error", "MCP startup wait timed out"):
         return "transport_failed"
+    if event.get("level") == "ERROR":
+        return "not_ready"
     return None
 
 
@@ -83,14 +94,29 @@ class RealTunnel:
         self._state = "stopped"
         self._error: str | None = None
         self._health_checked = False
+        self._poll_recovering = False
+
+    def _find_client(self) -> Path | None:
+        if _executable(self._binary):
+            return self._binary
+        # Homebrew exposes a symlink to its wrapper. Keep the installation intact
+        # so its companion files stay available; never search an inherited PATH.
+        for candidate in _HOMEBREW_CLIENTS:
+            try:
+                resolved = candidate.resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if _executable(resolved):
+                return resolved
+        return None
 
     def _report(self, *, passed: bool | None = None) -> dict[str, Any]:
         code = self._error or self._state
         return {
             "state": self._state,
-            "passed": self._error is None if passed is None else passed,
+            "passed": self._error is None and self._state != "not_ready" if passed is None else passed,
             "simulated": False,
-            "client_installed": _executable(self._binary),
+            "client_installed": self._find_client() is not None,
             "running": None if self._state == "unknown" else self._process is not None,
             "real_connected": self._state == "connected",
             "local_health_checked": self._health_checked,
@@ -119,9 +145,10 @@ class RealTunnel:
                 report = self._report(passed=False)
                 report.update(error_code="not_stopped", message=_MESSAGES["not_stopped"])
                 return report
+            binary = self._find_client()
             for valid, code in (
                 (isinstance(tunnel_id, str) and _TUNNEL_ID.fullmatch(tunnel_id), "invalid_tunnel_id"),
-                (_executable(self._binary), "client_missing"),
+                (binary is not None, "client_missing"),
                 (_executable(self._shim), "mcp_missing"),
             ):
                 if not valid:
@@ -154,7 +181,7 @@ class RealTunnel:
                     "/usr/bin/env", f"HOME={Path.home()}", str(self._shim),
                 ])
                 command = [
-                    str(self._binary), "run",
+                    str(binary), "run",
                     "--control-plane.tunnel-id", tunnel_id,
                     "--control-plane.api-key", f"file:/dev/fd/{read_fd}",
                     "--mcp.command", mcp_command,
@@ -178,6 +205,7 @@ class RealTunnel:
                 if os.getpgid(self._process.pid) != self._pgid:
                     raise RuntimeError("process group not isolated")
                 self._state, self._error, self._health_checked = "starting", None, False
+                self._poll_recovering = False
                 threading.Thread(target=self._consume, args=(self._process,), daemon=True).start()
             except Exception:
                 return self._fail("start_failed")
@@ -198,8 +226,14 @@ class RealTunnel:
                 if code:
                     with self._lock:
                         if self._process is process and self._state != "unknown":
-                            self._fail(code)
-                    return
+                            if code in ("recovering", "recovered", "not_ready"):
+                                if code != "not_ready":
+                                    self._poll_recovering = code == "recovering"
+                                self._state = "not_ready"
+                                self._health_checked = False
+                            else:
+                                self._fail(code)
+                                return
         except Exception:
             with self._lock:
                 if self._process is process and self._state != "unknown":
@@ -207,7 +241,7 @@ class RealTunnel:
         finally:
             stream.close()
 
-    def _read_health(self) -> tuple[bool, bool]:
+    def _read_health(self) -> bool:
         assert self._run is not None
         path = self._run / "health.url"
         info = path.lstat()
@@ -240,7 +274,6 @@ class RealTunnel:
             finally:
                 connection.close()
         latest = 0.0
-        failed = False
         for line in payloads["/metrics"].splitlines():
             match = _METRIC.fullmatch(line)
             if match is None:
@@ -251,11 +284,8 @@ class RealTunnel:
                 continue
             if name == "commands_poll_last_successful_timestamp_seconds":
                 latest = max(latest, value)
-            if name == "commands_poll_errors_total" and value > 0:
-                failed = True
-            if name == "http_client_requests_total" and labels and value > 0:
-                failed = failed or bool(re.search(r'http_response_status_code="[45]\d\d"', labels))
-        return ready and latest >= self._started_at - 1, failed
+        # Error counters are cumulative, not the current connection state.
+        return ready and latest >= self._started_at - 1
 
     def health(self) -> dict[str, Any]:
         with self._lock:
@@ -265,21 +295,23 @@ class RealTunnel:
                 if self._process.poll() is not None:
                     return self._fail("process_exited")
                 try:
-                    connected, failed = self._read_health()
+                    connected = self._read_health()
                 except FileNotFoundError:
                     if self._state == "starting" and time.time() - self._started_at < _STARTUP_SECONDS:
                         return self._report()
-                    raise
+                    self._state, self._health_checked = "not_ready", False
+                    return self._report(passed=False)
                 self._health_checked = True
-                if failed:
-                    return self._fail("transport_failed")
-                if connected:
+                if connected and not self._poll_recovering:
                     self._state = "connected"
-                elif self._state == "connected" or time.time() - self._started_at >= _STARTUP_SECONDS:
-                    return self._fail("health_failed")
+                elif self._state != "starting" or time.time() - self._started_at >= _STARTUP_SECONDS:
+                    self._state = "not_ready"
+            except (OSError, http.client.HTTPException):
+                self._state, self._health_checked = "not_ready", False
+                return self._report(passed=False)
             except Exception:
                 return self._fail("health_failed")
-            return self._report()
+            return self._report(passed=self._state == "connected")
 
     def _stop_owned(self) -> bool:
         process, pgid = self._process, self._pgid

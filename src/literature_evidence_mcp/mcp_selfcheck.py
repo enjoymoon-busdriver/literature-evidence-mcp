@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shlex
 import stat
 import sys
@@ -57,10 +58,27 @@ def _guide_base() -> dict[str, Any]:
     }
 
 
+def _test_instance(application_root: Path) -> str | None:
+    requested = Path(os.path.abspath(os.fspath(application_root)))
+    if (requested.name != "application" or requested.parent.parent.name != "test-instances"
+            or requested.parent.parent.parent.name != "local-artifacts"
+            or re.fullmatch(r"[a-z][a-z0-9-]{0,39}", requested.parent.name) is None):
+        return None
+    project = requested.parents[3]
+    if not (project / "pyproject.toml").is_file() or not (project / "scripts" / "macos_launcher.py").is_file():
+        return None
+    try:
+        LibraryRegistry(requested)
+    except Exception:
+        return None
+    return requested.parent.name
+
+
 def _ready_mcp_shim(application_root: Path) -> bool:
     try:
         requested = Path(os.path.abspath(os.fspath(application_root)))
-        if requested != default_application_root():
+        test_instance = _test_instance(requested)
+        if requested != default_application_root() and test_instance is None:
             return False
         shim = requested / MCP_SHIM_NAME
         status = shim.lstat()
@@ -70,6 +88,12 @@ def _ready_mcp_shim(application_root: Path) -> bool:
         words = shlex.split(text.splitlines()[1])
         python = Path(words[1])
         python_status = python.stat()
+        if test_instance is not None:
+            venv = requested.parent / ".venv"
+            if (venv.is_symlink() or python != venv / "bin" / "python"
+                    or Path(sys.prefix) != venv
+                    or not Path(__file__).resolve().is_relative_to(venv)):
+                return False
     except (IndexError, OSError, RuntimeError, TypeError, UnicodeError, ValueError):
         return False
     return (
@@ -100,14 +124,23 @@ def _ready_mcp_shim(application_root: Path) -> bool:
 
 
 def local_mcp_guide(application_root: Path) -> dict[str, Any]:
-    """Return the copy-only guide only for a prepared standard installation."""
+    """Return a copy-only guide for a prepared default or explicit test instance."""
     base = _guide_base()
+    test_instance = _test_instance(application_root)
+    shell_command = _SHELL_COMMAND
+    server_name = SERVER_NAME
+    if test_instance is not None:
+        identity = hashlib.sha256(os.fsencode(Path(application_root).absolute())).hexdigest()[:10]
+        server_name = f"{SERVER_NAME}-test-{test_instance}-{identity}"
+        shell_command = "exec " + shlex.quote(os.fspath(Path(application_root) / MCP_SHIM_NAME))
+        base.update(server_name=server_name, instance_kind="isolated_test",
+                    instance_label=test_instance, application_root=os.fspath(application_root))
     if not _ready_mcp_shim(application_root):
         return {
             **base,
             "state": "unavailable",
             "reason": (
-                "当前不是已由 Finder 入口准备的标准应用目录，"
+                "当前不是已准备的正式或隔离测试实例，"
                 "或本地 MCP 启动入口尚未就绪；不能复制配置。"
             ),
         }
@@ -115,13 +148,13 @@ def local_mcp_guide(application_root: Path) -> dict[str, Any]:
         **base,
         "state": "copy_ready_not_configured",
         "cli": (
-            f"codex mcp add {SERVER_NAME} -- {_SHELL} {_SHELL_FLAG} "
-            f"{shlex.quote(_SHELL_COMMAND)}"
+            f"codex mcp add {server_name} -- {_SHELL} {_SHELL_FLAG} "
+            f"{shlex.quote(shell_command)}"
         ),
         "toml": (
-            f"[mcp_servers.{SERVER_NAME}]\n"
+            f"[mcp_servers.{server_name}]\n"
             f"command = {json.dumps(_SHELL)}\n"
-            f"args = [{json.dumps(_SHELL_FLAG)}, {json.dumps(_SHELL_COMMAND)}]\n"
+            f"args = [{json.dumps(_SHELL_FLAG)}, {json.dumps(shell_command)}]\n"
         ),
     }
 
@@ -204,11 +237,11 @@ def _base_report() -> dict[str, Any]:
     }
 
 
-async def _run_stdio_self_check() -> dict[str, Any]:
+async def _run_stdio_self_check(test_root: Path | None = None) -> dict[str, Any]:
     report = _base_report()
     current_step = "准备临时合成资料库"
     try:
-        with tempfile.TemporaryDirectory(prefix="lemcp-stage8-selfcheck-") as raw:
+        with tempfile.TemporaryDirectory(prefix="lemcp-stage8-selfcheck-", dir=None if test_root is None else test_root.parent) as raw:
             temporary = Path(raw)
             fake_home = temporary / "fake home"
             application_root = (
@@ -254,6 +287,23 @@ async def _run_stdio_self_check() -> dict[str, Any]:
             )
 
             current_step = "通过复制模板启动真实本地 STDIO MCP 并核验八个工具"
+            if test_root is not None:
+                if not _test_instance(test_root) or not _ready_mcp_shim(test_root):
+                    raise RuntimeError("isolated entry is not ready")
+                before_instance = _tree_identity(test_root)
+                expected_ids = {item["library_id"] for item in LibraryRegistry(test_root).list_libraries()}
+                bound = StdioServerParameters(command=_SHELL,
+                    args=[_SHELL_FLAG, "exec " + shlex.quote(os.fspath(test_root / MCP_SHIM_NAME))],
+                    cwd=temporary, env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(fake_home)})
+                with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as bound_log:
+                    async with asyncio.timeout(30):
+                        async with Client(stdio_client(bound, errlog=bound_log)) as bound_client:
+                            _tool_contract((await bound_client.list_tools()).tools)
+                            actual = _payload(await bound_client.call_tool("retrieval_status", {}))
+                            if actual.get("scope") != "libraries" or {item["library_id"] for item in actual["libraries"]} != expected_ids:
+                                raise RuntimeError("isolated root mismatch")
+                if _tree_identity(test_root) != before_instance:
+                    raise RuntimeError("isolated root changed during read-only check")
             params = StdioServerParameters(
                 command=_SHELL,
                 args=[_SHELL_FLAG, _SHELL_COMMAND],
@@ -434,12 +484,14 @@ async def _run_stdio_self_check() -> dict[str, Any]:
         "本地离线 STDIO 自检通过；这只证明隔离 fake HOME 中相同的固定启动模板"
         "和合成证据链可用，不证明真实 HOME 的入口可执行，也不代表客户端已经配置。"
     )
+    if test_root is not None:
+        report["message"] = "隔离测试实例的真实固定入口、库范围及合成 STDIO 证据链自检通过；不代表客户端或真实 Tunnel 已连接。"
     return report
 
 
-def run_stdio_self_check() -> dict[str, Any]:
+def run_stdio_self_check(test_root: Path | None = None) -> dict[str, Any]:
     """Run one bounded self-check synchronously for the local Web endpoint."""
-    return asyncio.run(_run_stdio_self_check())
+    return asyncio.run(_run_stdio_self_check(test_root))
 
 
 __all__ = ["SELF_CHECK_INTENT", "local_mcp_guide", "run_stdio_self_check"]

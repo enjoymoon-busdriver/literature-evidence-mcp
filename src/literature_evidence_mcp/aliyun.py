@@ -27,12 +27,16 @@ class AliyunError(LiteratureEvidenceError):
     """A provider failure whose message contains no request or credential."""
 
 
-def aliyun_profile() -> dict[str, Any]:
+def aliyun_profile(model_id: str = EMBEDDING_MODEL) -> dict[str, Any]:
     return validate_profile({
         "provider": PROVIDER,
-        "model_id": EMBEDDING_MODEL,
+        "model_id": model_id,
         # The API exposes a model name, not an immutable server-weight revision.
-        "model_revision": "provider-managed-qwen3.7",
+        "model_revision": (
+            "provider-managed-qwen3.7"
+            if model_id == EMBEDDING_MODEL
+            else "provider-managed"
+        ),
         "dimensions": DIMENSIONS,
         "input_role": "document",
         "instruction": "",
@@ -44,11 +48,17 @@ def aliyun_profile() -> dict[str, Any]:
     })
 
 
-def enhanced_config() -> EnhancedSearchConfig:
+def enhanced_config(
+    *,
+    query_rewrite_model_id: str = REWRITE_MODEL,
+    vector_recall_model_id: str = EMBEDDING_MODEL,
+    candidate_rerank_model_id: str = RERANK_MODEL,
+) -> EnhancedSearchConfig:
     return EnhancedSearchConfig(
-        provider=PROVIDER, query_rewrite_model_id=REWRITE_MODEL,
-        vector_recall_model_id=EMBEDDING_MODEL,
-        candidate_rerank_model_id=RERANK_MODEL, vector_profile=aliyun_profile(),
+        provider=PROVIDER, query_rewrite_model_id=query_rewrite_model_id,
+        vector_recall_model_id=vector_recall_model_id,
+        candidate_rerank_model_id=candidate_rerank_model_id,
+        vector_profile=aliyun_profile(vector_recall_model_id),
     )
 
 
@@ -75,8 +85,13 @@ def _vectors(value: Mapping[str, Any], count: int) -> list[list[float]]:
 class _AliyunClient:
     simulated = False
 
-    def __init__(self, key_loader: Callable[[], str]) -> None:
+    def __init__(
+        self,
+        key_loader: Callable[[], str],
+        config: EnhancedSearchConfig | None = None,
+    ) -> None:
         self._key_loader = key_loader
+        self._config = config or enhanced_config()
         self.last_audit: dict[str, Any] = {"call_count": 0, "calls": []}
 
     def _post(self, role: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -121,7 +136,7 @@ class _AliyunClient:
 
     def _embedding(self, texts: Sequence[str], role: str) -> list[list[float]]:
         value = self._post(role, "/compatible-mode/v1/embeddings", {
-            "model": EMBEDDING_MODEL, "input": list(texts),
+            "model": self._config.vector_recall_model_id, "input": list(texts),
             "dimensions": DIMENSIONS, "encoding_format": "float",
         })
         result = _vectors(value, len(texts))
@@ -132,8 +147,11 @@ class _AliyunClient:
 class AliyunTransport(_AliyunClient):
     def invoke(self, *, role: str, provider: str, model_id: str,
                payload: Mapping[str, Any]) -> object:
-        expected = {QUERY_REWRITE: REWRITE_MODEL, VECTOR_RECALL: EMBEDDING_MODEL,
-                    CANDIDATE_RERANK: RERANK_MODEL}
+        expected = {
+            QUERY_REWRITE: self._config.query_rewrite_model_id,
+            VECTOR_RECALL: self._config.vector_recall_model_id,
+            CANDIDATE_RERANK: self._config.candidate_rerank_model_id,
+        }
         if provider != PROVIDER or expected.get(role) != model_id:
             raise AliyunError("阿里云角色或模型配置不匹配。")
         if role == QUERY_REWRITE:
@@ -202,7 +220,7 @@ class AliyunEmbedder(_AliyunClient):
 
     def __call__(self, texts: Sequence[str], profile: Mapping[str, Any]) -> list[list[float]]:
         self.last_audit = {"call_count": 0, "calls": []}
-        if (profile != aliyun_profile() or isinstance(texts, (str, bytes))
+        if (profile != self._config.vector_profile or isinstance(texts, (str, bytes))
                 or not 1 <= len(texts) <= BATCH_SIZE
                 or any(not isinstance(t, str) or not t for t in texts)):
             raise AliyunError("阿里云语料向量配置或批次无效。")

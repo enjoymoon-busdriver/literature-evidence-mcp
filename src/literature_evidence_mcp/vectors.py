@@ -1020,6 +1020,70 @@ def _reusable_inputs(root, profile, chunks, verified, existing_objects):
     return mappings, texts, reusable, missing_ids
 
 
+def vector_readiness(library: Path | LibraryRegistry,
+                     profile: Mapping[str, Any]) -> dict[str, str]:
+    """Read-only readiness for every snapshot under the exact embedding profile."""
+    selected_profile_id = profile_id(profile)
+    guard = _root_guard(library)
+    root = _validated_root(guard)
+    assert root is not None
+    catalog = load_snapshot_catalog(guard)
+    verified, _objects = _verify_vector_state(root, catalog, _load_vector_catalog(root))
+    prepared = {snapshot_id for snapshot_id, _profile in verified}
+    return {
+        record["snapshot_id"]: (
+            "ready" if (record["snapshot_id"], selected_profile_id) in verified
+            else "mismatch" if record["snapshot_id"] in prepared else "missing"
+        )
+        for record in catalog["snapshots"]
+    }
+
+
+def document_vector_readiness(library: Path | LibraryRegistry, snapshot_id: str,
+                              profile: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Verify once, then compare each current document's exact inputs to owned vectors."""
+    selected_profile_id = profile_id(profile)
+    guard = _root_guard(library)
+    root = _validated_root(guard)
+    assert root is not None
+    catalog = load_snapshot_catalog(guard)
+    record = snapshot_record(catalog, snapshot_id)
+    status, database = _open_verified_snapshot(root / "snapshots" / snapshot_id)
+    try:
+        if status["manifest_sha256"] != record["manifest_sha256"]:
+            raise VectorError("向量输入快照与目录册绑定不一致。")
+        rows = database.execute(
+            "SELECT document_id,chunk_id,chunk_text FROM chunk ORDER BY chunk_id"
+        ).fetchall()
+    finally:
+        database.close()
+    chunks = tuple((row["chunk_id"], row["chunk_text"]) for row in rows)
+    verified, _objects = _verify_vector_state(
+        root, catalog, _load_vector_catalog(root), {snapshot_id: (status, chunks)}
+    )
+    profiles: dict[str, tuple[dict[str, Any], set[str]]] = {}
+    for (_snapshot, identity), (artifact, _values, _record) in verified.items():
+        _profile, available = profiles.setdefault(identity, (artifact["profile"], set()))
+        available.update(item["vector_object_id"] for item in artifact["objects"])
+    current = profiles.get(selected_profile_id, (profile, set()))[1]
+    documents: dict[str, list[str]] = {}
+    for row in rows:
+        documents.setdefault(row["document_id"], []).append(row["chunk_text"])
+    result = {}
+    for document_id, texts in documents.items():
+        covered = sum(_vector_object_id(profile, text) in current for text in texts)
+        other_profile = any(
+            identity != selected_profile_id and any(
+                _vector_object_id(other, text) in available for text in texts
+            ) for identity, (other, available) in profiles.items()
+        )
+        result[document_id] = {
+            "vector_status": "ready" if covered == len(texts) else "mismatch" if other_profile else "missing",
+            "vector_covered_chunks": covered, "vector_total_chunks": len(texts),
+        }
+    return result
+
+
 def preview_vectors(library: Path | LibraryRegistry, snapshot_id: str,
                     profile: Mapping[str, Any]) -> dict[str, Any]:
     """Read and verify the inputs that a ten-item real provider build would send."""

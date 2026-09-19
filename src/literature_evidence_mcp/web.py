@@ -38,6 +38,7 @@ from .errors import (
 )
 from .ingest import prepare_document
 from .library import FixedLibrary
+from .mcp_tools import ReadOnlyEvidenceTools
 from .mcp_selfcheck import (
     SELF_CHECK_INTENT,
     local_mcp_guide,
@@ -59,6 +60,8 @@ BUILD_INTENT = "build-snapshot"
 CREATE_LIBRARY_INTENT = "create-library"
 SELECT_LIBRARY_INTENT = "select-library"
 ACTIVATE_SNAPSHOT_INTENT = "activate-snapshot"
+RENAME_LIBRARY_INTENT = "rename-library"
+UPDATE_LIBRARY_DESCRIPTION_INTENT = "update-library-description"
 ACTION_INTENT_HEADER = "x-action-intent"
 UPLOAD_TEMP_PREFIX = "literature-evidence-upload-"
 _MIB = 1024 * 1024
@@ -1013,8 +1016,13 @@ def create_app(
     async def status(request: Request) -> Response:
         connection_status = None if connections is None else await run_in_threadpool(connections.status)
         active_enhanced = enhanced_summary
-        if connection_status and connection_status["aliyun_configured"]:
-            active_enhanced = connection_status["models"]
+        if connection_status is not None:
+            active_enhanced = (
+                connection_status["models"]
+                if connection_status["aliyun_configured"]
+                and connection_status["model_settings"]["enabled"]
+                else None
+            )
         cookie = request.cookies.get(cookie_name)
         session_id = sessions.validate_cookie(cookie)
         new_cookie: str | None = None
@@ -1094,6 +1102,28 @@ def create_app(
         public = await run_in_threadpool(_public_library, record)
         return JSONResponse({"library": public})
 
+    async def rename_library(request: Request) -> Response:
+        _require_intent(request, RENAME_LIBRARY_INTENT)
+        body = await _bounded_json(request, upload_limits.max_json_bytes)
+        if request.url.query or set(body) != {"name"}:
+            raise RequestBoundaryError(400, "资料库改名只接受 name。")
+        record = await run_in_threadpool(
+            registry.rename, request.path_params["library_id"], body["name"]
+        )
+        return JSONResponse({"library": await run_in_threadpool(_public_library, record)})
+
+    async def update_library_description(request: Request) -> Response:
+        _require_intent(request, UPDATE_LIBRARY_DESCRIPTION_INTENT)
+        body = await _bounded_json(request, upload_limits.max_json_bytes)
+        if request.url.query or set(body) != {"description"}:
+            raise RequestBoundaryError(400, "资料库描述更新只接受 description。")
+        record = await run_in_threadpool(
+            registry.update_description,
+            request.path_params["library_id"],
+            body["description"],
+        )
+        return JSONResponse({"library": await run_in_threadpool(_public_library, record)})
+
     async def snapshots(request: Request) -> Response:
         library_id = request.path_params["library_id"]
         library = await run_in_threadpool(_fixed_library, registry, library_id)
@@ -1102,6 +1132,11 @@ def create_app(
             await run_in_threadpool(_snapshot_view, library, item)
             for item in values
         ]
+        vector_states = {} if connections is None else await run_in_threadpool(
+            connections.vector_states, library_id
+        )
+        for view in views:
+            view["vector_status"] = vector_states.get(view["snapshot_id"], "unknown")
         return JSONResponse(
             {
                 "library_id": library_id,
@@ -1132,6 +1167,62 @@ def create_app(
         result = await run_in_threadpool(library.verify, snapshot_id)
         view = await run_in_threadpool(_snapshot_view, library, result)
         return JSONResponse({"library_id": library_id, **view})
+
+    async def documents(request: Request) -> Response:
+        library_id = request.path_params["library_id"]
+        snapshot_id = request.path_params["snapshot_id"]
+        library = await run_in_threadpool(_fixed_library, registry, library_id)
+        members = await run_in_threadpool(library.snapshot_members, snapshot_id)
+        tools = ReadOnlyEvidenceTools(application_root)
+        values = []
+        for member in members:
+            result = await run_in_threadpool(
+                tools.get_document_metadata,
+                library_id,
+                snapshot_id,
+                member["document_id"],
+            )
+            values.append(result["document"])
+        vector_states = {} if connections is None else await run_in_threadpool(
+            connections.document_vector_states, library_id, snapshot_id
+        )
+        for document in values:
+            document.update(vector_states.get(document["document_id"], {"vector_status": "unknown"}))
+        return JSONResponse({"library_id": library_id, "snapshot_id": snapshot_id,
+                             "documents": values})
+
+    async def document_detail(request: Request) -> Response:
+        library_id = request.path_params["library_id"]
+        snapshot_id = request.path_params["snapshot_id"]
+        document_id = request.path_params["document_id"]
+        tools = ReadOnlyEvidenceTools(application_root)
+        metadata = await run_in_threadpool(
+            tools.get_document_metadata, library_id, snapshot_id, document_id
+        )
+        toc = await run_in_threadpool(
+            tools.get_document_toc, library_id, snapshot_id, document_id
+        )
+        return JSONResponse({
+            "library_id": library_id,
+            "snapshot_id": snapshot_id,
+            "document": metadata["document"],
+            "toc": {
+                "items": toc["items"],
+                "truncated": toc["truncated"],
+                "navigation_semantics": toc["navigation_semantics"],
+            },
+        })
+
+    async def document_section(request: Request) -> Response:
+        tools = ReadOnlyEvidenceTools(application_root)
+        result = await run_in_threadpool(
+            tools.read_document_section,
+            request.path_params["library_id"],
+            request.path_params["snapshot_id"],
+            request.path_params["document_id"],
+            request.path_params["section_id"],
+        )
+        return JSONResponse(result)
 
     async def activate(request: Request) -> Response:
         _require_intent(request, ACTIVATE_SNAPSHOT_INTENT)
@@ -1207,6 +1298,46 @@ def create_app(
             status_code=201,
         )
 
+    async def remove_documents(request: Request) -> Response:
+        _require_intent(request, "remove-documents")
+        body = await _bounded_json(request, 1024 * 1024)
+        if (request.url.query or set(body) != {"base_snapshot_id", "remove_document_ids"}
+                or not isinstance(body["base_snapshot_id"], str)
+                or not isinstance(body["remove_document_ids"], list)
+                or not body["remove_document_ids"]
+                or not all(isinstance(item, str) for item in body["remove_document_ids"])):
+            raise RequestBoundaryError(400, "请明确指定基础版本和非空文档 ID 列表。")
+        if not build_lock.acquire(blocking=False):
+            raise RequestBoundaryError(409, "已有构建正在进行；本次未重试、未发布。")
+        try:
+            library_id = request.path_params["library_id"]
+            library = await run_in_threadpool(_fixed_library, registry, library_id)
+            base_members = await run_in_threadpool(library.snapshot_members, body["base_snapshot_id"])
+            result = await run_in_threadpool(
+                library.build, [], base_snapshot_id=body["base_snapshot_id"],
+                remove_document_ids=body["remove_document_ids"],
+            )
+            removed = set(body["remove_document_ids"])
+            members = [item for item in base_members if item["document_id"] not in removed]
+            return JSONResponse({"library_id": library_id, **result, "published": True,
+                                 "members": members,
+                                 "difference": _member_difference(members, base_members)}, status_code=201)
+        finally:
+            build_lock.release()
+
+    async def delete_library(request: Request) -> Response:
+        _require_intent(request, "delete-library")
+        body = await _bounded_json(request, 4096)
+        if request.url.query or set(body) != {"confirmation_name"} or not isinstance(body["confirmation_name"], str):
+            raise RequestBoundaryError(400, "永久删除必须输入准确库名。")
+        if not build_lock.acquire(blocking=False):
+            raise RequestBoundaryError(409, "已有构建或向量任务正在进行，请稍后再删除。")
+        try:
+            result = await run_in_threadpool(registry.delete, request.path_params["library_id"], body["confirmation_name"])
+            return JSONResponse(result)
+        finally:
+            build_lock.release()
+
     async def mcp_self_check(request: Request) -> Response:
         _require_intent(request, SELF_CHECK_INTENT)
         if request.url.query or await request.body():
@@ -1214,13 +1345,14 @@ def create_app(
                 400,
                 "本地 MCP 自检不接受参数、路径、命令或环境变量。",
             )
-        if local_mcp_guide(application_root)["state"] != "copy_ready_not_configured":
+        guide = local_mcp_guide(application_root)
+        if guide["state"] != "copy_ready_not_configured":
             return _error_response(
                 503,
                 "本地 MCP 启动入口尚未由 Finder 路径准备；不能运行连接自检。",
             )
         try:
-            report = await run_in_threadpool(run_stdio_self_check)
+            report = await run_in_threadpool(run_stdio_self_check, application_root) if guide.get("instance_kind") == "isolated_test" else await run_in_threadpool(run_stdio_self_check)
         except Exception:
             return _error_response(
                 503,
@@ -1277,6 +1409,30 @@ def create_app(
                                         body["tunnel_id"], body["accept_backoff"])
         return JSONResponse({"connections": result})
 
+    async def save_model_settings(request: Request) -> Response:
+        _require_intent(request, "save-model-settings")
+        body = await _bounded_json(request, 4096)
+        if request.url.query or set(body) != {"enabled", "model_ids"}:
+            raise RequestBoundaryError(400, "模型设置只接受 enabled 和 model_ids。")
+        result = await run_in_threadpool(
+            require_connections().save_models, body["enabled"], body["model_ids"]
+        )
+        return JSONResponse({"connections": result})
+
+    async def restore_recommended_models(request: Request) -> Response:
+        _require_intent(request, "restore-recommended-models")
+        if request.url.query or await request.body():
+            raise RequestBoundaryError(400, "恢复推荐模型不接受参数。")
+        result = await run_in_threadpool(require_connections().restore_recommended_models)
+        return JSONResponse({"connections": result})
+
+    async def check_model_connections(request: Request) -> Response:
+        _require_intent(request, "check-model-connections")
+        if request.url.query or await request.body():
+            raise RequestBoundaryError(400, "模型连接检查不接受参数。")
+        result = await run_in_threadpool(require_connections().check_models)
+        return JSONResponse({"connection_check": result})
+
     async def real_tunnel_action(request: Request) -> Response:
         action = request.path_params["action"]
         if action not in {"health", "stop"}:
@@ -1297,7 +1453,13 @@ def create_app(
             raise RequestBoundaryError(400, "向量操作必须明确指定快照。")
         runtime = require_connections()
         method = runtime.preview_vectors if action == "preview" else runtime.build_vectors
-        result = await run_in_threadpool(method, request.path_params["library_id"], body["snapshot_id"])
+        if action == "build" and not build_lock.acquire(blocking=False):
+            raise RequestBoundaryError(409, "已有构建或删除操作正在进行，请稍后再准备向量。")
+        try:
+            result = await run_in_threadpool(method, request.path_params["library_id"], body["snapshot_id"])
+        finally:
+            if action == "build":
+                build_lock.release()
         return JSONResponse({"vectors": result})
 
     async def connection_error_handler(_request: Request, _exc: Exception) -> JSONResponse:
@@ -1333,7 +1495,11 @@ def create_app(
         _request: Request, exc: Exception
     ) -> JSONResponse:
         assert isinstance(exc, EnhancedSearchError)
-        unavailable = "尚未配置" in str(exc) or "当前不可用" in str(exc)
+        unavailable = (
+            "尚未配置" in str(exc)
+            or "当前不可用" in str(exc)
+            or "已关闭" in str(exc)
+        )
         return _error_response(
             503 if unavailable else 422,
             str(exc),
@@ -1379,8 +1545,13 @@ def create_app(
         Route("/static/connections.js", connection_script, methods=["GET"]),
         Route("/api/connections/credentials", save_credential, methods=["POST"]),
         Route("/api/connections/tunnel", save_tunnel_settings, methods=["POST"]),
+        Route("/api/connections/models", save_model_settings, methods=["POST"]),
+        Route("/api/connections/models/recommended", restore_recommended_models, methods=["POST"]),
+        Route("/api/connections/models/check", check_model_connections, methods=["POST"]),
         Route("/api/tunnel/production/{action:str}", real_tunnel_action, methods=["POST"]),
         Route("/api/libraries/{library_id:str}/vectors/{action:str}", vectors_action, methods=["POST"]),
+        Route("/api/libraries/{library_id:str}/remove-documents", remove_documents, methods=["POST"]),
+        Route("/api/libraries/{library_id:str}/delete", delete_library, methods=["POST"]),
         Route("/api/status", status, methods=["GET"]),
         Route("/api/mcp-self-check", mcp_self_check, methods=["POST"]),
         Route("/api/tunnel/simulated/{action:str}", tunnel_action, methods=["POST"]),
@@ -1393,6 +1564,16 @@ def create_app(
             methods=["POST"],
         ),
         Route(
+            "/api/libraries/{library_id:str}/rename",
+            rename_library,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/libraries/{library_id:str}/description",
+            update_library_description,
+            methods=["POST"],
+        ),
+        Route(
             "/api/libraries/{library_id:str}/snapshots",
             snapshots,
             methods=["GET"],
@@ -1400,6 +1581,21 @@ def create_app(
         Route(
             "/api/libraries/{library_id:str}/snapshots/{snapshot_id:str}/verify",
             verify,
+            methods=["GET"],
+        ),
+        Route(
+            "/api/libraries/{library_id:str}/snapshots/{snapshot_id:str}/documents",
+            documents,
+            methods=["GET"],
+        ),
+        Route(
+            "/api/libraries/{library_id:str}/snapshots/{snapshot_id:str}/documents/{document_id:str}",
+            document_detail,
+            methods=["GET"],
+        ),
+        Route(
+            "/api/libraries/{library_id:str}/snapshots/{snapshot_id:str}/documents/{document_id:str}/sections/{section_id:str}",
+            document_section,
             methods=["GET"],
         ),
         Route(

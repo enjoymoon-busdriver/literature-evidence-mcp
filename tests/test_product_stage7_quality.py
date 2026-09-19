@@ -17,14 +17,31 @@ from literature_evidence_mcp.mcp_server import TOOLS
 from literature_evidence_mcp.quality_eval import main, run_evaluation
 
 
+_BUSINESS_TREE_DIRECTORIES = ("demo", "docs", "scripts", "src", "tests")
+_BUSINESS_TREE_ROOT_FILES = (
+    ".gitignore",
+    "AGENTS.md",
+    "ARCHITECTURE.md",
+    "LICENSE",
+    "README.md",
+    "pyproject.toml",
+    "启动文献证据管理页.command",
+)
+
+
 def _business_tree_identity(root: Path) -> dict[str, str]:
     identity: dict[str, str] = {}
-    for path in sorted(root.rglob("*")):
+    candidates = [root / name for name in _BUSINESS_TREE_ROOT_FILES]
+    for directory_name in _BUSINESS_TREE_DIRECTORIES:
+        directory = root / directory_name
+        if directory.is_dir() and not directory.is_symlink():
+            candidates.extend(directory.rglob("*"))
+    for path in sorted(candidates):
         if (
             not path.is_file()
+            or path.is_symlink()
             or "__pycache__" in path.parts
             or path.suffix in {".pyc", ".pyo"}
-            or path.name == ".git"
         ):
             continue
         identity[path.relative_to(root).as_posix()] = hashlib.sha256(
@@ -34,6 +51,25 @@ def _business_tree_identity(root: Path) -> dict[str, str]:
 
 
 class ProductStageSevenQualityTests(unittest.TestCase):
+    def test_business_tree_identity_is_bounded_and_detects_source_changes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lemcp-stage7-tree-") as temp_dir:
+            root = Path(temp_dir)
+            source = root / "src" / "package" / "module.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            runtime_log = root / "local-artifacts" / "runs" / "latest.log"
+            runtime_log.parent.mkdir(parents=True)
+            runtime_log.write_text("runtime output\n", encoding="utf-8")
+
+            before = _business_tree_identity(root)
+            self.assertEqual(set(before), {"src/package/module.py"})
+
+            runtime_log.write_text("changed runtime output\n", encoding="utf-8")
+            self.assertEqual(before, _business_tree_identity(root))
+
+            source.write_text("VALUE = 2\n", encoding="utf-8")
+            self.assertNotEqual(before, _business_tree_identity(root))
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.repository_root = Path(__file__).resolve().parents[1]

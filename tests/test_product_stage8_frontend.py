@@ -1,152 +1,78 @@
 from __future__ import annotations
 
-import subprocess
 import unittest
-from pathlib import Path
+
+from tests.test_formal_ui_frontend import run_scenario
 
 
-from tests.node_runtime import NODE
-STATIC_ROOT = (
-    Path(__file__).resolve().parents[1]
-    / "src"
-    / "literature_evidence_mcp"
-    / "static"
-)
+VALID_REPORT = r'''
+const validReport = (overrides = {}) => ({
+  passed: true, scope: 'local_stdio_self_check', evidence_level: 'offline_local_stdio',
+  observation_scope_zh: 'fake HOME observation scope',
+  message: 'fake HOME template tested; current user config/client not tested',
+  tool_count: 8, network_calls: null, model_calls: 0, api_keys_used: 0,
+  external_config_writes: null, retry_count: 0,
+  steps: Array.from({length: 6}, (_, index) => ({name: `step-${index}`, message: 'ok', passed: true})),
+  ...overrides,
+});
+'''
 
 
 class StageEightFrontendTests(unittest.TestCase):
-    def test_frontend_validates_guides_and_self_check_reports(self) -> None:
-        html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
-        self.assertIn('id="copy-mcp-cli-button" class="secondary" type="button" disabled', html)
-        self.assertIn('id="copy-mcp-toml-button" class="secondary" type="button" disabled', html)
-        self.assertIn('id="mcp-self-check-button" type="button" disabled', html)
-
-        harness = r'''
-const fs = require("fs");
-const vm = require("vm");
-
-class FakeElement {
-  constructor(id = "") {
-    this.id = id;
-    this.value = id === "search-mode" ? "bm25" : "";
-    this.checked = id === "build-blank";
-    this.disabled = [
-      "copy-mcp-cli-button",
-      "copy-mcp-toml-button",
-      "mcp-self-check-button",
-    ].includes(id);
-    this.hidden = false;
-    this.textContent = "";
-    this.files = [];
-    this.children = [];
-    this.classList = {add() {}, remove() {}, toggle() {}};
-  }
-  addEventListener() {}
-  append(...items) { this.children.push(...items); }
-  replaceChildren(...items) { this.children = [...items]; }
-}
-
-const fakeElements = new Map();
-global.document = {
-  querySelector(selector) {
-    const id = selector.startsWith("#") ? selector.slice(1) : selector;
-    if (!fakeElements.has(id)) fakeElements.set(id, new FakeElement(id));
-    return fakeElements.get(id);
-  },
-  createElement(tag) { return new FakeElement(tag); },
+    def test_guide_copy_boundary_and_self_check_report_validation(self) -> None:
+        run_scenario(self, VALID_REPORT + r'''
+const guide = {
+  state: 'copy_ready_not_configured', server_name: 'literature-evidence',
+  tool_count: 8, api_key_required: false,
+  cli: 'codex mcp add literature-evidence', toml: '[mcp_servers.literature-evidence]',
 };
-global.navigator = {clipboard: {writeText: async () => {}}};
+state.mcpGuide = guide;
+let rendered = FolioConnections.renderApps();
+assert(rendered.includes('data-action="copy-mcp-cli"'));
+assert(rendered.includes('data-action="copy-mcp-toml"'));
+assert(rendered.includes('data-action="mcp-self-check"'));
+assert(!/data-action="copy-mcp-cli"[^>]*disabled/.test(rendered));
+assert(!/data-action="mcp-self-check"[^>]*disabled/.test(rendered));
 
+const valid = validReport();
+assert(FolioApp.validMcpSelfCheck(valid), 'valid report rejected');
+for (const key of Object.keys(valid)) {
+  const missing = {...valid}; delete missing[key];
+  assert(!FolioApp.validMcpSelfCheck(missing), `missing field accepted: ${key}`);
+}
+for (const bad of [
+  {...valid, steps: valid.steps.slice(0, 5)},
+  {...valid, steps: [{name: 'bad', message: 'bad', passed: true}]},
+  {...valid, network_calls: 0}, {...valid, external_config_writes: 0},
+  {...valid, model_calls: 1}, {...valid, api_keys_used: 1}, {...valid, retry_count: 1},
+]) assert(!FolioApp.validMcpSelfCheck(bad), 'malformed report accepted');
+
+state.csrfToken = 'synthetic-csrf';
 let pending;
-global.fetch = (path, options = {}) => {
-  if (path === "/api/mcp-self-check") {
-    return new Promise((resolve) => {
-      pending = {resolve, signal: options.signal};
-    });
-  }
-  return new Promise(() => {});
-};
+route = (path, options) => path === '/api/mcp-self-check'
+  ? new Promise(resolve => { pending = {resolve, options}; }) : undefined;
+const check = FolioConnections.runMcpSelfCheck();
+assert.equal(pending.options.headers['X-Action-Intent'], 'mcp-self-check');
+assert.equal(pending.options.headers['X-CSRF-Token'], 'synthetic-csrf');
+pending.resolve(response({self_check: valid}));
+await check;
+assert.equal(state.mcpSelfCheck, valid);
+rendered = FolioConnections.renderApps();
+assert(rendered.includes('8 个只读工具'));
+assert(rendered.includes('零模型、零 Key、零重试'));
 
-function response(report) {
-  return {
-    ok: true,
-    headers: {get: () => "application/json"},
-    json: async () => ({self_check: report}),
-  };
-}
+route = () => Promise.resolve(response({self_check: {...valid, steps: []}}));
+await FolioConnections.runMcpSelfCheck();
+assert.equal(state.mcpSelfCheck.passed, false);
+assert(state.mcpSelfCheck.message.includes('数据格式无效'));
 
-function validReport(overrides = {}) {
-  return {
-    passed: true,
-    scope: "local_stdio_self_check",
-    evidence_level: "offline_local_stdio",
-    observation_scope_zh: "fake HOME observation scope",
-    message: "fake HOME template tested; current user config/client not tested",
-    tool_count: 8,
-    network_calls: null,
-    model_calls: 0,
-    api_keys_used: 0,
-    external_config_writes: null,
-    retry_count: 0,
-    steps: Array.from({length: 6}, (_, index) => ({
-      name: `step-${index}`,
-      message: "ok",
-      passed: true,
-    })),
-    ...overrides,
-  };
-}
-
-const app = fs.readFileSync(process.argv[1], "utf8");
-const test = `
-;(async () => {
-  renderMcpGuide({
-    state: "copy_ready_not_configured",
-    server_name: "literature-evidence",
-    tool_count: 8,
-    api_key_required: false,
-    cli: "codex mcp add literature-evidence",
-    toml: "[mcp_servers.literature-evidence]",
-  });
-  if (fakeElements.get("copy-mcp-cli-button").disabled) throw new Error("valid guide stayed disabled");
-
-  const valid = runMcpSelfCheck();
-  pending.resolve(response(validReport()));
-  await valid;
-  const rendered = fakeElements.get("mcp-self-check-report").children
-    .map((child) => child.textContent).join("|");
-  if (!rendered.includes("网络调用：未观测")) throw new Error("null network count was not labeled");
-  if (!rendered.includes("外部配置写入：未观测")) throw new Error("null write count was not labeled");
-
-  const malformed = runMcpSelfCheck();
-  pending.resolve(response({...validReport(), steps: [{name: "bad", message: "bad", passed: true}]}));
-  await malformed;
-  const status = fakeElements.get("mcp-self-check-status").textContent;
-  if (!status.includes("数据格式无效")) throw new Error("malformed report was not rejected");
-  if (!fakeElements.get("mcp-self-check-report").hidden) throw new Error("malformed report was rendered");
-  if (fakeElements.get("mcp-self-check-report").children.length !== 0) throw new Error("stale report remained");
-
-  fakeElements.get("mcp-cli").value = "stale cli";
-  fakeElements.get("mcp-toml").value = "stale toml";
-  renderMcpGuide({state: "unavailable", reason: "not ready"});
-  if (fakeElements.get("mcp-cli").value || fakeElements.get("mcp-toml").value) throw new Error("unavailable guide kept stale text");
-  if (!fakeElements.get("copy-mcp-cli-button").disabled || !fakeElements.get("mcp-self-check-button").disabled) throw new Error("unavailable guide enabled controls");
-})().catch((error) => {
-  process.stderr.write(String(error && error.stack || error));
-  process.exitCode = 1;
-});
-`;
-vm.runInThisContext(app + test, {filename: process.argv[1]});
-'''
-        self.assertTrue(NODE.is_file(), NODE)
-        completed = subprocess.run(
-            [str(NODE), "-e", harness, str(STATIC_ROOT / "app.js")],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
+state.mcpGuide = {...guide, state: 'unavailable', cli: 'stale cli', toml: 'stale toml'};
+rendered = FolioConnections.renderApps();
+assert(/data-action="copy-mcp-cli"[^>]*disabled/.test(rendered));
+assert(/data-action="mcp-self-check"[^>]*disabled/.test(rendered));
+assert(!rendered.includes('stale cli'));
+assert(!rendered.includes('stale toml'));
+''')
 
 
 if __name__ == "__main__":

@@ -335,102 +335,33 @@ class ProductStageFiveWebTests(unittest.TestCase):
 
         page = self.client.get("/")
         script = self.client.get("/static/app.js")
-        self.assertIn('id="drop-zone"', page.text)
-        self.assertIn('type="file"', page.text)
-        self.assertIn('accept=".md,.markdown,.pdf,text/markdown,application/pdf"', page.text)
-        for label in (
-            "待提交",
-            "本机接收 / 构建中",
-            "已进入成功快照",
-            "失败、未发布",
-            "current",
-            "last-successful",
-        ):
-            self.assertIn(label, page.text + script.text)
+        connections = self.client.get("/static/connections.js")
+        # The formal UI renders its workspace into a stable shell.  Keep these
+        # checks about user-visible boundaries, rather than its internal page
+        # component structure.
+        self.assertIn('id="content"', page.text)
+        self.assertIn('id="library-select"', page.text)
+        self.assertIn('data-action="import"', page.text)
+        self.assertIn('id="historical-banner"', page.text)
+        self.assertIn('id="details"', page.text)
+        for label in ("待提交", "本机接收 / 构建中", "已进入成功快照", "失败、未发布", "current", "last-successful"):
+            self.assertIn(label, page.text + script.text + connections.text)
         self.assertIn("textContent", script.text)
-        self.assertIn("createElement", script.text)
-        self.assertIn("resetLibraryContext", script.text)
-        self.assertIn("libraryContextIsCurrent", script.text)
-        self.assertIn("requestedLibraryId", script.text)
-        self.assertIn("requestedEpoch", script.text)
-        self.assertIn('elements.files.value = ""', script.text)
-        self.assertIn("cleanup_warning", script.text)
-        load_libraries = script.text.split(
-            'async function loadLibraries(candidateId = "") {',
-            1,
-        )[1].split("async function createLibrary()", 1)[0]
-        self.assertIn("const requestId = ++state.libraryRequestId;", load_libraries)
-        stale_guard = "if (requestId !== state.libraryRequestId)"
-        self.assertIn(stale_guard, load_libraries)
-        self.assertLess(
-            load_libraries.index(stale_guard),
-            load_libraries.index("state.libraries = payload.libraries;"),
-        )
-        switch_library = script.text.split(
-            "async function switchLibrary() {",
-            1,
-        )[1].split("function badge(", 1)[0]
-        self.assertEqual(switch_library.count("loadLibraries(libraryId)"), 1)
-        self.assertIn("if (!(await loadLibraries(libraryId)))", switch_library)
-        load_snapshots = script.text.split(
-            'async function loadSnapshots(preferredId = "") {',
-            1,
-        )[1].split("async function verifySnapshot(", 1)[0]
-        self.assertIn("const requestId = ++state.snapshotRequestId;", load_snapshots)
-        self.assertIn(
-            "const previousSnapshotId = elements.snapshotSelect.value;",
-            load_snapshots,
-        )
-        snapshot_guard = "requestId !== state.snapshotRequestId"
-        self.assertIn(snapshot_guard, load_snapshots)
-        self.assertLess(
-            load_snapshots.index(snapshot_guard),
-            load_snapshots.index("state.snapshots = payload.snapshots;"),
-        )
-        snapshot_change = (
-            "if (elements.snapshotSelect.value !== previousSnapshotId)"
-        )
-        self.assertIn(snapshot_change, load_snapshots)
-        self.assertLess(
-            load_snapshots.index("elements.snapshotSelect.value = preferredId;"),
-            load_snapshots.index(snapshot_change),
-        )
-        self.assertIn("invalidateSearch();", load_snapshots)
-        choose_files = script.text.split("function chooseFiles(fileList) {", 1)[1].split(
-            "function renderSelectedFiles()",
-            1,
-        )[0]
-        self.assertLess(
-            choose_files.index('elements.files.value = "";'),
-            choose_files.index("state.files = files;"),
-        )
-        search_function = script.text.split("async function search() {", 1)[1].split(
-            "async function refreshAll()",
-            1,
-        )[0]
-        self.assertIn("const requestId = ++state.searchRequestId;", search_function)
-        self.assertEqual(search_function.count("searchRequestIsCurrent("), 3)
-        self.assertIn(
-            'elements.query.addEventListener("input", invalidateSearch);',
-            script.text,
-        )
-        self.assertIn(
-            'elements.snapshotSelect.addEventListener("change", invalidateSearch);',
-            script.text,
-        )
-        self.assertNotIn("innerHTML", script.text)
+        self.assertIn("escapeHtml", script.text)
+        ui_assets = page.text + script.text + connections.text
+        self.assertIn("application/pdf", ui_assets)
+        self.assertIn(".markdown", ui_assets)
+        self.assertIn("requestId", script.text)
+        self.assertIn("selectionIsCurrent", script.text)
+        self.assertIn("X-CSRF-Token", script.text)
+        self.assertIn("X-Action-Intent", script.text)
         self.assertNotIn("insertAdjacentHTML", script.text)
         self.assertNotIn("https://", page.text + script.text)
-        self.assertIn('id="search-mode"', page.text)
-        self.assertIn("BM25（离线、零密钥、零模型调用）", page.text)
-        self.assertIn("增强搜索（当前不可用）", page.text)
-        self.assertIn("第 1 次发送原问题做改写", page.text)
-        self.assertIn("第 2 次发送改写问题取得查询向量", page.text)
-        self.assertIn(
-            "第 3 次只发送所选快照中本地向量召回的有界候选 ID",
-            page.text,
-        )
-        self.assertIn("增强搜索尚未配置或当前不可用", page.text + script.text)
+        self.assertIn("search-mode", ui_assets)
+        self.assertIn("BM25（离线、零密钥、零模型调用）", ui_assets)
+        self.assertIn("AI 增强搜索", ui_assets)
+        self.assertIn("本地 BM25", ui_assets)
+        self.assertIn("明确选择“AI 增强搜索”", ui_assets)
 
         self.assertEqual(len(TOOLS), 8)
         self.assertEqual(

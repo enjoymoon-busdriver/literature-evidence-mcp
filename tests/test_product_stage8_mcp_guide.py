@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,11 +12,11 @@ from starlette.testclient import TestClient
 
 from literature_evidence_mcp import mcp_selfcheck
 from literature_evidence_mcp.web import create_app
+from tests.test_formal_ui_frontend import run_scenario
 
 
 PORT = 19128
 ORIGIN = f"http://127.0.0.1:{PORT}"
-from tests.node_runtime import NODE
 STATIC_ROOT = (
     Path(__file__).resolve().parents[1]
     / "src"
@@ -282,129 +281,47 @@ class StageEightWebBoundaryTests(unittest.TestCase):
     def test_beginner_guide_copy_boundary_and_no_remote_assets(self) -> None:
         html = (STATIC_ROOT / "index.html").read_text(encoding="utf-8")
         script = (STATIC_ROOT / "app.js").read_text(encoding="utf-8")
+        connections = (STATIC_ROOT / "connections.js").read_text(encoding="utf-8")
+        ui_assets = html + script + connections
 
         for text in (
-            "连接本地 AI / MCP",
-            "复制但未配置",
-            "不需要 OpenAI API key",
-            "不会执行命令",
-            "ChatGPT web 不会读取本机 Codex 配置",
-            "Stage 9 仅提供 Tunnel 离线模拟向导",
-            "不代表客户端已配置",
+            "本机 MCP · 八个只读工具",
+            "复制不会执行命令或写配置",
+            "本地 MCP 无需 OpenAI Key",
+            "ChatGPT desktop",
+            "ChatGPT Secure MCP Tunnel（离线模拟）",
+            "不收集真实 Key",
+            "通过不代表客户端已配置",
         ):
-            self.assertIn(text, html)
-        self.assertNotIn("https://", html.lower())
-        self.assertNotIn("http://", html.lower())
-        self.assertIn("navigator.clipboard.writeText", script)
-        self.assertIn("已复制，但尚未配置", script)
-        self.assertIn("new AbortController()", script)
-        self.assertIn("state.mcpSelfCheckController.abort()", script)
-        self.assertIn("requestId !== state.mcpSelfCheckRequestId", script)
+            self.assertIn(text, ui_assets)
+        self.assertIn('id="content"', html)
+        self.assertIn('data-action="apps"', html)
+        self.assertNotIn("https://", ui_assets.lower())
+        self.assertNotIn("http://", ui_assets.lower())
+        self.assertIn("navigator.clipboard.writeText", connections)
+        self.assertIn("mcpSelfCheck", script + connections)
+        self.assertIn("requestId", connections)
+        self.assertIn("FolioApp", script)
+        self.assertIn("FolioConnections", connections)
 
     def test_newer_self_check_request_wins_even_if_old_response_arrives_last(
         self,
     ) -> None:
-        self.assertTrue(NODE.is_file(), NODE)
-        harness = r'''
-const fs = require("fs");
-const vm = require("vm");
-
-class FakeElement {
-  constructor(id = "") {
-    this.id = id;
-    this.value = id === "search-mode" ? "bm25" : "";
-    this.checked = id === "build-blank";
-    this.disabled = false;
-    this.hidden = false;
-    this.textContent = "";
-    this.files = [];
-    this.children = [];
-    this.classList = {
-      add() {},
-      remove() {},
-      toggle() {},
-    };
-  }
-  addEventListener() {}
-  append(...items) { this.children.push(...items); }
-  replaceChildren(...items) { this.children = [...items]; }
-}
-
-const fakeElements = new Map();
-global.document = {
-  querySelector(selector) {
-    const id = selector.startsWith("#") ? selector.slice(1) : selector;
-    if (!fakeElements.has(id)) fakeElements.set(id, new FakeElement(id));
-    return fakeElements.get(id);
-  },
-  createElement(tag) { return new FakeElement(tag); },
-};
-global.navigator = {clipboard: {writeText: async () => {}}};
-
-const selfChecks = [];
-global.fetch = (path, options = {}) => {
-  if (path === "/api/mcp-self-check") {
-    return new Promise((resolve) => {
-      selfChecks.push({resolve, signal: options.signal});
-    });
-  }
-  return new Promise(() => {});
-};
-
-function response(message, passed) {
-  return {
-    ok: true,
-    headers: {get: () => "application/json"},
-    json: async () => ({
-      self_check: {
-        passed,
-        message,
-        tool_count: 8,
-        scope: "local_stdio_self_check",
-        evidence_level: "offline_local_stdio",
-        observation_scope_zh: "隔离树核验；网络和外部写入未观测。",
-        network_calls: null,
-        model_calls: 0,
-        api_keys_used: 0,
-        external_config_writes: null,
-        retry_count: 0,
-        steps: Array.from({length: 6}, (_, i) => ({name: "step" + i, message: "ok", passed})),
-      },
-    }),
-  };
-}
-
-const app = fs.readFileSync(process.argv[1], "utf8");
-const test = `
-;(async () => {
-  const first = runMcpSelfCheck();
-  const second = runMcpSelfCheck();
-  if (selfChecks.length !== 2) throw new Error("expected two requests");
-  if (!selfChecks[0].signal.aborted) throw new Error("old request was not aborted");
-  if (selfChecks[1].signal.aborted) throw new Error("new request was aborted");
-  selfChecks[1].resolve(response("SECOND_RESULT", true));
-  await second;
-  selfChecks[0].resolve(response("STALE_RESULT", false));
-  await first;
-  const status = fakeElements.get("mcp-self-check-status").textContent;
-  if (status !== "SECOND_RESULT") {
-    throw new Error("stale response overwrote newer result: " + status);
-  }
-})().catch((error) => {
-  process.stderr.write(String(error && error.stack || error));
-  process.exitCode = 1;
-});
-`;
-vm.runInThisContext(app + test, {filename: process.argv[1]});
-'''
-        completed = subprocess.run(
-            [str(NODE), "-e", harness, str(STATIC_ROOT / "app.js")],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
+        run_scenario(self, r'''
+state.csrfToken = 'synthetic-csrf';
+state.mcpGuide = {state:'copy_ready_not_configured', server_name:'literature-evidence', tool_count:8, api_key_required:false, cli:'cli', toml:'toml'};
+let pending = [];
+route = (path, options) => path === '/api/mcp-self-check'
+  ? new Promise(resolve => pending.push({resolve, options})) : undefined;
+const first = FolioConnections.runMcpSelfCheck();
+const second = FolioConnections.runMcpSelfCheck();
+assert.equal(pending.length, 2);
+pending[1].resolve(response({self_check:{passed:true, message:'SECOND_RESULT', tool_count:8, scope:'local_stdio_self_check', evidence_level:'offline_local_stdio', observation_scope_zh:'scope', network_calls:null, model_calls:0, api_keys_used:0, external_config_writes:null, retry_count:0, steps:Array.from({length:6}, (_, i) => ({name:'step'+i, message:'ok', passed:true}))}}));
+await second;
+pending[0].resolve(response({self_check:{passed:true, message:'STALE_RESULT', tool_count:8, scope:'local_stdio_self_check', evidence_level:'offline_local_stdio', observation_scope_zh:'scope', network_calls:null, model_calls:0, api_keys_used:0, external_config_writes:null, retry_count:0, steps:Array.from({length:6}, (_, i) => ({name:'step'+i, message:'ok', passed:true}))}}));
+await first;
+assert.equal(state.mcpSelfCheck.message, 'SECOND_RESULT');
+''')
 
 
 if __name__ == "__main__":

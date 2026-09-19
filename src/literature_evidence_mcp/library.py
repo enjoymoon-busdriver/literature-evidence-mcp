@@ -62,6 +62,9 @@ class FixedLibrary:
             if requested.is_symlink():
                 raise ImportPolicyError("固定资料库根目录不能是符号链接。")
             self._root_guard = _root_guard(requested)
+            if library_id is not None:
+                # Registered libraries must never be recreated after deletion.
+                _validated_root(self._root_guard)
             self._root = self._root_guard.application_root
         except ImportPolicyError:
             raise

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import uuid
 from contextlib import contextmanager
@@ -918,6 +919,60 @@ class LibraryRegistry:
                     item,
                     selected_library_id=registry["selected_library_id"],
                 )
+
+    def delete(self, library_id: str, confirmation_name: str) -> dict[str, Any]:
+        """Unregister and physically remove one explicitly confirmed, owned library."""
+        library_id = _validated_library_id(library_id)
+        if not shutil.rmtree.avoids_symlink_attacks:
+            raise LibraryRegistryError("当前平台不支持安全清理目录；未删除资料库。")
+        with self._application_root(create=False) as root_descriptor:
+            if root_descriptor is None:
+                raise LibraryRegistryError("受控应用根目录不存在。")
+            with self._exclusive_write_lock(root_descriptor):
+                registry = self._load(root_descriptor)
+                item = self._record(registry, library_id)
+                if type(confirmation_name) is not str or confirmation_name != item["name"]:
+                    raise LibraryRegistryError("确认库名与指定 library_id 的准确库名不符；未删除。")
+                libraries = self._open_libraries(root_descriptor, allow_missing=False)
+                assert libraries is not None
+                try:
+                    target = self._open_directory_entry(libraries, library_id,
+                        label="待删除资料库", allow_missing=False)
+                    assert target is not None
+                    try:
+                        # Snapshot and vector writers hold this same directory lock.
+                        with self._root_lock(target, exclusive=True):
+                            remaining = [record for record in registry["libraries"]
+                                         if record["library_id"] != library_id]
+                            selected = registry["selected_library_id"]
+                            if selected == library_id:
+                                selected = remaining[0]["library_id"] if remaining else None
+                            next_registry = {**registry, "libraries": remaining,
+                                             "selected_library_id": selected}
+                            residual = self._libraries_root / library_id
+                            try:
+                                self._write(root_descriptor, next_registry)
+                            except _RegistryWriteFailure as exc:
+                                if exc.published:
+                                    raise LibraryRegistryError(
+                                        f"库已移出注册目录，但保存确认失败，文件尚未清理。请停止服务后检查并清理残留目录：{residual}"
+                                    ) from exc
+                                raise
+                            try:
+                                current = self._entry_status(libraries, library_id, label="待删除资料库")
+                                if current is None or _identity(current) != _identity(os.fstat(target)):
+                                    raise OSError("target identity changed")
+                                shutil.rmtree(library_id, dir_fd=libraries)
+                            except OSError as exc:
+                                raise LibraryRegistryError(
+                                    f"库已移出注册目录，但文件清理未完成。请停止服务、检查目录权限并手工清理该残留目录：{residual}"
+                                ) from exc
+                            return {"deleted_library_id": library_id, "deleted": True,
+                                    "selected_library_id": selected}
+                    finally:
+                        os.close(target)
+                finally:
+                    os.close(libraries)
 
     def library_path(self, library_id: str) -> Path:
         """Resolve a registered ID to its direct, non-symlink physical root."""
