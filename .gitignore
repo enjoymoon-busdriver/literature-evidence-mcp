@@ -4,8 +4,12 @@ __pycache__/
 *.egg-info/
 .venv/
 .venv-dev/
+/.build-venv/
 .pytest_cache/
 /local-artifacts/
+/dsh-work/
+/desktop/node_modules/
+/desktop/out/
 build/
 dist/
 local-library/

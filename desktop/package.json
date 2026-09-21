@@ -1,0 +1,26 @@
+{
+  "name": "literature-evidence-mcp",
+  "productName": "FolioHook",
+  "version": "0.1.0",
+  "description": "FolioHook local literature evidence desktop shell",
+  "author": "FolioHook contributors",
+  "license": "Apache-2.0",
+  "private": true,
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron-forge start",
+    "test": "node --test test/*.test.cjs",
+    "test:mcp-shim:win": "node test/windows-mcp-smoke.cjs",
+    "make": "electron-forge make",
+    "package:win": "electron-forge package --platform=win32 --arch=x64",
+    "make:win": "electron-forge make --platform=win32 --arch=x64"
+  },
+  "dependencies": {
+    "electron-squirrel-startup": "1.0.1"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "7.11.2",
+    "@electron-forge/maker-squirrel": "7.11.2",
+    "electron": "44.4.3"
+  }
+}

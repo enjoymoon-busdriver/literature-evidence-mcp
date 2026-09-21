@@ -511,10 +511,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        from .connections import Connections
+        from .connections import desktop_connections
         from .registry import default_application_root
         root = args.application_root or default_application_root()
-        connections = Connections(root)
+        connections = desktop_connections(root)
         service = ReadOnlyEvidenceTools(root, enhanced_search=connections.enhanced)
         server = create_server(service)
         asyncio.run(_serve_stdio(server))

@@ -30,6 +30,7 @@ from .object_store import (
     _validated_directory,
     _write_new_file,
 )
+from .platform_fs import replace_file, status_is_reparse
 from .registry import LibraryRegistry
 from .snapshot import _open_verified_snapshot
 
@@ -408,7 +409,7 @@ def _write_vector_catalog(root: Path, catalog: dict[str, Any]) -> None:
         except OSError as exc:
             raise VectorError("无法读取向量 artifact 登记表目标。") from exc
         if (
-            stat.S_ISLNK(status.st_mode)
+            status_is_reparse(status)
             or not stat.S_ISREG(status.st_mode)
             or status.st_nlink != 1
         ):
@@ -420,13 +421,14 @@ def _write_vector_catalog(root: Path, catalog: dict[str, Any]) -> None:
     committed = False
     try:
         descriptor, temporary = tempfile.mkstemp(prefix=".catalog-", dir=vectors)
-        os.fchmod(descriptor, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             descriptor = -1
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        replace_file(Path(temporary), path)
         committed = True
         temporary = ""
         _fsync_directory(vectors)
@@ -927,8 +929,13 @@ def _publish_object(
         _read_vector_payload(root, descriptor, len(payload) // _FLOAT_BYTES)
         return descriptor
     finally:
-        if temporary.exists() and not temporary.is_symlink():
-            shutil.rmtree(temporary)
+        try:
+            temporary_status = temporary.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if not status_is_reparse(temporary_status):
+                shutil.rmtree(temporary)
 
 
 def _publish_artifact(
@@ -966,16 +973,24 @@ def _publish_artifact(
             raise VectorError("新发布向量 artifact 核验失败。")
         return record
     except BaseException:
-        if published and target.exists() and not target.is_symlink():
+        if published:
             try:
+                target_status = target.lstat()
+                if status_is_reparse(target_status):
+                    raise OSError("published vector target became a reparse point")
                 shutil.rmtree(target)
                 _fsync_directory(snapshot_root)
             except OSError:
                 pass
         raise
     finally:
-        if temporary.exists() and not temporary.is_symlink():
-            shutil.rmtree(temporary)
+        try:
+            temporary_status = temporary.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if not status_is_reparse(temporary_status):
+                shutil.rmtree(temporary)
 
 
 def _artifact_status(
@@ -1269,7 +1284,7 @@ def _load_verified(
         selected_profile_id, _PROFILE_ID, "profile_id"
     )
     root_guard = _root_guard(library)
-    with snapshot_catalog_lock(root_guard):
+    with snapshot_catalog_lock(root_guard, exclusive=False):
         root = _validated_root(root_guard)
         assert root is not None
         snapshot_catalog = load_snapshot_catalog(root_guard)

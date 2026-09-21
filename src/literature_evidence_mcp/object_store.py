@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import ctypes
-import errno
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -23,6 +20,12 @@ from .ingest import (
     _parse_payload,
     _parser_identity,
     _prepared_document,
+)
+from .platform_fs import (
+    fsync_directory,
+    open_path_file,
+    publish_directory_no_replace,
+    status_is_reparse,
 )
 
 
@@ -82,13 +85,15 @@ def _read_regular_file(path: Path, *, label: str) -> bytes:
         before = path.lstat()
     except OSError as exc:
         raise SnapshotError(f"缺少{label}。") from exc
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise SnapshotError(f"{label}必须是普通文件且不能是符号链接。")
+    if status_is_reparse(before) or not stat.S_ISREG(before.st_mode):
+        raise SnapshotError(
+            f"{label}必须是普通文件且不能是符号链接或重解析点。"
+        )
     if before.st_nlink != 1:
         raise SnapshotError(f"{label}不能是多链接文件。")
     descriptor = -1
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = open_path_file(path, os.O_RDONLY)
         blocks: list[bytes] = []
         while True:
             block = os.read(descriptor, 1024 * 1024)
@@ -116,8 +121,10 @@ def _validated_directory(path: Path, *, label: str) -> None:
         status = path.lstat()
     except OSError as exc:
         raise SnapshotError(f"缺少{label}。") from exc
-    if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
-        raise SnapshotError(f"{label}必须是普通目录且不能是符号链接。")
+    if status_is_reparse(status) or not stat.S_ISDIR(status.st_mode):
+        raise SnapshotError(
+            f"{label}必须是普通目录且不能是符号链接或重解析点。"
+        )
 
 
 def _object_payload_path(library_root: Path, kind: str, digest: str) -> Path:
@@ -204,27 +211,11 @@ def _write_new_file(path: Path, payload: bytes) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    fsync_directory(path)
 
 
 def _publish_directory_no_replace(source: Path, target: Path) -> None:
-    if sys.platform == "darwin":
-        renamex_np = ctypes.CDLL(None, use_errno=True).renamex_np
-        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-        renamex_np.restype = ctypes.c_int
-        if renamex_np(os.fsencode(source), os.fsencode(target), 0x00000004) == 0:
-            return
-        error_number = ctypes.get_errno()
-        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-            raise FileExistsError(error_number, os.strerror(error_number), target)
-        raise OSError(error_number, os.strerror(error_number), target)
-    if target.exists():
-        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), target)
-    os.rename(source, target)
+    publish_directory_no_replace(source, target)
 
 
 def _ensure_object(
@@ -276,8 +267,13 @@ def _ensure_object(
             raise SnapshotError(f"新发布的 {kind} 对象核验失败。")
         return True
     finally:
-        if temporary.exists() and not temporary.is_symlink():
-            shutil.rmtree(temporary)
+        try:
+            temporary_status = temporary.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if not status_is_reparse(temporary_status):
+                shutil.rmtree(temporary)
 
 
 def _parsed_payload(document: PreparedDocument) -> bytes:

@@ -9,9 +9,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-import fcntl
-
 from .errors import LibraryRegistryError, SnapshotError
+from .platform_fs import (
+    file_lock,
+    fsync_directory,
+    open_file,
+    open_path_file,
+    replace_file,
+    status_is_reparse,
+)
 from .registry import LibraryRegistry, _identity
 
 
@@ -138,7 +144,7 @@ def _unregistered_snapshot_exists(root: Path) -> bool:
         return False
     except OSError as exc:
         raise SnapshotError("无法读取 snapshots 目录状态。") from exc
-    if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+    if status_is_reparse(status) or not stat.S_ISDIR(status.st_mode):
         raise SnapshotError("snapshots 必须是普通目录且不能是符号链接。")
     try:
         with os.scandir(snapshots) as entries:
@@ -160,8 +166,10 @@ def snapshot_catalog_exists(library: Path | LibraryRegistry) -> bool:
         return False
     except OSError as exc:
         raise SnapshotError("无法读取快照目录册状态。") from exc
-    if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
-        raise SnapshotError("快照目录册必须是普通文件且不能是符号链接。")
+    if status_is_reparse(status) or not stat.S_ISREG(status.st_mode):
+        raise SnapshotError(
+            "快照目录册必须是普通文件且不能是符号链接或重解析点。"
+        )
     return True
 
 
@@ -177,14 +185,16 @@ def load_snapshot_catalog(library: Path | LibraryRegistry) -> dict[str, Any]:
         return empty_snapshot_catalog()
     except OSError as exc:
         raise SnapshotError("无法读取快照目录册状态。") from exc
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise SnapshotError("快照目录册必须是普通文件且不能是符号链接。")
+    if status_is_reparse(before) or not stat.S_ISREG(before.st_mode):
+        raise SnapshotError(
+            "快照目录册必须是普通文件且不能是符号链接或重解析点。"
+        )
     if before.st_nlink != 1 or before.st_size > _CATALOG_MAX_BYTES:
         raise SnapshotError("快照目录册链接数或大小无效。")
 
     descriptor = -1
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = open_path_file(path, os.O_RDONLY)
         raw = bytearray()
         while True:
             block = os.read(descriptor, 1024 * 1024)
@@ -223,37 +233,41 @@ def snapshot_record(catalog: dict[str, Any], snapshot_id: str) -> dict[str, Any]
 
 
 @contextmanager
-def snapshot_catalog_lock(library: Path | LibraryRegistry) -> Iterator[None]:
+def snapshot_catalog_lock(
+    library: Path | LibraryRegistry, *, exclusive: bool = True
+) -> Iterator[None]:
     guard = _root_guard(library)
     try:
         with guard._application_root(create=False) as root_descriptor:
             if root_descriptor is None:
                 raise SnapshotError("资料库尚未安全建立。")
-            with guard._root_lock(root_descriptor, exclusive=True):
+            with guard._root_lock(root_descriptor, exclusive=exclusive):
                 try:
-                    before = os.stat(
+                    before = guard._entry_status(
+                        root_descriptor,
                         CATALOG_LOCK_NAME,
-                        dir_fd=root_descriptor,
-                        follow_symlinks=False,
+                        label="快照目录册锁文件",
                     )
                 except FileNotFoundError:
                     before = None
                 if before is not None and (
-                    stat.S_ISLNK(before.st_mode)
+                    status_is_reparse(before)
                     or not stat.S_ISREG(before.st_mode)
                 ):
-                    raise SnapshotError("快照目录册锁文件无效。")
+                    raise SnapshotError(
+                        "快照目录册锁文件必须是普通文件且不能是重解析点。"
+                    )
 
-                flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                flags = os.O_RDWR if exclusive else os.O_RDONLY
+                if exclusive:
+                    flags |= os.O_CREAT
+                flags |= getattr(os, "O_NOFOLLOW", 0)
                 flags |= getattr(os, "O_CLOEXEC", 0)
                 descriptor = -1
                 locked = False
                 try:
-                    descriptor = os.open(
-                        CATALOG_LOCK_NAME,
-                        flags,
-                        0o600,
-                        dir_fd=root_descriptor,
+                    descriptor = open_file(
+                        root_descriptor, CATALOG_LOCK_NAME, flags, 0o600
                     )
                     opened = os.fstat(descriptor)
                     if (
@@ -263,26 +277,27 @@ def snapshot_catalog_lock(library: Path | LibraryRegistry) -> Iterator[None]:
                     ):
                         raise SnapshotError("快照目录册锁文件无效。")
                     try:
-                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        lock_context = file_lock(descriptor, exclusive=exclusive)
+                        lock_context.__enter__()
                     except BlockingIOError:
                         raise SnapshotError(
                             "该资料库已有快照写操作正在进行。"
                         ) from None
                     locked = True
-                    current = os.stat(
+                    current = guard._entry_status(
+                        root_descriptor,
                         CATALOG_LOCK_NAME,
-                        dir_fd=root_descriptor,
-                        follow_symlinks=False,
+                        label="快照目录册锁文件",
                     )
-                    if _identity(current) != _identity(opened):
+                    if current is None or _identity(current) != _identity(opened):
                         raise SnapshotError("快照目录册锁文件身份已改变。")
                     yield
                 finally:
                     if descriptor >= 0:
                         if locked:
                             try:
-                                fcntl.flock(descriptor, fcntl.LOCK_UN)
-                            except OSError:
+                                lock_context.__exit__(None, None, None)
+                            except (OSError, RuntimeError):
                                 pass
                         os.close(descriptor)
     except LibraryRegistryError as exc:
@@ -307,7 +322,7 @@ def write_snapshot_catalog(
     except OSError as exc:
         raise SnapshotError("无法读取快照目录册目标状态。") from exc
     else:
-        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+        if status_is_reparse(status) or not stat.S_ISREG(status.st_mode):
             raise SnapshotError("快照目录册目标必须是普通文件。")
 
     payload = json.dumps(
@@ -320,20 +335,17 @@ def write_snapshot_catalog(
         descriptor, temporary = tempfile.mkstemp(
             prefix=".snapshot-catalog-", dir=root
         )
-        os.fchmod(descriptor, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             descriptor = -1
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        replace_file(Path(temporary), path)
         committed = True
         temporary = ""
-        directory = os.open(root, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        fsync_directory(root)
     except (OSError, ValueError) as exc:
         if committed:
             # The visible state changed at os.replace; reporting a failed build here

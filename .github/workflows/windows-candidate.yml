@@ -1,0 +1,108 @@
+name: Windows candidate
+
+# The first workflow cannot be manually dispatched before it exists on main.
+# Keep this bootstrap trigger restricted to the explicitly authorized branch.
+on:
+  push:
+    branches: [codex/windows-test-installer]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[windows-build]')
+    runs-on: windows-2022
+    timeout-minutes: 35
+    env:
+      PYTHONUTF8: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.15.0'
+      - name: Record build host
+        shell: pwsh
+        run: |
+          python --version
+          node --version
+          Write-Output "Image: $env:ImageOS $env:ImageVersion"
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture
+      - name: Fresh installed backend
+        shell: pwsh
+        run: |
+          python -m venv .build-venv
+          .build-venv/Scripts/python -m pip --isolated install --index-url https://pypi.org/simple --no-cache-dir -r scripts/packaging/requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .build-venv/Scripts/python -m pip --isolated install --no-build-isolation --no-deps .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .build-venv/Scripts/python -m pip list --format=freeze
+      - name: Windows storage and desktop tests
+        shell: pwsh
+        run: |
+          .build-venv/Scripts/python -m unittest -v tests.test_windows_storage tests.test_desktop_runtime tests.test_stage1 tests.test_stage2_retrieval
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Freeze backend
+        shell: pwsh
+        run: |
+          .build-venv/Scripts/python -m PyInstaller --noconfirm --distpath local-artifacts/windows-package/dist --workpath local-artifacts/windows-package/build scripts/packaging/backend.spec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Frozen HTTP and MCP synthetic checks
+        shell: pwsh
+        run: |
+          .build-venv/Scripts/python scripts/packaging/smoke_backend.py --backend local-artifacts/windows-package/dist/backend/foliohook-backend.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Stable Windows MCP command with Unicode paths
+        shell: pwsh
+        run: |
+          node desktop/test/windows-mcp-smoke.cjs --backend local-artifacts/windows-package/dist/backend/foliohook-backend.exe --python .build-venv/Scripts/python.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install locked desktop build dependencies
+        working-directory: desktop
+        run: npm ci --no-audit --no-fund
+      - name: Desktop unit tests
+        working-directory: desktop
+        run: npm test
+      - name: Make unsigned installer
+        working-directory: desktop
+        run: npm run make -- --platform=win32 --arch=x64
+      - name: Packaged desktop window and shutdown
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem desktop/out -Directory -Filter '*win32-x64' | ForEach-Object { Join-Path $_.FullName 'FolioHook.exe' }
+          if (@($exe).Count -ne 1 -or !(Test-Path $exe)) { throw 'Packaged desktop executable missing' }
+          $fixture = Join-Path $env:RUNNER_TEMP 'FolioHook 合成 UI smoke'
+          $process = Start-Process -FilePath $exe -ArgumentList @('--smoke-test', '--application-root', ('"' + $fixture + '"')) -PassThru
+          if (!$process.WaitForExit(60000)) {
+            $process.Kill()
+            throw 'Packaged desktop did not finish within 60 seconds'
+          }
+          if ($process.ExitCode -ne 0) { throw "Packaged desktop failed: $($process.ExitCode)" }
+      - name: Record candidate size
+        shell: pwsh
+        run: |
+          $packages = @(Get-ChildItem desktop/out/make -Recurse -Filter '*Setup.exe')
+          if ($packages.Count -ne 1) { throw 'Expected exactly one Windows Setup.exe' }
+          $packages | Select-Object Name, Length
+          if ($packages[0].Length -gt 400MB) { throw 'Candidate exceeds the planned artifact size limit' }
+          "Windows Server 2022 x64 build; unsigned test candidate, not Windows 11 clean-client acceptance." >> $env:GITHUB_STEP_SUMMARY
+          "Installer: $($packages[0].Name), $($packages[0].Length) bytes" >> $env:GITHUB_STEP_SUMMARY
+          "Test candidate retained for one day; no Release is created." >> $env:GITHUB_STEP_SUMMARY
+      - name: Save approved test candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: FolioHook-Windows-x64-unsigned-${{ github.sha }}
+          path: desktop/out/make/**/*.exe
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

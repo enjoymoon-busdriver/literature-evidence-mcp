@@ -28,6 +28,8 @@ _SHELL_COMMAND = (
 )
 _SHELL = "/bin/zsh"
 _SHELL_FLAG = "-fc"
+_WINDOWS_COMMAND = "cmd.exe"
+_WINDOWS_FLAGS = ("/d", "/v:off", "/s", "/c")
 _QUERY = "stage8localmarker"
 _SAFE_FAILURE = "此步骤未通过；自检已停止，未重试。"
 _OBSERVATION_SCOPE = (
@@ -44,6 +46,32 @@ _TOOL_NAMES = (
     "find_in_document",
     "retrieval_status",
 )
+
+
+def _frozen_windows_executable() -> Path | None:
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return None
+    try:
+        executable = Path(sys.executable).absolute()
+        if not executable.is_file():
+            return None
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return executable
+
+
+def _windows_launcher_command(application_root: Path) -> str | None:
+    launcher = Path(application_root) / "mcp-server.cmd"
+    raw = os.fspath(launcher.absolute())
+    if any(character in raw for character in ('"', "%", "\r", "\n")):
+        return None
+    try:
+        if launcher.is_symlink() or not launcher.is_file():
+            return None
+    except OSError:
+        return None
+    # /s requires the extra outer pair when the command itself starts quoted.
+    return f'""{raw}""'
 
 
 def _guide_base() -> dict[str, Any]:
@@ -126,6 +154,35 @@ def _ready_mcp_shim(application_root: Path) -> bool:
 def local_mcp_guide(application_root: Path) -> dict[str, Any]:
     """Return a copy-only guide for a prepared default or explicit test instance."""
     base = _guide_base()
+    frozen_executable = _frozen_windows_executable()
+    if frozen_executable is not None:
+        command = _windows_launcher_command(application_root)
+        if command is None:
+            return {
+                **base,
+                "state": "unavailable",
+                "platform": "windows_x64_test",
+                "reason": (
+                    "Windows 本机 MCP 稳定入口尚未由桌面安装器准备；"
+                    "不能复制会随版本变化的后端路径。"
+                ),
+            }
+        args = [*_WINDOWS_FLAGS, command]
+        cli_argument = "'" + command.replace("'", "''") + "'"
+        return {
+            **base,
+            "state": "copy_ready_not_configured",
+            "platform": "windows_x64_test",
+            "cli": (
+                f"codex mcp add {SERVER_NAME} -- {_WINDOWS_COMMAND} "
+                f"{' '.join(_WINDOWS_FLAGS)} {cli_argument}"
+            ),
+            "toml": (
+                f"[mcp_servers.{SERVER_NAME}]\n"
+                f"command = {json.dumps(_WINDOWS_COMMAND)}\n"
+                f"args = {json.dumps(args)}\n"
+            ),
+        }
     test_instance = _test_instance(application_root)
     shell_command = _SHELL_COMMAND
     server_name = SERVER_NAME
@@ -166,6 +223,32 @@ def _temporary_mcp_shim_text(application_root: Path) -> str:
         f"{shlex.quote(os.fspath(application_root))}"
     )
     return f"#!/bin/zsh -f\n{command}\n"
+
+
+def _frozen_stdio_parameters(
+    executable: Path,
+    application_root: Path,
+    temporary: Path,
+    fake_home: Path,
+) -> StdioServerParameters:
+    isolated_local = fake_home / "LocalAppData"
+    isolated_temp = temporary / "temp"
+    isolated_local.mkdir(parents=True, exist_ok=True)
+    isolated_temp.mkdir(exist_ok=True)
+    environment = {
+        "LOCALAPPDATA": os.fspath(isolated_local),
+        "TEMP": os.fspath(isolated_temp),
+        "TMP": os.fspath(isolated_temp),
+    }
+    system_root = os.environ.get("SystemRoot")
+    if system_root:
+        environment["SystemRoot"] = system_root
+    return StdioServerParameters(
+        command=os.fspath(executable),
+        args=["mcp", "--application-root", os.fspath(application_root)],
+        cwd=temporary,
+        env=environment,
+    )
 
 
 def _tree_identity(root: Path) -> dict[str, tuple[str, str]]:
@@ -221,11 +304,18 @@ def _tool_contract(tools: list[Any]) -> None:
 
 
 def _base_report() -> dict[str, Any]:
+    observation_scope = _OBSERVATION_SCOPE
+    if _frozen_windows_executable() is not None:
+        observation_scope = (
+            "本次自检直接核验隔离目录中的冻结后端 mcp 子命令、STDIO 协议、"
+            "BM25 路线和完整临时树；不核验稳定 cmd 入口或客户端配置，"
+            "也未安装系统级网络及隔离树外写入观测。"
+        )
     return {
         "passed": False,
         "scope": "local_stdio_self_check",
         "evidence_level": "offline_local_stdio",
-        "observation_scope_zh": _OBSERVATION_SCOPE,
+        "observation_scope_zh": observation_scope,
         "message": "本地离线自检尚未完成；这不代表客户端已经配置。",
         "tool_count": None,
         "network_calls": None,
@@ -244,8 +334,11 @@ async def _run_stdio_self_check(test_root: Path | None = None) -> dict[str, Any]
         with tempfile.TemporaryDirectory(prefix="lemcp-stage8-selfcheck-", dir=None if test_root is None else test_root.parent) as raw:
             temporary = Path(raw)
             fake_home = temporary / "fake home"
+            frozen_executable = _frozen_windows_executable()
             application_root = (
-                fake_home
+                temporary / "application"
+                if frozen_executable is not None
+                else fake_home
                 / "Library"
                 / "Application Support"
                 / "literature-evidence-mcp"
@@ -268,20 +361,25 @@ async def _run_stdio_self_check(test_root: Path | None = None) -> dict[str, Any]
             fake_config = fake_home / ".codex" / "config.toml"
             fake_config.parent.mkdir()
             fake_config.write_text("# self-check sentinel; do not change\n", encoding="utf-8")
-            shim = application_root / MCP_SHIM_NAME
-            shim.write_text(
-                _temporary_mcp_shim_text(application_root),
-                encoding="utf-8",
-            )
-            shim.chmod(0o700)
+            if frozen_executable is None:
+                shim = application_root / MCP_SHIM_NAME
+                shim.write_text(
+                    _temporary_mcp_shim_text(application_root),
+                    encoding="utf-8",
+                )
+                shim.chmod(0o700)
             before = _tree_identity(temporary)
             report["steps"].append(
                 {
                     "name": current_step,
                     "passed": True,
                     "message": (
-                        "已在隔离 fake HOME 建立合成快照和固定启动入口；"
-                        "未读取用户资料库。"
+                        (
+                            "已在隔离目录建立合成快照；将用冻结后端的 mcp 子命令直接启动；"
+                            if frozen_executable is not None
+                            else "已在隔离 fake HOME 建立合成快照和固定启动入口；"
+                        )
+                        + "未读取用户资料库。"
                     ),
                 }
             )
@@ -304,15 +402,23 @@ async def _run_stdio_self_check(test_root: Path | None = None) -> dict[str, Any]
                                 raise RuntimeError("isolated root mismatch")
                 if _tree_identity(test_root) != before_instance:
                     raise RuntimeError("isolated root changed during read-only check")
-            params = StdioServerParameters(
-                command=_SHELL,
-                args=[_SHELL_FLAG, _SHELL_COMMAND],
-                cwd=temporary,
-                env={
-                    "HOME": os.fspath(fake_home),
-                    "PATH": "/usr/bin:/bin",
-                },
-            )
+            if frozen_executable is None:
+                params = StdioServerParameters(
+                    command=_SHELL,
+                    args=[_SHELL_FLAG, _SHELL_COMMAND],
+                    cwd=temporary,
+                    env={
+                        "HOME": os.fspath(fake_home),
+                        "PATH": "/usr/bin:/bin",
+                    },
+                )
+            else:
+                params = _frozen_stdio_parameters(
+                    frozen_executable,
+                    application_root,
+                    temporary,
+                    fake_home,
+                )
             with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errlog:
                 async with asyncio.timeout(30):
                     async with Client(
@@ -326,8 +432,12 @@ async def _run_stdio_self_check(test_root: Path | None = None) -> dict[str, Any]
                                 "name": current_step,
                                 "passed": True,
                                 "message": (
-                                    "固定 /bin/zsh -fc 与 $HOME shim 链启动成功；"
-                                    "STDIO 子进程返回恰好八个工具，均只读，"
+                                    (
+                                        "冻结后端 mcp 子命令直接启动成功；"
+                                        if frozen_executable is not None
+                                        else "固定 /bin/zsh -fc 与 $HOME shim 链启动成功；"
+                                    )
+                                    + "STDIO 子进程返回恰好八个工具，均只读，"
                                     "仅 search_documents 标注可能访问开放世界。"
                                 ),
                             }
@@ -481,7 +591,10 @@ async def _run_stdio_self_check(test_root: Path | None = None) -> dict[str, Any]
 
     report["passed"] = True
     report["message"] = (
-        "本地离线 STDIO 自检通过；这只证明隔离 fake HOME 中相同的固定启动模板"
+        "本地离线 STDIO 自检通过；这只证明隔离目录中的冻结后端 mcp 子命令和"
+        "合成证据链可用，不证明稳定入口已写入客户端，也不代表客户端已经配置。"
+        if frozen_executable is not None
+        else "本地离线 STDIO 自检通过；这只证明隔离 fake HOME 中相同的固定启动模板"
         "和合成证据链可用，不证明真实 HOME 的入口可执行，也不代表客户端已经配置。"
     )
     if test_root is not None:

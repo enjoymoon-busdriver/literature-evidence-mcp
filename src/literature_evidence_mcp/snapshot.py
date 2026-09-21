@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import ctypes
-import errno
 import functools
 import hashlib
 import importlib.metadata
@@ -42,6 +40,12 @@ from .object_store import (
     load_document,
     object_store_manifest,
     referenced_object_identities,
+)
+from .platform_fs import (
+    fsync_directory,
+    open_path_file,
+    publish_directory_no_replace,
+    status_is_reparse,
 )
 from .registry import LibraryRegistry
 
@@ -171,11 +175,7 @@ def _write_new_file(path: Path, payload: bytes) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    fsync_directory(path)
 
 
 def _prepare_library(
@@ -184,9 +184,23 @@ def _prepare_library(
     root = _validated_root(library, create=True)
     assert root is not None
     snapshots = root / "snapshots"
-    if snapshots.is_symlink():
-        raise ImportPolicyError("snapshots 目录不能是符号链接。")
+    try:
+        snapshots_status = snapshots.lstat()
+    except FileNotFoundError:
+        snapshots_status = None
+    except OSError as exc:
+        raise ImportPolicyError("无法读取 snapshots 目录状态。") from exc
+    if snapshots_status is not None and status_is_reparse(snapshots_status):
+        raise ImportPolicyError("snapshots 目录不能是符号链接或重解析点。")
     snapshots.mkdir(exist_ok=True)
+    try:
+        snapshots_status = snapshots.lstat()
+    except OSError as exc:
+        raise ImportPolicyError("无法读取 snapshots 目录状态。") from exc
+    if status_is_reparse(snapshots_status) or not stat.S_ISDIR(
+        snapshots_status.st_mode
+    ):
+        raise ImportPolicyError("snapshots 必须是普通目录且不能是重解析点。")
     return root, snapshots.resolve(strict=True)
 
 
@@ -395,13 +409,15 @@ def _sha256_regular_file(path: Path, *, label: str) -> tuple[str, int]:
         before = path.lstat()
     except OSError as exc:
         raise SnapshotError(f"快照缺少{label}。") from exc
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise SnapshotError(f"{label}必须是普通文件且不能是符号链接。")
+    if status_is_reparse(before) or not stat.S_ISREG(before.st_mode):
+        raise SnapshotError(
+            f"{label}必须是普通文件且不能是符号链接或重解析点。"
+        )
     if before.st_nlink != 1:
         raise SnapshotError(f"{label}不能是多链接文件。")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY
     try:
-        descriptor = os.open(path, flags)
+        descriptor = open_path_file(path, flags)
         try:
             digest = hashlib.sha256()
             while True:
@@ -490,26 +506,22 @@ def _cleanup_build_directory(path: Path, snapshots_root: Path) -> None:
         inside = path.parent.resolve(strict=True) == snapshots_root.resolve(strict=True)
     except OSError:
         inside = False
-    if inside and path.name.startswith(".building-") and path.exists() and not path.is_symlink():
+    if not inside or not path.name.startswith(".building-"):
+        return
+    try:
+        status = path.lstat()
+    except FileNotFoundError:
+        return
+    if not status_is_reparse(status):
         shutil.rmtree(path)
 
 
 def _publish_directory_no_replace(source: Path, target: Path) -> None:
     """Atomically publish on macOS without replacing an existing snapshot."""
-    if sys.platform == "darwin":
-        renamex_np = ctypes.CDLL(None, use_errno=True).renamex_np
-        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-        renamex_np.restype = ctypes.c_int
-        result = renamex_np(os.fsencode(source), os.fsencode(target), 0x00000004)
-        if result == 0:
-            return
-        error_number = ctypes.get_errno()
-        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
-            raise SnapshotError("目标快照已存在；未覆盖任何已有快照。")
-        raise OSError(error_number, os.strerror(error_number), str(target))
-    if target.exists():
+    try:
+        publish_directory_no_replace(source, target)
+    except FileExistsError:
         raise SnapshotError("目标快照已存在；未覆盖任何已有快照。")
-    os.rename(source, target)
 
 
 def _publish_prepared_snapshot(
@@ -681,8 +693,10 @@ def _catalog_object_identities(
             status = snapshot_directory.lstat()
         except OSError as exc:
             raise SnapshotError("找不到已登记快照目录。") from exc
-        if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
-            raise SnapshotError("已登记快照必须是普通目录且不能是符号链接。")
+        if status_is_reparse(status) or not stat.S_ISDIR(status.st_mode):
+            raise SnapshotError(
+                "已登记快照必须是普通目录且不能是符号链接或重解析点。"
+            )
         manifest, manifest_sha256 = _load_manifest(snapshot_directory)
         if manifest_sha256 != record["manifest_sha256"]:
             raise SnapshotError("已登记快照的 manifest 与目录册绑定不一致。")
@@ -842,14 +856,15 @@ def _load_manifest(snapshot_directory: Path) -> tuple[dict[str, Any], str]:
     manifest_path = snapshot_directory / MANIFEST_NAME
     try:
         before = manifest_path.lstat()
-        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-            raise SnapshotError("manifest.json 必须是普通文件且不能是符号链接。")
+        if status_is_reparse(before) or not stat.S_ISREG(before.st_mode):
+            raise SnapshotError(
+                "manifest.json 必须是普通文件且不能是符号链接或重解析点。"
+            )
         if before.st_nlink != 1:
             raise SnapshotError("manifest.json 不能是多链接文件。")
         if before.st_size > 8 * 1024 * 1024:
             raise SnapshotError("manifest.json 超过 8 MiB 上限。")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(manifest_path, flags)
+        descriptor = open_path_file(manifest_path, os.O_RDONLY)
         try:
             raw = bytearray()
             while True:
@@ -907,8 +922,10 @@ def _snapshot_library_root(snapshot_directory: Path) -> Path:
             status = path.lstat()
         except OSError as exc:
             raise SnapshotError(f"无法读取{label}状态。") from exc
-        if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
-            raise SnapshotError(f"{label}必须是普通目录且不能是符号链接。")
+        if status_is_reparse(status) or not stat.S_ISDIR(status.st_mode):
+            raise SnapshotError(
+                f"{label}必须是普通目录且不能是符号链接或重解析点。"
+            )
     return library_root
 
 
@@ -1040,8 +1057,12 @@ def _verify_snapshot(
 ) -> tuple[dict[str, Any], bytes]:
     """Verify one exact database image plus its manifest and frozen sources."""
     directory = Path(snapshot).expanduser()
-    if directory.is_symlink():
-        raise SnapshotError("快照目录不能是符号链接。")
+    try:
+        directory_status = directory.lstat()
+    except OSError as exc:
+        raise SnapshotError("找不到快照目录。") from exc
+    if status_is_reparse(directory_status):
+        raise SnapshotError("快照目录不能是符号链接或重解析点。")
     try:
         directory = directory.resolve(strict=True)
     except OSError as exc:

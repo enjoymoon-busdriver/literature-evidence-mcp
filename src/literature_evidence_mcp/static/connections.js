@@ -116,6 +116,15 @@
     const value = settings();
     const configured = Boolean(local.connections?.aliyun_configured);
     const draft = local.modelDraft || value.model_ids;
+    const support = local.connections?.platform_support;
+    if (support?.enhanced === false) {
+      return app.heading("全局设置", "本机 BM25 始终可用。", '<button type="button" data-action="open-apps">连接 AI 应用 →</button>') + `
+        <section class="settings-card">
+          <h2>Windows x64 测试版</h2>
+          <div class="note-box">${app.escapeHtml(support.message || "当前版本只提供本机资料库与 BM25。")}</div>
+          <p>本版本不会保存明文 Key，也不会尝试启动增强模型或 Secure MCP Tunnel。</p>
+        </section>`;
+    }
     return app.heading("全局设置", "配置可选的 AI 增强搜索。默认关闭，本地 BM25 始终可用。", '<button type="button" data-action="open-apps">连接 AI 应用 →</button>') + `
       <section class="settings-card">
         <h2>AI 增强搜索</h2>
@@ -168,18 +177,19 @@
     const connections = local.connections || {};
     const simulation = app.state.simulatedTunnel;
     const mcp = app.state.mcpSelfCheck;
-    return app.heading("连接 AI 应用", "本地 MCP 无需 OpenAI Key；真实 Tunnel 单独配置运行 Key。", '<button type="button" data-action="open-settings">返回全局设置</button>') + `
+    const support = connections.platform_support;
+    const mcpResult = mcp ? (mcp.passed
+      ? (guide.platform === "windows_x64_test"
+        ? `冻结后端自检通过：${mcp.tool_count} 个只读工具；本次未核验稳定 cmd 被真实客户端调用，仍需手工配置。`
+        : `自检通过：${mcp.tool_count} 个只读工具；零模型、零 Key、零重试。仍需在客户端手工配置。`)
+      : app.escapeHtml(mcp.message || "自检未通过"))
+      : "尚未运行自检。通过不代表客户端已配置。";
+    const productionTunnel = support?.tunnel === false ? `
       <section class="settings-card">
-        <h2>本机 MCP · 八个只读工具</h2>
-        <p>适用于同一台电脑上的 ChatGPT desktop、Codex CLI 与 Codex IDE 扩展。复制不会执行命令或写配置。</p>
-        <div class="two-column">
-          <label class="field">可复制 CLI<textarea id="mcp-cli" class="code-copy" rows="4" readonly>${app.escapeHtml(copyReady ? guide.cli : "")}</textarea><button type="button" data-action="copy-mcp-cli" ${copyReady ? "" : "disabled"}>复制 CLI（不执行）</button></label>
-          <label class="field">等价 TOML<textarea id="mcp-toml" class="code-copy" rows="4" readonly>${app.escapeHtml(copyReady ? guide.toml : "")}</textarea><button type="button" data-action="copy-mcp-toml" ${copyReady ? "" : "disabled"}>复制 TOML（不写配置）</button></label>
-        </div>
-        ${copyReady ? "" : `<div class="note-box danger">${app.escapeHtml(guide.reason || "本地 MCP 启动入口尚未准备。")}</div>`}
-        <button type="button" data-action="mcp-self-check" ${!copyReady || local.mcpRequestId ? "disabled" : ""}>${local.mcpRequestId ? "正在运行自检…" : "运行本地离线 STDIO 自检"}</button>
-        <div class="note-box" role="status">${mcp ? (mcp.passed ? `自检通过：${mcp.tool_count} 个只读工具；零模型、零 Key、零重试。仍需在客户端手工配置。` : app.escapeHtml(mcp.message || "自检未通过")) : "尚未运行自检。通过不代表客户端已配置。"}</div>
-      </section>
+        <h2>ChatGPT Secure MCP Tunnel · 当前不可用</h2>
+        <div class="note-box">${app.escapeHtml(support.message || "当前版本不支持真实 Tunnel。")}</div>
+        <p>本版本不会要求或保存 Tunnel Key；本机 STDIO MCP 与 BM25 不受影响。</p>
+      </section>` : `
       <section class="settings-card">
         <h2>ChatGPT Secure MCP Tunnel · 真实连接</h2>
         <p>运行 Key 只保存在本机钥匙串。启动后通过出站 HTTPS 连接；本地健康不等于 ChatGPT 已发现工具。</p>
@@ -192,7 +202,23 @@
         <button type="button" data-action="save-real-tunnel">保存连接设置</button>
         <div class="tunnel-actions" style="margin-top:18px"><button class="primary" type="button" data-action="real-tunnel-start" ${local.tunnelAction ? "disabled" : ""}>启动真实 Tunnel</button><button type="button" data-action="real-tunnel-health" ${local.tunnelAction ? "disabled" : ""}>检查真实连接</button><button type="button" data-action="real-tunnel-stop" ${["start", "stop"].includes(local.tunnelAction) ? "disabled" : ""}>停止真实 Tunnel</button></div>
         <div id="real-tunnel-status" class="note-box" role="status">${app.escapeHtml(realTunnelStatusText())}</div>
+      </section>`;
+    const subtitle = support?.tunnel === false
+      ? "本地 STDIO MCP 可用；Windows x64 测试版暂不提供真实 Tunnel。"
+      : "本地 MCP 无需 OpenAI Key；真实 Tunnel 单独配置运行 Key。";
+    return app.heading("连接 AI 应用", subtitle, '<button type="button" data-action="open-settings">返回全局设置</button>') + `
+      <section class="settings-card">
+        <h2>本机 MCP · 八个只读工具</h2>
+        <p>适用于同一台电脑上的 ChatGPT desktop、Codex CLI 与 Codex IDE 扩展。复制不会执行命令或写配置。</p>
+        <div class="two-column">
+          <label class="field">可复制 CLI<textarea id="mcp-cli" class="code-copy" rows="4" readonly>${app.escapeHtml(copyReady ? guide.cli : "")}</textarea><button type="button" data-action="copy-mcp-cli" ${copyReady ? "" : "disabled"}>复制 CLI（不执行）</button></label>
+          <label class="field">等价 TOML<textarea id="mcp-toml" class="code-copy" rows="4" readonly>${app.escapeHtml(copyReady ? guide.toml : "")}</textarea><button type="button" data-action="copy-mcp-toml" ${copyReady ? "" : "disabled"}>复制 TOML（不写配置）</button></label>
+        </div>
+        ${copyReady ? "" : `<div class="note-box danger">${app.escapeHtml(guide.reason || "本地 MCP 启动入口尚未准备。")}</div>`}
+        <button type="button" data-action="mcp-self-check" ${!copyReady || local.mcpRequestId ? "disabled" : ""}>${local.mcpRequestId ? "正在运行自检…" : "运行本地离线 STDIO 自检"}</button>
+        <div class="note-box" role="status">${mcpResult}</div>
       </section>
+      ${productionTunnel}
       <section class="settings-card">
         <h2>ChatGPT Secure MCP Tunnel（离线模拟）</h2>
         <p>独立的流程演练：不收集真实 Key，不建立连接，网络调用与外部配置写入均为 0。</p>

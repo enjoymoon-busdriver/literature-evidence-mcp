@@ -10,9 +10,30 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-import fcntl
-
 from .errors import LibraryRegistryError
+from .platform_fs import (
+    IS_WINDOWS,
+    DirectoryHandle,
+    PathIdentityError,
+    UnsafePathError,
+    absolute_path,
+    capture_directory_identities,
+    directory_identity,
+    entry_status,
+    file_lock,
+    fsync_directory,
+    identity as _platform_identity,
+    list_directory,
+    mkdir_entry,
+    open_anchored_directory,
+    open_child_directory,
+    open_file,
+    remove_directory_tree,
+    replace_entry,
+    rmdir_entry,
+    status_is_reparse,
+    unlink_entry,
+)
 
 
 REGISTRY_FORMAT = "literature-evidence-library-registry"
@@ -34,6 +55,15 @@ _SYSTEM_TOP_LEVEL_ALIASES = {
 def default_application_root(*, home: Path | None = None) -> Path:
     """Return the fixed per-user application root without creating it."""
     try:
+        if IS_WINDOWS:
+            if home is None:
+                local_app_data = os.environ.get("LOCALAPPDATA")
+                if not local_app_data:
+                    raise LibraryRegistryError("无法确定当前用户的 LocalAppData 目录。")
+                base = Path(local_app_data)
+            else:
+                base = Path(home) / "AppData" / "Local"
+            return absolute_path(base.expanduser()) / "literature-evidence-mcp"
         base = Path.home() if home is None else Path(home)
         return (
             base.expanduser().resolve()
@@ -81,7 +111,7 @@ def _lstat(path: Path, *, label: str) -> os.stat_result | None:
 
 def _absolute_without_symlink_components(path: Path) -> Path:
     try:
-        absolute = Path(os.path.abspath(os.fspath(path)))
+        absolute = absolute_path(path)
     except (OSError, TypeError, ValueError) as exc:
         raise LibraryRegistryError("无法固定受控应用根目录。") from exc
     current = Path(absolute.anchor)
@@ -89,7 +119,7 @@ def _absolute_without_symlink_components(path: Path) -> Path:
     if parts:
         top_level = current / parts[0]
         top_status = _lstat(top_level, label="受控应用路径")
-        if top_status is not None and stat.S_ISLNK(top_status.st_mode):
+        if top_status is not None and status_is_reparse(top_status):
             expected = _SYSTEM_TOP_LEVEL_ALIASES.get(str(top_level))
             if expected is None:
                 raise LibraryRegistryError(
@@ -106,7 +136,7 @@ def _absolute_without_symlink_components(path: Path) -> Path:
     for index, part in enumerate(parts):
         current /= part
         status = _lstat(current, label="受控应用路径")
-        if status is not None and stat.S_ISLNK(status.st_mode):
+        if status is not None and status_is_reparse(status):
             raise LibraryRegistryError("受控应用路径不能经过符号链接。")
         if index < len(parts) - 1 and status is not None and not stat.S_ISDIR(
             status.st_mode
@@ -115,64 +145,23 @@ def _absolute_without_symlink_components(path: Path) -> Path:
     return current
 
 
-def _directory_open_flags() -> int:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    return flags
-
-
 def _identity(status: os.stat_result) -> tuple[int, int]:
-    return status.st_dev, status.st_ino
+    return _platform_identity(status)
 
 
 def _capture_directory_identities(path: Path) -> list[tuple[int, int] | None]:
     """Capture existing components through no-follow directory descriptors."""
-    parts = path.parts[1:]
-    identities: list[tuple[int, int] | None] = [None] * len(parts)
     try:
-        descriptor = os.open(path.anchor, _directory_open_flags())
-    except OSError as exc:
-        raise LibraryRegistryError("无法固定受控应用路径身份。") from exc
-    try:
-        for index, part in enumerate(parts):
-            try:
-                child = os.open(
-                    part,
-                    _directory_open_flags(),
-                    dir_fd=descriptor,
-                )
-            except FileNotFoundError:
-                break
-            except OSError as exc:
-                raise LibraryRegistryError(
-                    "受控应用路径不能经过符号链接或非目录条目。"
-                ) from exc
-            try:
-                status = os.fstat(child)
-            except OSError as exc:
-                os.close(child)
-                raise LibraryRegistryError(
-                    "无法固定受控应用路径身份。"
-                ) from exc
-            if not stat.S_ISDIR(status.st_mode):
-                os.close(child)
-                raise LibraryRegistryError("受控应用路径的组件不是目录。")
-            identities[index] = _identity(status)
-            os.close(descriptor)
-            descriptor = child
-    finally:
-        os.close(descriptor)
-    return identities
+        return capture_directory_identities(path)
+    except (OSError, UnsafePathError) as exc:
+        raise LibraryRegistryError(
+            "受控应用路径不能经过符号链接、重解析点或非目录条目。"
+        ) from exc
 
 
-def _fsync_directory(descriptor: int) -> None:
+def _fsync_directory(descriptor: DirectoryHandle) -> None:
     try:
-        os.fsync(descriptor)
+        fsync_directory(descriptor)
     except OSError as exc:
         raise LibraryRegistryError("无法同步受控应用目录。") from exc
 
@@ -212,92 +201,36 @@ class LibraryRegistry:
             "libraries": [],
         }
 
-    def _open_anchored_root(self, *, create: bool) -> int | None:
+    def _open_anchored_root(self, *, create: bool) -> DirectoryHandle | None:
         try:
-            descriptor = os.open(self._root.anchor, _directory_open_flags())
-        except OSError as exc:
-            raise LibraryRegistryError("无法打开受控应用路径锚点。") from exc
-        try:
-            for index, part in enumerate(self._root.parts[1:]):
-                expected = self._component_identities[index]
-                try:
-                    child = os.open(
-                        part,
-                        _directory_open_flags(),
-                        dir_fd=descriptor,
-                    )
-                except FileNotFoundError as exc:
-                    if expected is not None:
-                        raise LibraryRegistryError(
-                            "受控应用路径的既有组件已被移除或替换。"
-                        ) from exc
-                    if not create:
-                        os.close(descriptor)
-                        return None
-                    try:
-                        os.mkdir(part, mode=0o700, dir_fd=descriptor)
-                    except FileExistsError:
-                        pass
-                    except OSError as mkdir_exc:
-                        raise LibraryRegistryError(
-                            "无法在受控锚点内创建应用目录。"
-                        ) from mkdir_exc
-                    try:
-                        child = os.open(
-                            part,
-                            _directory_open_flags(),
-                            dir_fd=descriptor,
-                        )
-                    except OSError as open_exc:
-                        raise LibraryRegistryError(
-                            "新建受控应用路径不能经过符号链接或非目录条目。"
-                        ) from open_exc
-                except OSError as exc:
-                    raise LibraryRegistryError(
-                        "受控应用路径不能经过符号链接或非目录条目。"
-                    ) from exc
-
-                try:
-                    opened_status = os.fstat(child)
-                except OSError as exc:
-                    os.close(child)
-                    raise LibraryRegistryError(
-                        "无法核对受控应用路径身份。"
-                    ) from exc
-                opened_identity = _identity(opened_status)
-                if not stat.S_ISDIR(opened_status.st_mode):
-                    os.close(child)
-                    raise LibraryRegistryError("受控应用路径的组件不是目录。")
-                if expected is not None and opened_identity != expected:
-                    os.close(child)
-                    raise LibraryRegistryError("受控应用路径的目录身份已改变。")
-                if expected is None:
-                    self._component_identities[index] = opened_identity
-                os.close(descriptor)
-                descriptor = child
-        except Exception:
-            os.close(descriptor)
-            raise
-        return descriptor
+            return open_anchored_directory(
+                self._root,
+                self._component_identities,
+                create=create,
+            )
+        except PathIdentityError as exc:
+            raise LibraryRegistryError(
+                "受控应用路径的既有组件已被移除、替换或改变身份。"
+            ) from exc
+        except (OSError, UnsafePathError, ValueError) as exc:
+            raise LibraryRegistryError(
+                "受控应用路径不能经过符号链接、重解析点或非目录条目。"
+            ) from exc
 
     @contextmanager
-    def _application_root(self, *, create: bool) -> Iterator[int | None]:
+    def _application_root(self, *, create: bool) -> Iterator[DirectoryHandle | None]:
         descriptor = self._open_anchored_root(create=create)
         try:
             yield descriptor
         finally:
             if descriptor is not None:
-                os.close(descriptor)
+                descriptor.close()
 
     def _entry_status(
-        self, parent_descriptor: int, name: str, *, label: str
+        self, parent_descriptor: DirectoryHandle, name: str, *, label: str
     ) -> os.stat_result | None:
         try:
-            return os.stat(
-                name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
+            return entry_status(parent_descriptor, name)
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -305,17 +238,18 @@ class LibraryRegistry:
 
     def _open_directory_entry(
         self,
-        parent_descriptor: int,
+        parent_descriptor: DirectoryHandle,
         name: str,
         *,
         label: str,
         allow_missing: bool,
         create: bool = False,
-    ) -> int | None:
+        delete_access: bool = False,
+    ) -> DirectoryHandle | None:
         status = self._entry_status(parent_descriptor, name, label=label)
         if status is None and create:
             try:
-                os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+                mkdir_entry(parent_descriptor, name, mode=0o700)
             except FileExistsError:
                 pass
             except OSError as exc:
@@ -325,33 +259,31 @@ class LibraryRegistry:
             if allow_missing:
                 return None
             raise LibraryRegistryError(f"{label}不存在。")
-        if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
-            raise LibraryRegistryError(f"{label}必须是普通目录且不能是符号链接。")
-        try:
-            descriptor = os.open(
-                name,
-                _directory_open_flags(),
-                dir_fd=parent_descriptor,
-            )
-        except OSError as exc:
+        if status_is_reparse(status) or not stat.S_ISDIR(status.st_mode):
             raise LibraryRegistryError(
-                f"{label}必须是普通目录且不能是符号链接。"
-            ) from exc
+                f"{label}必须是普通目录且不能是符号链接或重解析点。"
+            )
         try:
-            opened_status = os.fstat(descriptor)
-        except OSError as exc:
-            os.close(descriptor)
-            raise LibraryRegistryError(f"无法核对{label}身份。") from exc
-        if not stat.S_ISDIR(opened_status.st_mode) or _identity(
-            opened_status
-        ) != _identity(status):
-            os.close(descriptor)
-            raise LibraryRegistryError(f"{label}在安全检查与打开之间发生变化。")
+            descriptor = open_child_directory(
+                parent_descriptor,
+                name,
+                allow_missing=False,
+                delete_access=delete_access,
+            )
+        except (OSError, UnsafePathError, PathIdentityError) as exc:
+            raise LibraryRegistryError(
+                f"{label}必须是普通目录且不能是符号链接或重解析点。"
+            ) from exc
+        assert descriptor is not None
         return descriptor
 
     def _open_libraries(
-        self, root_descriptor: int, *, allow_missing: bool, create: bool = False
-    ) -> int | None:
+        self,
+        root_descriptor: DirectoryHandle,
+        *,
+        allow_missing: bool,
+        create: bool = False,
+    ) -> DirectoryHandle | None:
         return self._open_directory_entry(
             root_descriptor,
             LIBRARIES_DIRECTORY_NAME,
@@ -361,7 +293,7 @@ class LibraryRegistry:
         )
 
     def _validate_library_directory(
-        self, libraries_descriptor: int, library_id: str
+        self, libraries_descriptor: DirectoryHandle, library_id: str
     ) -> None:
         library_id = _validated_library_id(library_id)
         descriptor = self._open_directory_entry(
@@ -371,10 +303,10 @@ class LibraryRegistry:
             allow_missing=False,
         )
         assert descriptor is not None
-        os.close(descriptor)
+        descriptor.close()
 
     def _safe_library_directory(
-        self, root_descriptor: int, library_id: str
+        self, root_descriptor: DirectoryHandle, library_id: str
     ) -> Path:
         library_id = _validated_library_id(library_id)
         libraries_descriptor = self._open_libraries(
@@ -385,12 +317,14 @@ class LibraryRegistry:
         try:
             self._validate_library_directory(libraries_descriptor, library_id)
         finally:
-            os.close(libraries_descriptor)
+            libraries_descriptor.close()
         return self._libraries_root / library_id
 
-    def _managed_library_entry_exists(self, libraries_descriptor: int) -> bool:
+    def _managed_library_entry_exists(
+        self, libraries_descriptor: DirectoryHandle
+    ) -> bool:
         try:
-            names = os.listdir(libraries_descriptor)
+            names = list_directory(libraries_descriptor)
         except OSError as exc:
             raise LibraryRegistryError("无法检查资料库集合目录。") from exc
         for name in names:
@@ -403,7 +337,7 @@ class LibraryRegistry:
             )
             if status is None:
                 continue
-            if not stat.S_ISDIR(status.st_mode) or stat.S_ISLNK(status.st_mode):
+            if not stat.S_ISDIR(status.st_mode) or status_is_reparse(status):
                 raise LibraryRegistryError(
                     "资料库注册表缺失，且集合目录含受控格式的异常条目。"
                 )
@@ -412,8 +346,8 @@ class LibraryRegistry:
 
     def _read_registry_json(
         self,
-        root_descriptor: int,
-        libraries_descriptor: int | None,
+        root_descriptor: DirectoryHandle,
+        libraries_descriptor: DirectoryHandle | None,
     ) -> dict[str, Any]:
         status = self._entry_status(
             root_descriptor,
@@ -428,16 +362,14 @@ class LibraryRegistry:
                     "资料库注册表缺失，但发现已有受管资料库目录；已停止以避免覆盖。"
                 )
             return self._empty_registry()
-        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
-            raise LibraryRegistryError("资料库注册表必须是普通文件且不能是符号链接。")
+        if status_is_reparse(status) or not stat.S_ISREG(status.st_mode):
+            raise LibraryRegistryError(
+                "资料库注册表必须是普通文件且不能是符号链接或重解析点。"
+            )
         flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
         descriptor: int | None = None
         try:
-            descriptor = os.open(REGISTRY_NAME, flags, dir_fd=root_descriptor)
+            descriptor = open_file(root_descriptor, REGISTRY_NAME, flags)
             opened_status = os.fstat(descriptor)
             if not stat.S_ISREG(opened_status.st_mode) or _identity(
                 opened_status
@@ -463,7 +395,7 @@ class LibraryRegistry:
             raise LibraryRegistryError("资料库注册表根必须是对象。")
         return value
 
-    def _load(self, root_descriptor: int) -> dict[str, Any]:
+    def _load(self, root_descriptor: DirectoryHandle) -> dict[str, Any]:
         libraries_descriptor = self._open_libraries(
             root_descriptor,
             allow_missing=True,
@@ -540,41 +472,94 @@ class LibraryRegistry:
             }
         finally:
             if libraries_descriptor is not None:
-                os.close(libraries_descriptor)
+                libraries_descriptor.close()
 
     @contextmanager
     def _root_lock(
-        self, root_descriptor: int, *, exclusive: bool
+        self, root_descriptor: DirectoryHandle, *, exclusive: bool
     ) -> Iterator[None]:
-        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        locked = False
-        try:
+        if not IS_WINDOWS:
+            if root_descriptor.descriptor is None:
+                raise LibraryRegistryError("受控应用目录句柄已经关闭。")
             try:
-                fcntl.flock(root_descriptor, operation | fcntl.LOCK_NB)
+                with file_lock(root_descriptor.descriptor, exclusive=exclusive):
+                    yield
             except BlockingIOError as exc:
                 raise LibraryRegistryError(
                     "另一个本地资料库写操作正在进行，请稍后重新执行。"
                 ) from exc
             except OSError as exc:
                 raise LibraryRegistryError("无法安全获取资料库目录锁。") from exc
-            locked = True
-            yield
+            return
+
+        status = self._entry_status(root_descriptor, LOCK_NAME, label="资料库写锁")
+        if status is None and not exclusive:
+            try:
+                entries = list_directory(root_descriptor)
+            except OSError as exc:
+                raise LibraryRegistryError("无法检查资料库目录锁状态。") from exc
+            managed_entries = {
+                name for name in entries if name.casefold() != "mcp-server.cmd"
+            }
+            if not managed_entries:
+                # A truly empty, never-written root remains read-only. Every
+                # Windows data write creates this coordination file. The
+                # installer-owned launcher is not library state.
+                yield
+                return
+            raise LibraryRegistryError(
+                "资料库已有持久化内容但缺少 Windows 协调锁，已拒绝无锁读取。"
+            )
+        if status is not None and (
+            status_is_reparse(status) or not stat.S_ISREG(status.st_mode)
+        ):
+            raise LibraryRegistryError(
+                "资料库写锁必须是普通文件且不能是符号链接或重解析点。"
+            )
+        descriptor: int | None = None
+        try:
+            try:
+                flags = os.O_RDWR | (os.O_CREAT if exclusive else 0)
+                descriptor = open_file(root_descriptor, LOCK_NAME, flags, 0o600)
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                    raise LibraryRegistryError("资料库写锁不是普通单链接文件。")
+                with file_lock(descriptor, exclusive=exclusive):
+                    current = self._entry_status(
+                        root_descriptor, LOCK_NAME, label="资料库写锁"
+                    )
+                    if (
+                        current is None
+                        or status_is_reparse(current)
+                        or _identity(current) != _identity(opened)
+                    ):
+                        raise LibraryRegistryError("资料库写锁的固定文件身份已改变。")
+                    yield
+            except (BlockingIOError, FileNotFoundError) as exc:
+                raise LibraryRegistryError(
+                    "另一个本地资料库写操作正在进行，请稍后重新执行。"
+                ) from exc
+            except OSError as exc:
+                raise LibraryRegistryError("无法安全获取资料库目录锁。") from exc
         finally:
-            if locked:
-                try:
-                    fcntl.flock(root_descriptor, fcntl.LOCK_UN)
-                except OSError:
-                    pass
+            if descriptor is not None:
+                os.close(descriptor)
 
     @contextmanager
-    def _visible_write_lock(self, root_descriptor: int) -> Iterator[None]:
+    def _visible_write_lock(
+        self, root_descriptor: DirectoryHandle
+    ) -> Iterator[None]:
+        if IS_WINDOWS:
+            # _root_lock already holds this same byte range exclusively.
+            yield
+            return
         status = self._entry_status(
             root_descriptor,
             LOCK_NAME,
             label="资料库写锁",
         )
         if status is not None and (
-            stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode)
+            status_is_reparse(status) or not stat.S_ISREG(status.st_mode)
         ):
             raise LibraryRegistryError("资料库写锁必须是普通文件且不能是符号链接。")
         flags = os.O_RDWR | os.O_CREAT
@@ -583,57 +568,38 @@ class LibraryRegistry:
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         descriptor: int | None = None
-        locked = False
         try:
-            descriptor = os.open(LOCK_NAME, flags, 0o600, dir_fd=root_descriptor)
+            descriptor = open_file(root_descriptor, LOCK_NAME, flags, 0o600)
             opened_status = os.fstat(descriptor)
             if not stat.S_ISREG(opened_status.st_mode):
                 raise LibraryRegistryError("资料库写锁不是普通文件。")
             if status is not None and _identity(opened_status) != _identity(status):
                 raise LibraryRegistryError("资料库写锁的文件身份已改变。")
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with file_lock(descriptor, exclusive=True):
+                    current_status = self._entry_status(
+                        root_descriptor,
+                        LOCK_NAME,
+                        label="资料库写锁",
+                    )
+                    if current_status is None or _identity(
+                        current_status
+                    ) != _identity(opened_status):
+                        raise LibraryRegistryError("资料库写锁的固定文件身份已改变。")
+                    yield
             except BlockingIOError as exc:
                 raise LibraryRegistryError(
                     "另一个本地资料库写操作正在进行，请稍后重新执行。"
                 ) from exc
-            locked = True
-            current_status = self._entry_status(
-                root_descriptor,
-                LOCK_NAME,
-                label="资料库写锁",
-            )
-            if current_status is None or _identity(current_status) != _identity(
-                opened_status
-            ):
-                raise LibraryRegistryError("资料库写锁的固定文件身份已改变。")
         except OSError as exc:
-            if descriptor is not None:
-                os.close(descriptor)
             raise LibraryRegistryError("无法安全获取资料库写锁。") from exc
-        except LibraryRegistryError:
-            if descriptor is not None:
-                if locked:
-                    try:
-                        fcntl.flock(descriptor, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
-                os.close(descriptor)
-            raise
-        try:
-            yield
         finally:
             if descriptor is not None:
-                if locked:
-                    try:
-                        fcntl.flock(descriptor, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
                 os.close(descriptor)
 
     @contextmanager
     def _exclusive_write_lock(
-        self, root_descriptor: int | None = None
+        self, root_descriptor: DirectoryHandle | None = None
     ) -> Iterator[None]:
         if root_descriptor is None:
             with self._application_root(create=False) as opened_root:
@@ -646,14 +612,16 @@ class LibraryRegistry:
             with self._visible_write_lock(root_descriptor):
                 yield
 
-    def _write(self, root_descriptor: int, registry: dict[str, Any]) -> None:
+    def _write(
+        self, root_descriptor: DirectoryHandle, registry: dict[str, Any]
+    ) -> None:
         current_status = self._entry_status(
             root_descriptor,
             REGISTRY_NAME,
             label="资料库注册表",
         )
         if current_status is not None and (
-            stat.S_ISLNK(current_status.st_mode)
+            status_is_reparse(current_status)
             or not stat.S_ISREG(current_status.st_mode)
         ):
             raise LibraryRegistryError("资料库注册表必须是普通文件且不能是符号链接。")
@@ -680,24 +648,14 @@ class LibraryRegistry:
         descriptor: int | None = None
         published = False
         try:
-            descriptor = os.open(
-                temporary,
-                flags,
-                0o600,
-                dir_fd=root_descriptor,
-            )
+            descriptor = open_file(root_descriptor, temporary, flags, 0o600)
             handle = os.fdopen(descriptor, "wb")
             descriptor = None
             with handle:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.rename(
-                temporary,
-                REGISTRY_NAME,
-                src_dir_fd=root_descriptor,
-                dst_dir_fd=root_descriptor,
-            )
+            replace_entry(root_descriptor, temporary, REGISTRY_NAME)
             published = True
             _fsync_directory(root_descriptor)
         except LibraryRegistryError as exc:
@@ -714,7 +672,7 @@ class LibraryRegistry:
             if descriptor is not None:
                 os.close(descriptor)
             try:
-                os.unlink(temporary, dir_fd=root_descriptor)
+                unlink_entry(root_descriptor, temporary)
             except FileNotFoundError:
                 pass
             except OSError:
@@ -729,7 +687,7 @@ class LibraryRegistry:
 
     def _public_record(
         self,
-        root_descriptor: int,
+        root_descriptor: DirectoryHandle,
         item: dict[str, str],
         *,
         selected_library_id: str | None,
@@ -795,10 +753,8 @@ class LibraryRegistry:
                                 "新 library_id 与现有记录冲突。"
                             )
                         try:
-                            os.mkdir(
-                                library_id,
-                                mode=0o700,
-                                dir_fd=libraries_descriptor,
+                            mkdir_entry(
+                                libraries_descriptor, library_id, mode=0o700
                             )
                             _fsync_directory(libraries_descriptor)
                         except FileExistsError as exc:
@@ -807,10 +763,7 @@ class LibraryRegistry:
                             ) from exc
                         except (LibraryRegistryError, OSError) as exc:
                             try:
-                                os.rmdir(
-                                    library_id,
-                                    dir_fd=libraries_descriptor,
-                                )
+                                rmdir_entry(libraries_descriptor, library_id)
                             except OSError:
                                 pass
                             if isinstance(exc, LibraryRegistryError):
@@ -831,20 +784,14 @@ class LibraryRegistry:
                         except _RegistryWriteFailure as exc:
                             if not exc.published:
                                 try:
-                                    os.rmdir(
-                                        library_id,
-                                        dir_fd=libraries_descriptor,
-                                    )
+                                    rmdir_entry(libraries_descriptor, library_id)
                                     _fsync_directory(libraries_descriptor)
                                 except (LibraryRegistryError, OSError):
                                     pass
                             raise
                         except Exception:
                             try:
-                                os.rmdir(
-                                    library_id,
-                                    dir_fd=libraries_descriptor,
-                                )
+                                rmdir_entry(libraries_descriptor, library_id)
                                 _fsync_directory(libraries_descriptor)
                             except (LibraryRegistryError, OSError):
                                 pass
@@ -855,7 +802,7 @@ class LibraryRegistry:
                             selected_library_id=registry["selected_library_id"],
                         )
                     finally:
-                        os.close(libraries_descriptor)
+                        libraries_descriptor.close()
 
     def select(self, library_id: str) -> dict[str, Any]:
         """Explicitly persist the library selected by the local user."""
@@ -923,7 +870,7 @@ class LibraryRegistry:
     def delete(self, library_id: str, confirmation_name: str) -> dict[str, Any]:
         """Unregister and physically remove one explicitly confirmed, owned library."""
         library_id = _validated_library_id(library_id)
-        if not shutil.rmtree.avoids_symlink_attacks:
+        if not IS_WINDOWS and not shutil.rmtree.avoids_symlink_attacks:
             raise LibraryRegistryError("当前平台不支持安全清理目录；未删除资料库。")
         with self._application_root(create=False) as root_descriptor:
             if root_descriptor is None:
@@ -936,8 +883,13 @@ class LibraryRegistry:
                 libraries = self._open_libraries(root_descriptor, allow_missing=False)
                 assert libraries is not None
                 try:
-                    target = self._open_directory_entry(libraries, library_id,
-                        label="待删除资料库", allow_missing=False)
+                    target = self._open_directory_entry(
+                        libraries,
+                        library_id,
+                        label="待删除资料库",
+                        allow_missing=False,
+                        delete_access=IS_WINDOWS,
+                    )
                     assert target is not None
                     try:
                         # Snapshot and vector writers hold this same directory lock.
@@ -958,21 +910,44 @@ class LibraryRegistry:
                                         f"库已移出注册目录，但保存确认失败，文件尚未清理。请停止服务后检查并清理残留目录：{residual}"
                                     ) from exc
                                 raise
-                            try:
-                                current = self._entry_status(libraries, library_id, label="待删除资料库")
-                                if current is None or _identity(current) != _identity(os.fstat(target)):
-                                    raise OSError("target identity changed")
-                                shutil.rmtree(library_id, dir_fd=libraries)
-                            except OSError as exc:
-                                raise LibraryRegistryError(
-                                    f"库已移出注册目录，但文件清理未完成。请停止服务、检查目录权限并手工清理该残留目录：{residual}"
-                                ) from exc
-                            return {"deleted_library_id": library_id, "deleted": True,
-                                    "selected_library_id": selected}
+                            if not IS_WINDOWS:
+                                try:
+                                    current = self._entry_status(
+                                        libraries, library_id, label="待删除资料库"
+                                    )
+                                    if current is None or _identity(
+                                        current
+                                    ) != directory_identity(target):
+                                        raise OSError("target identity changed")
+                                    assert libraries.descriptor is not None
+                                    shutil.rmtree(
+                                        library_id, dir_fd=libraries.descriptor
+                                    )
+                                except OSError as exc:
+                                    raise LibraryRegistryError(
+                                        f"库已移出注册目录，但文件清理未完成。请停止服务、检查目录权限并手工清理该残留目录：{residual}"
+                                    ) from exc
+                        try:
+                            if IS_WINDOWS:
+                                # The target handle requests DELETE access and
+                                # deliberately omits FILE_SHARE_DELETE. It pins
+                                # this directory and prevents a new managed
+                                # operation from reopening it while the now-
+                                # closed lock file and tree are removed.
+                                remove_directory_tree(target, parent=libraries)
+                        except OSError as exc:
+                            raise LibraryRegistryError(
+                                f"库已移出注册目录，但文件清理未完成。请停止服务、检查目录权限并手工清理该残留目录：{residual}"
+                            ) from exc
+                        return {
+                            "deleted_library_id": library_id,
+                            "deleted": True,
+                            "selected_library_id": selected,
+                        }
                     finally:
-                        os.close(target)
+                        target.close()
                 finally:
-                    os.close(libraries)
+                    libraries.close()
 
     def library_path(self, library_id: str) -> Path:
         """Resolve a registered ID to its direct, non-symlink physical root."""

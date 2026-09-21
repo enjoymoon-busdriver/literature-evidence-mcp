@@ -6,11 +6,20 @@ import os
 import re
 import secrets
 import stat
+import sys
 import threading
 from pathlib import Path
 from typing import Any
 
 from .errors import EnhancedSearchError, LiteratureEvidenceError
+from .platform_fs import (
+    entry_status,
+    fsync_directory,
+    open_file,
+    replace_entry,
+    status_is_reparse,
+    unlink_entry,
+)
 from .registry import LibraryRegistry
 
 
@@ -73,11 +82,12 @@ class Connections:
             with self.registry._application_root(create=False) as directory:
                 if directory is None:
                     return empty
-                try:
-                    fd = os.open("connections.json", os.O_RDONLY | os.O_NOFOLLOW,
-                                 dir_fd=directory)
-                except FileNotFoundError:
+                status = entry_status(directory, "connections.json")
+                if status is None:
                     return empty
+                if status_is_reparse(status) or not stat.S_ISREG(status.st_mode):
+                    raise ValueError
+                fd = open_file(directory, "connections.json", os.O_RDONLY)
                 with os.fdopen(fd, "rb") as source:
                     status = os.fstat(source.fileno())
                     if not stat.S_ISREG(status.st_mode) or status.st_size > 4096:
@@ -106,20 +116,23 @@ class Connections:
         with self.registry._application_root(create=True) as directory:
             temporary = f".connections-{secrets.token_hex(8)}.tmp"
             try:
-                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                             0o600, dir_fd=directory)
+                fd = open_file(
+                    directory,
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
                 with os.fdopen(fd, "w", encoding="utf-8") as target:
                     json.dump(value, target)
                     target.flush()
                     os.fsync(target.fileno())
-                os.replace(temporary, "connections.json", src_dir_fd=directory,
-                           dst_dir_fd=directory)
-                os.fsync(directory)
+                replace_entry(directory, temporary, "connections.json")
+                fsync_directory(directory)
             except OSError:
                 raise ConnectionError("本机连接设置保存失败。") from None
             finally:
                 try:
-                    os.unlink(temporary, dir_fd=directory)
+                    unlink_entry(directory, temporary)
                 except FileNotFoundError:
                     pass
 
@@ -349,3 +362,114 @@ class _ConfiguredSearch:
             raise EnhancedSearchError(str(exc), audit) from None
         result["provider_audit"] = transport.last_audit
         return result
+
+
+_WINDOWS_LOCAL_ONLY_MESSAGE = (
+    "Windows x64 测试版仅支持本机资料库与 BM25；"
+    "AI 增强搜索、凭据保存和 Secure MCP Tunnel 暂不可用。"
+)
+
+
+class _UnavailableEnhancedSearch:
+    def public_summary(self, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {
+            "available": False,
+            "simulated": False,
+            "roles": [],
+            "message": _WINDOWS_LOCAL_ONLY_MESSAGE,
+        }
+
+    def search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise EnhancedSearchError(
+            _WINDOWS_LOCAL_ONLY_MESSAGE,
+            {"simulated": False, "call_count": 0, "calls": []},
+        )
+
+
+class _UnavailableTunnel:
+    def status(self) -> dict[str, Any]:
+        return {
+            "state": "unavailable",
+            "passed": False,
+            "simulated": False,
+            "client_installed": False,
+            "running": False,
+            "real_connected": False,
+            "local_health_checked": False,
+            "chatgpt_tool_discovery_checked": False,
+            "network_calls": 0,
+            "error_code": "unsupported_platform",
+            "message": _WINDOWS_LOCAL_ONLY_MESSAGE,
+        }
+
+    def close(self) -> dict[str, Any]:
+        return self.status()
+
+    def start(self, _tunnel_id: str) -> dict[str, Any]:
+        raise ConnectionError(_WINDOWS_LOCAL_ONLY_MESSAGE)
+
+    def health(self) -> dict[str, Any]:
+        raise ConnectionError(_WINDOWS_LOCAL_ONLY_MESSAGE)
+
+    def stop(self) -> dict[str, Any]:
+        return self.status()
+
+
+class WindowsLocalOnlyConnections:
+    """Explicit no-secret boundary for the unsigned Windows test candidate."""
+
+    def __init__(self, application_root: Path):
+        self.registry = LibraryRegistry(application_root)
+        self.root = self.registry.application_root
+        self.enhanced = _UnavailableEnhancedSearch()
+        self.tunnel = _UnavailableTunnel()
+
+    def status(self) -> dict[str, Any]:
+        models = _recommended_model_ids()
+        return {
+            **_empty_settings(),
+            "credential_storage": "unavailable",
+            "model_settings": {
+                "enabled": False,
+                "provider": "unavailable",
+                "region": "unavailable",
+                "model_ids": models,
+                "recommended_model_ids": models,
+            },
+            "models": self.enhanced.public_summary(),
+            "tunnel": self.tunnel.status(),
+            "platform_support": {
+                "local_bm25": True,
+                "enhanced": False,
+                "tunnel": False,
+                "credential_storage": False,
+                "message": _WINDOWS_LOCAL_ONLY_MESSAGE,
+            },
+        }
+
+    def _unsupported(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise ConnectionError(_WINDOWS_LOCAL_ONLY_MESSAGE)
+
+    save_key = _unsupported
+    save_tunnel = _unsupported
+    save_models = _unsupported
+    restore_recommended_models = _unsupported
+    check_models = _unsupported
+    preview_vectors = _unsupported
+    build_vectors = _unsupported
+    start_tunnel = _unsupported
+
+    def vector_states(self, _library_id: str) -> dict[str, str]:
+        return {}
+
+    def document_vector_states(
+        self, _library_id: str, _snapshot_id: str
+    ) -> dict[str, Any]:
+        return {}
+
+
+def desktop_connections(application_root: Path) -> Connections | WindowsLocalOnlyConnections:
+    """Select only capabilities that are actually supported by this desktop OS."""
+    if sys.platform == "win32":
+        return WindowsLocalOnlyConnections(application_root)
+    return Connections(application_root)
