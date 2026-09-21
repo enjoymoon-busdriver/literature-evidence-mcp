@@ -118,6 +118,7 @@ class DesktopRuntimeTests(unittest.TestCase):
             executable.write_bytes(b"synthetic")
             launcher = root / "mcp-server.cmd"
             launcher.write_text("@echo off\r\n", encoding="utf-8")
+            expected_launcher = str(launcher.absolute())
             with mock.patch.object(
                 mcp_selfcheck, "_frozen_windows_executable", return_value=executable
             ):
@@ -128,6 +129,15 @@ class DesktopRuntimeTests(unittest.TestCase):
         self.assertIn("cmd.exe", guide["toml"])
         self.assertIn("/v:off", guide["toml"])
         self.assertIn("mcp-server.cmd", guide["toml"])
+        args_line = next(
+            line for line in guide["toml"].splitlines() if line.startswith("args = ")
+        )
+        self.assertEqual(
+            json.loads(args_line.removeprefix("args = ")),
+            ["/d", "/v:off", "/c", "call", expected_launcher],
+        )
+        self.assertNotIn("/s", guide["toml"])
+        self.assertIn(" /c call ", guide["cli"])
         self.assertNotIn("foliohook-backend.exe", guide["toml"])
         self.assertNotIn("python", guide["toml"].lower())
         self.assertNotIn("zsh", guide["toml"].lower())

@@ -29,7 +29,7 @@ _SHELL_COMMAND = (
 _SHELL = "/bin/zsh"
 _SHELL_FLAG = "-fc"
 _WINDOWS_COMMAND = "cmd.exe"
-_WINDOWS_FLAGS = ("/d", "/v:off", "/s", "/c")
+_WINDOWS_FLAGS = ("/d", "/v:off", "/c", "call")
 _QUERY = "stage8localmarker"
 _SAFE_FAILURE = "此步骤未通过；自检已停止，未重试。"
 _OBSERVATION_SCOPE = (
@@ -70,8 +70,10 @@ def _windows_launcher_command(application_root: Path) -> str | None:
             return None
     except OSError:
         return None
-    # /s requires the extra outer pair when the command itself starts quoted.
-    return f'""{raw}""'
+    # Keep the path as its own argv item. Windows process launchers quote it for
+    # CreateProcess; `call` then invokes the .cmd without hand-written nested
+    # quotes, which cmd.exe does not parse using the C runtime rules.
+    return raw
 
 
 def _guide_base() -> dict[str, Any]:

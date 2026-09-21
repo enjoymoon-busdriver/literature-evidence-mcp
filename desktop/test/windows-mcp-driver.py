@@ -30,7 +30,11 @@ TOOL_NAMES = (
 
 
 class SmokeFailure(RuntimeError):
-    """One fixed, non-sensitive acceptance failure."""
+    """One fixed, synthetic-fixture-only acceptance failure."""
+
+    def __init__(self, message: str, diagnostics: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
 
 
 def _arguments() -> argparse.Namespace:
@@ -67,6 +71,42 @@ def _child_environment() -> dict[str, str]:
     return environment
 
 
+def _sanitize_diagnostic(text: str, shim: Path, cwd: Path) -> str:
+    replacements = {
+        os.fspath(shim.absolute()): "<shim>",
+        os.fspath(cwd.absolute()): "<fixture>",
+        os.environ.get("LOCALAPPDATA", ""): "<localappdata>",
+        os.environ.get("TEMP", ""): "<temp>",
+        os.environ.get("TMP", ""): "<temp>",
+    }
+    result = text
+    for raw, replacement in sorted(
+        ((raw, replacement) for raw, replacement in replacements.items() if raw),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        result = result.replace(raw, replacement)
+    return result[-2000:]
+
+
+def _exception_chain(exception: BaseException, shim: Path, cwd: Path) -> list[str]:
+    entries: list[str] = []
+
+    def visit(item: BaseException) -> None:
+        if len(entries) >= 8:
+            return
+        if isinstance(item, BaseExceptionGroup):
+            entries.append(type(item).__name__)
+            for child in item.exceptions:
+                visit(child)
+            return
+        detail = _sanitize_diagnostic(str(item), shim, cwd)
+        entries.append(f"{type(item).__name__}: {detail}" if detail else type(item).__name__)
+
+    visit(exception)
+    return entries
+
+
 async def _run(shim: Path, cwd: Path) -> None:
     if sys.platform != "win32":
         raise SmokeFailure("the real cmd.exe smoke test requires Windows")
@@ -76,25 +116,42 @@ async def _run(shim: Path, cwd: Path) -> None:
     if not shim.is_file() or not cwd.is_dir():
         raise SmokeFailure("the isolated shim fixture is incomplete")
 
-    # Keep this byte-for-byte argument shape aligned with
-    # mcp_selfcheck._windows_launcher_command and _WINDOWS_FLAGS.
-    command_string = f'""{raw_shim}""'
+    # Keep this argv shape aligned with mcp_selfcheck._WINDOWS_FLAGS. Python's
+    # Windows launcher quotes the separate path item for CreateProcess; do not
+    # add nested quotes because cmd.exe does not use the C runtime parser.
     parameters = StdioServerParameters(
         command="cmd.exe",
-        args=["/d", "/v:off", "/s", "/c", command_string],
+        args=["/d", "/v:off", "/c", "call", raw_shim],
         cwd=cwd,
         env=_child_environment(),
     )
+    stage = "initialize"
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errlog:
-        async with asyncio.timeout(60):
-            async with Client(stdio_client(parameters, errlog=errlog)) as client:
-                tools = (await client.list_tools()).tools
-                names = [tool.name for tool in tools]
-                if names != list(TOOL_NAMES):
-                    raise SmokeFailure("tools/list did not return the eight-tool contract")
-                status = _payload(await client.call_tool("retrieval_status", {}))
-                if status.get("scope") != "libraries" or status.get("libraries") != []:
-                    raise SmokeFailure("the isolated default application root was not empty")
+        try:
+            async with asyncio.timeout(60):
+                async with Client(stdio_client(parameters, errlog=errlog)) as client:
+                    stage = "tools/list"
+                    tools = (await client.list_tools()).tools
+                    names = [tool.name for tool in tools]
+                    if names != list(TOOL_NAMES):
+                        raise SmokeFailure("tools/list did not return the eight-tool contract")
+                    stage = "retrieval_status"
+                    status = _payload(await client.call_tool("retrieval_status", {}))
+                    if status.get("scope") != "libraries" or status.get("libraries") != []:
+                        raise SmokeFailure("the isolated default application root was not empty")
+        except Exception as exc:
+            errlog.flush()
+            errlog.seek(0)
+            server_stderr = _sanitize_diagnostic(errlog.read(), shim, cwd).strip()
+            raise SmokeFailure(
+                "the synthetic cmd.exe MCP chain failed",
+                {
+                    "stage": stage,
+                    "exception_chain": _exception_chain(exc, shim, cwd),
+                    "server_stderr": server_stderr,
+                    "cmd_args": ["/d", "/v:off", "/c", "call", "<shim>"],
+                },
+            ) from exc
 
 
 def main() -> int:
@@ -102,7 +159,10 @@ def main() -> int:
     try:
         asyncio.run(_run(args.shim, args.cwd))
     except (SmokeFailure, TimeoutError) as exc:
-        print(json.dumps({"passed": False, "error": str(exc)}), file=sys.stderr)
+        payload = {"passed": False, "error": str(exc)}
+        if isinstance(exc, SmokeFailure):
+            payload.update(exc.diagnostics)
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
         return 1
     except Exception:
         print(

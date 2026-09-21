@@ -12,6 +12,13 @@ const {
 
 const OUTPUT_LIMIT = 16 * 1024;
 
+class DriverFailure extends Error {
+  constructor(report) {
+    super(report.error || 'MCP smoke driver failed');
+    this.report = report;
+  }
+}
+
 function parseArguments(argv) {
   const result = { backend: null, python: null };
   for (let index = 0; index < argv.length; index += 1) {
@@ -83,7 +90,14 @@ function runDriver(python, driver, shim, cwd, environment) {
       if (signal) {
         reject(new Error('MCP smoke driver timed out or was terminated'));
       } else if (code !== 0) {
-        reject(new Error(stderr.trim() || `MCP smoke driver exited ${code}`));
+        try {
+          const lines = stderr.trim().split(/\r?\n/).filter(Boolean);
+          const report = JSON.parse(lines.at(-1));
+          reject(new DriverFailure(report));
+        } catch (error) {
+          if (error instanceof DriverFailure) reject(error);
+          else reject(new Error(stderr.trim() || `MCP smoke driver exited ${code}`));
+        }
       } else {
         resolve(stdout.trim());
       }
@@ -153,6 +167,9 @@ async function main() {
 }
 
 main().catch((error) => {
-  process.stderr.write(`${JSON.stringify({ passed: false, error: error.message })}\n`);
+  const report = error instanceof DriverFailure
+    ? error.report
+    : { passed: false, error: error.message };
+  process.stderr.write(`${JSON.stringify(report)}\n`);
   process.exitCode = 1;
 });
