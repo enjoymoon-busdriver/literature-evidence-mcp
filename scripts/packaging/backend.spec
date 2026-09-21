@@ -19,7 +19,11 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=collect_submodules("uvicorn") + collect_submodules("mcp"),
+    # The optional SDK CLI exits at import when its extra dependencies are absent.
+    # FolioHook has its own entry point and only needs the SDK runtime.
+    hiddenimports=collect_submodules("uvicorn") + collect_submodules(
+        "mcp", filter=lambda name: name != "mcp.cli" and not name.startswith("mcp.cli.")
+    ),
     hookspath=[],
     excludes=["tkinter", "pytest"],
     noarchive=False,
